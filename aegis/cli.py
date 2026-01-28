@@ -70,22 +70,37 @@ def get_secrets_repo(secrets_path: Optional[Path]) -> config.SecretsRepo:
 
 
 def get_entities_path(entities_path: Optional[Path]) -> Path:
-    """Get the entities path, with default handling."""
+    """Get the entities path, with default handling.
+    
+    Resolution order:
+    1. Explicit --entities-path argument
+    2. AEGIS_ENTITIES environment variable (set by dev shell)
+    3. Common relative paths
+    """
     if entities_path is not None:
         return entities_path
     
-    # Try to find it
+    # Check AEGIS_ENTITIES environment variable (set by nix develop)
+    env_path = os.environ.get("AEGIS_ENTITIES")
+    if env_path:
+        path = Path(env_path)
+        if path.exists():
+            return path
+    
+    # Try to find it in common locations
     candidates = [
         Path.cwd() / "nix-entities",
         Path.cwd().parent / "nix-entities",
-        Path("/net/projects/niten/nix-entities"),
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
     
     typer.echo("Error: Could not find nix-entities repo", err=True)
-    typer.echo("Use --entities-path to specify location", err=True)
+    typer.echo("", err=True)
+    typer.echo("Options:", err=True)
+    typer.echo("  1. Use 'nix develop' in aegis-secrets (sets AEGIS_ENTITIES)", err=True)
+    typer.echo("  2. Use --entities-path to specify location", err=True)
     raise typer.Exit(1)
 
 
