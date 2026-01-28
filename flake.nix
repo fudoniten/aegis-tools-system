@@ -97,10 +97,7 @@
           aegis = self.packages.${prev.system}.aegis;
         };
 
-        # NixOS module for aegis secrets
-        nixosModules = {
-          default = import ./nix/aegis-secrets-module.nix;
-          aegis-secrets = import ./nix/aegis-secrets-module.nix;
-        };
+        # NOTE: NixOS modules are in the separate 'aegis' repo at /net/projects/niten/aegis
+        # This repo (aegis-tools-system) is for admin CLI tools only.
       };
 }

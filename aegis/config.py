@@ -14,8 +14,20 @@ import tomli_w  # type: ignore
 
 @dataclass
 class HostConfig:
-    """Configuration for a host."""
+    """Configuration for a host.
+    
+    Attributes:
+        hostname: The host's name
+        master_pubkey: The host's master key (SSH public key format).
+                       This is the key used to encrypt secrets FOR this host.
+                       The host uses the corresponding private key to decrypt.
+                       Can be set manually or pulled from nix-entities.
+        services: Kerberos services this host provides
+        filesystem_keys: Filesystem encryption keys
+        extra_secrets: Additional secrets with metadata
+    """
     hostname: str
+    master_pubkey: str | None = None  # SSH public key for encrypting secrets to this host
     services: list[str] = field(default_factory=lambda: ["host", "ssh"])
     filesystem_keys: list[str] = field(default_factory=list)
     extra_secrets: dict[str, Any] = field(default_factory=dict)  # Can be str or dict with metadata
@@ -24,17 +36,21 @@ class HostConfig:
     def from_dict(cls, hostname: str, data: dict) -> "HostConfig":
         return cls(
             hostname=hostname,
+            master_pubkey=data.get("master_pubkey"),
             services=data.get("services", ["host", "ssh"]),
             filesystem_keys=data.get("filesystem_keys", []),
             extra_secrets=data.get("extra_secrets", {}),
         )
     
     def to_dict(self) -> dict:
-        return {
+        d: dict[str, Any] = {
             "services": self.services,
             "filesystem_keys": self.filesystem_keys,
             "extra_secrets": self.extra_secrets,
         }
+        if self.master_pubkey:
+            d["master_pubkey"] = self.master_pubkey
+        return d
 
 
 @dataclass
@@ -43,6 +59,7 @@ class UserConfig:
     username: str
     hosts: list[str]
     repo_url: str | None = None
+    public_key: str | None = None  # User's age public key for manifest encryption
     
     @classmethod
     def from_dict(cls, username: str, data: dict) -> "UserConfig":
@@ -50,6 +67,7 @@ class UserConfig:
             username=username,
             hosts=data.get("hosts", []),
             repo_url=data.get("repo_url"),
+            public_key=data.get("public_key"),
         )
     
     def to_dict(self) -> dict[str, Any]:
@@ -58,6 +76,8 @@ class UserConfig:
         }
         if self.repo_url:
             d["repo_url"] = self.repo_url
+        if self.public_key:
+            d["public_key"] = self.public_key
         return d
 
 
@@ -242,6 +262,10 @@ class SecretsRepo:
     def user_key_path(self, username: str) -> Path:
         """Get the path to a user's private key (encrypted)."""
         return self.keys_path / "users" / f"{username}.age"
+    
+    def user_pubkey_path(self, username: str) -> Path:
+        """Get the path to a user's public key."""
+        return self.keys_path / "users" / f"{username}.pub"
     
     def admin_key_path(self) -> Path:
         """Get the path to the admin public key."""
