@@ -1,5 +1,6 @@
 """Aegis CLI - System administration tools for secrets management."""
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -16,24 +17,56 @@ app = typer.Typer(
 )
 
 
+def _is_aegis_repo(path: Path) -> bool:
+    """Check if a path looks like an aegis secrets repo."""
+    return (
+        (path / "src").exists() or 
+        (path / "flake.nix").exists() and 
+        ((path / "keys").exists() or (path / "build").exists())
+    )
+
+
 def get_secrets_repo(secrets_path: Optional[Path]) -> config.SecretsRepo:
-    """Get the secrets repo, with default path handling."""
-    if secrets_path is None:
-        # Try to find it relative to current directory or from env
-        candidates = [
-            Path.cwd() / "aegis-secrets",
-            Path.cwd().parent / "aegis-secrets",
-            Path.cwd(),  # Maybe we're in the secrets repo
-        ]
-        for candidate in candidates:
-            if (candidate / "src").exists() or (candidate / "flake.nix").exists():
-                return config.SecretsRepo(candidate)
-        
-        typer.echo("Error: Could not find aegis-secrets repo", err=True)
-        typer.echo("Use --secrets-path or run from within the repo", err=True)
+    """Get the secrets repo, with default path handling.
+    
+    Resolution order:
+    1. Explicit --secrets-path argument
+    2. AEGIS_SYSTEM environment variable
+    3. Current directory (if it looks like a secrets repo)
+    4. Common relative paths (./aegis-secrets, ../aegis-secrets)
+    """
+    if secrets_path is not None:
+        if not secrets_path.exists():
+            typer.echo(f"Error: Specified path does not exist: {secrets_path}", err=True)
+            raise typer.Exit(1)
+        return config.SecretsRepo(secrets_path)
+    
+    # Check AEGIS_SYSTEM environment variable
+    env_path = os.environ.get("AEGIS_SYSTEM")
+    if env_path:
+        path = Path(env_path)
+        if path.exists() and _is_aegis_repo(path):
+            return config.SecretsRepo(path)
+        typer.echo(f"Error: AEGIS_SYSTEM points to invalid repo: {env_path}", err=True)
         raise typer.Exit(1)
     
-    return config.SecretsRepo(secrets_path)
+    # Try to find it relative to current directory
+    candidates = [
+        Path.cwd(),  # Maybe we're in the secrets repo
+        Path.cwd() / "aegis-secrets",
+        Path.cwd().parent / "aegis-secrets",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and _is_aegis_repo(candidate):
+            return config.SecretsRepo(candidate)
+    
+    typer.echo("Error: Could not find aegis-secrets repo", err=True)
+    typer.echo("", err=True)
+    typer.echo("Options:", err=True)
+    typer.echo("  1. Run from within an aegis-secrets repo", err=True)
+    typer.echo("  2. Set AEGIS_SYSTEM environment variable", err=True)
+    typer.echo("  3. Use --secrets-path to specify location", err=True)
+    raise typer.Exit(1)
 
 
 def get_entities_path(entities_path: Optional[Path]) -> Path:
