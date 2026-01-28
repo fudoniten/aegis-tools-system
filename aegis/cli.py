@@ -107,6 +107,7 @@ def build(
     
     if dry_run:
         typer.echo("  [dry-run] Would run: build-ssh-keys")
+        typer.echo("  [dry-run] Would run: build-nexus-keys")
         typer.echo("  [dry-run] Would run: build-keytabs")
         typer.echo("  [dry-run] Would run: build-user-secrets")
         typer.echo("  [dry-run] Would run: build-bundles")
@@ -116,11 +117,14 @@ def build(
     typer.echo("\n--- Building SSH Keys ---")
     build_ssh_keys(secrets_path=secrets_path, entities_path=entities_path, dry_run=False)
     
+    typer.echo("\n--- Building Nexus Keys ---")
+    build_nexus_keys(secrets_path=secrets_path, entities_path=entities_path, dry_run=False, algorithm="HmacSHA512")
+    
     typer.echo("\n--- Building Keytabs ---")
     build_keytabs(secrets_path=secrets_path, entities_path=entities_path, dry_run=False)
     
     typer.echo("\n--- Building User Secrets ---")
-    build_user_secrets(secrets_path=secrets_path, entities_path=entities_path, dry_run=False)
+    build_user_secrets(secrets_path=secrets_path, entities_path=entities_path, dry_run=False, user=None)
     
     # build_bundles(...)  # TODO - may not be needed if structure is already per-host
     
@@ -195,6 +199,88 @@ def build_ssh_keys(
         typer.echo(f"    SSHFP records:")
         for record in sshfp_records:
             typer.echo(f"      {record}")
+
+
+@app.command("build-nexus-keys")
+def build_nexus_keys(
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n"),
+    force: bool = typer.Option(False, "--force", "-f", help="Regenerate even if keys exist"),
+    algorithm: str = typer.Option("HmacSHA512", "--algorithm", "-a", help="HMAC algorithm"),
+):
+    """Generate Nexus DDNS authentication keys for hosts.
+    
+    Creates HMAC keys for each host to authenticate with Nexus DDNS servers.
+    Keys are encrypted with both the admin and host keys.
+    
+    Each host gets a unique key stored in build/hosts/<hostname>/nexus-key.age.
+    Nexus server hosts will automatically receive a collection of all client
+    keys via the NixOS configuration.
+    """
+    from . import nexus
+    
+    repo = get_secrets_repo(secrets_path)
+    ent_path = get_entities_path(entities_path)
+    
+    hosts = repo.list_hosts()
+    if not hosts:
+        typer.echo("No hosts configured. Use 'aegis init-host' first.")
+        return
+    
+    admin_pubkey = crypto.get_admin_public_key()
+    
+    for hostname in hosts:
+        output_path = repo.host_build_path(hostname) / "nexus-key.age"
+        
+        if output_path.exists() and not force:
+            typer.echo(f"  {hostname}: Nexus key exists (use --force to regenerate)")
+            continue
+        
+        if dry_run:
+            typer.echo(f"  [dry-run] Would generate Nexus key for {hostname}")
+            continue
+        
+        typer.echo(f"  Generating Nexus key for {hostname}...")
+        
+        # Get host info from entities
+        try:
+            host = entities.get_host(hostname, ent_path)
+        except Exception as e:
+            typer.echo(f"    Warning: Could not get host info from entities: {e}", err=True)
+            typer.echo(f"    Skipping {hostname}", err=True)
+            continue
+        
+        if host.master_key is None:
+            typer.echo(f"    Warning: No master key for {hostname}, skipping", err=True)
+            continue
+        
+        # Generate key in a temp file
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_key_path = Path(tmpdir) / "nexus.key"
+            nexus.generate_key(
+                output_path=tmp_key_path,
+                algorithm=algorithm,
+                verbose=False,
+            )
+            
+            # Read the generated key
+            key_content = tmp_key_path.read_text()
+        
+        # Get recipients
+        host_age_key = crypto.ssh_pubkey_to_age(host.master_key.public_key)
+        recipients = [host_age_key, admin_pubkey]
+        
+        # Encrypt and write
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        crypto.encrypt_age(key_content, recipients, output_path)
+        
+        typer.echo(f"    Wrote {output_path}")
+        
+        # Show the algorithm
+        algo, _ = key_content.strip().split(":", 1)
+        typer.echo(f"    Algorithm: {algo}")
 
 
 @app.command("build-keytabs")
@@ -607,6 +693,343 @@ def build_bundles(
 
 
 # =============================================================================
+# Import Commands
+# =============================================================================
+
+@app.command("import-ssh-key")
+def import_ssh_key(
+    hostname: str = typer.Argument(..., help="Hostname to import keys for"),
+    key_files: list[Path] = typer.Option([], "--key", help="Path to SSH private key file (type auto-detected, can specify multiple)"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+):
+    """Import SSH private keys for a host (key types and public keys auto-detected).
+    
+    This command imports existing SSH private keys and automatically:
+    - Detects the key type (ed25519, ecdsa, rsa)
+    - Derives the public key
+    
+    Keys are encrypted with both the host's master key and the admin key
+    before storing in build/hosts/<hostname>/ssh-keys.age.
+    
+    If the host doesn't exist in aegis-secrets, it will be created automatically
+    using information from nix-entities.
+    
+    Example:
+        aegis import-ssh-key lambda \\
+            --key /secure/lambda.ed25519.key \\
+            --key /secure/lambda.ecdsa.key
+    """
+    from . import ssh_utils
+    
+    repo = get_secrets_repo(secrets_path)
+    ent_path = get_entities_path(entities_path)
+    repo.ensure_structure()
+    
+    # Check if at least one key provided
+    if not key_files:
+        typer.echo("Error: At least one private key must be provided (use --key)", err=True)
+        raise typer.Exit(1)
+    
+    typer.echo(f"Importing SSH keys for {hostname}...")
+    
+    # Get host info from entities (for master key)
+    try:
+        host = entities.get_host(hostname, ent_path)
+    except Exception as e:
+        typer.echo(f"Error: Could not get host info from entities: {e}", err=True)
+        raise typer.Exit(1)
+    
+    if host.master_key is None:
+        typer.echo(f"Error: No master key configured for {hostname}", err=True)
+        raise typer.Exit(1)
+    
+    # Ensure host config exists (create if missing)
+    host_config = repo.get_host_config(hostname)
+    if not host_config:
+        typer.echo(f"  Host config not found, creating with defaults from entities...")
+        host_config = config.HostConfig(
+            hostname=hostname,
+            services=host.kerberos_services,
+        )
+        repo.set_host_config(host_config)
+        typer.echo(f"  Created {repo.src_path / 'hosts' / f'{hostname}.toml'}")
+    
+    # Read and validate private keys, derive public keys
+    try:
+        keypairs = ssh_utils.read_ssh_keypairs(
+            hostname=hostname,
+            key_files=key_files,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+    
+    if not keypairs:
+        typer.echo("Error: No valid keypairs found", err=True)
+        raise typer.Exit(1)
+    
+    typer.echo(f"  Detected {len(keypairs)} keypair(s):")
+    for kp in keypairs:
+        typer.echo(f"    - {kp.key_type}")
+        typer.echo(f"      Public key: {kp.public_key[:60]}...")
+    
+    # Convert to YAML format (same as build-ssh-keys)
+    keys_dict = {}
+    for kp in keypairs:
+        key_prefix = f"host_{kp.key_type}"
+        keys_dict[key_prefix] = {
+            "public_key": kp.public_key,
+            "private_key": kp.private_key,
+        }
+    
+    keys_yaml = yaml.dump(keys_dict, default_flow_style=False)
+    
+    # Get recipients (host master key + admin key)
+    host_age_key = crypto.ssh_pubkey_to_age(host.master_key.public_key)
+    admin_pubkey = crypto.get_admin_public_key()
+    recipients = [host_age_key, admin_pubkey]
+    
+    # Encrypt and write
+    output_path = repo.host_build_path(hostname) / "ssh-keys.age"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(keys_yaml, recipients, output_path)
+    
+    typer.secho(f"\nSSH keys imported successfully!", fg=typer.colors.GREEN)
+    typer.echo(f"  Output: {output_path}")
+    typer.echo(f"  Encrypted for: {hostname} (host) + admin")
+
+
+@app.command("import-nexus-key")
+def import_nexus_key(
+    hostname: str = typer.Argument(..., help="Hostname to import key for"),
+    key_file: Path = typer.Option(..., "--file", help="Path to nexus HMAC key file"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+):
+    """Import a Nexus DDNS authentication key for a host.
+    
+    Imports an existing Nexus HMAC key. The key should be in the format:
+    HmacSHA512:base64encodedkey
+    
+    Example:
+        aegis import-nexus-key lambda --file /secure/lambda.nexus.hmac
+    """
+    from . import nexus
+    
+    repo = get_secrets_repo(secrets_path)
+    ent_path = get_entities_path(entities_path)
+    repo.ensure_structure()
+    
+    if not key_file.exists():
+        typer.echo(f"Error: Key file not found: {key_file}", err=True)
+        raise typer.Exit(1)
+    
+    typer.echo(f"Importing Nexus key for {hostname}...")
+    
+    # Get host info
+    try:
+        host = entities.get_host(hostname, ent_path)
+    except Exception as e:
+        typer.echo(f"Error: Could not get host info from entities: {e}", err=True)
+        raise typer.Exit(1)
+    
+    if host.master_key is None:
+        typer.echo(f"Error: No master key configured for {hostname}", err=True)
+        raise typer.Exit(1)
+    
+    # Ensure host config exists
+    host_config = repo.get_host_config(hostname)
+    if not host_config:
+        typer.echo(f"  Host config not found, creating with defaults...")
+        host_config = config.HostConfig(
+            hostname=hostname,
+            services=host.kerberos_services,
+        )
+        repo.set_host_config(host_config)
+        typer.echo(f"  Created {repo.src_path / 'hosts' / f'{hostname}.toml'}")
+    
+    # Read and validate key
+    key_content = key_file.read_text().strip()
+    
+    try:
+        algo, encoded_key = nexus.read_key(key_file)
+        typer.echo(f"  Algorithm: {algo}")
+        typer.echo(f"  Key length: {len(encoded_key)} characters (base64)")
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+    
+    # Get recipients
+    host_age_key = crypto.ssh_pubkey_to_age(host.master_key.public_key)
+    admin_pubkey = crypto.get_admin_public_key()
+    recipients = [host_age_key, admin_pubkey]
+    
+    # Encrypt and write
+    output_path = repo.host_build_path(hostname) / "nexus-key.age"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(key_content, recipients, output_path)
+    
+    typer.secho(f"\nNexus key imported successfully!", fg=typer.colors.GREEN)
+    typer.echo(f"  Output: {output_path}")
+    typer.echo(f"  Encrypted for: {hostname} (host) + admin")
+
+
+@app.command("import-kerberos-realm")
+def import_kerberos_realm(
+    realm: str = typer.Argument(..., help="Realm name (e.g., SEA.FUDO.ORG)"),
+    realm_key: Path = typer.Option(..., "--realm-key", help="Path to realm master key file"),
+    principals_dir: Path = typer.Option(..., "--principals-dir", help="Path to directory containing principal key files"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+):
+    """Import a Kerberos realm with its master key and principal keys.
+    
+    This imports an existing Kerberos realm structure:
+    - realm.key: The realm master key
+    - principals/: Directory containing principal key files (e.g., krbtgt_REALM.key, host_fqdn.key)
+    
+    All keys will be encrypted with the admin key and stored in
+    src/kerberos/realms/<REALM>/ for use by aegis build-keytabs.
+    
+    Example:
+        aegis import-kerberos-realm SEA.FUDO.ORG \\
+            --realm-key /secure/realms/SEA.FUDO.ORG/realm.key \\
+            --principals-dir /secure/realms/SEA.FUDO.ORG/principals/
+    """
+    repo = get_secrets_repo(secrets_path)
+    repo.ensure_structure()
+    
+    if not realm_key.exists():
+        typer.echo(f"Error: Realm key not found: {realm_key}", err=True)
+        raise typer.Exit(1)
+    
+    if not principals_dir.exists() or not principals_dir.is_dir():
+        typer.echo(f"Error: Principals directory not found: {principals_dir}", err=True)
+        raise typer.Exit(1)
+    
+    typer.echo(f"Importing Kerberos realm: {realm}")
+    
+    # Create realm directory
+    realm_dir = repo.src_path / "kerberos" / "realms" / realm
+    realm_dir.mkdir(parents=True, exist_ok=True)
+    principals_out_dir = realm_dir / "principals"
+    principals_out_dir.mkdir(exist_ok=True)
+    
+    admin_pubkey = crypto.get_admin_public_key()
+    
+    # Import realm master key
+    typer.echo(f"  Importing realm master key...")
+    realm_key_content = realm_key.read_text()
+    realm_key_out = realm_dir / "realm.key.age"
+    crypto.encrypt_age(realm_key_content, [admin_pubkey], realm_key_out)
+    typer.echo(f"    Wrote {realm_key_out}")
+    
+    # Import principal keys
+    principal_files = list(principals_dir.glob("*.key"))
+    if not principal_files:
+        typer.echo("  Warning: No principal key files found (*.key)", err=True)
+    
+    typer.echo(f"  Importing {len(principal_files)} principal(s)...")
+    for principal_file in principal_files:
+        principal_name = principal_file.stem
+        principal_content = principal_file.read_text()
+        
+        output_file = principals_out_dir / f"{principal_name}.age"
+        crypto.encrypt_age(principal_content, [admin_pubkey], output_file)
+        typer.echo(f"    - {principal_name}")
+    
+    typer.secho(f"\nKerberos realm imported successfully!", fg=typer.colors.GREEN)
+    typer.echo(f"  Location: {realm_dir}")
+    typer.echo(f"  Realm master key: {realm_key_out.name}")
+    typer.echo(f"  Principals: {len(principal_files)}")
+    typer.echo(f"\nNext: Run 'aegis build-keytabs' to generate host keytabs")
+
+
+@app.command("import-secret")
+def import_secret(
+    hostname: str = typer.Argument(..., help="Hostname this secret belongs to"),
+    secret_name: str = typer.Argument(..., help="Name of the secret"),
+    file: Path = typer.Option(..., "--file", help="Path to secret file"),
+    target: str = typer.Option(..., "--target", help="Target path on host (e.g., /run/service/config)"),
+    user: str = typer.Option("root", "--user", help="Owner user on target host"),
+    group: str = typer.Option("root", "--group", help="Owner group on target host"),
+    mode: str = typer.Option("0400", "--mode", help="File permissions (e.g., 0600)"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+):
+    """Import a generic secret for a host.
+    
+    This is for service-specific or custom secrets that don't fit the standard
+    categories (SSH, Nexus, Kerberos). The secret will be encrypted and metadata
+    about target path, ownership, and permissions will be stored in the host config.
+    
+    Example:
+        aegis import-secret lambda my-service-token \\
+            --file /secure/lambda-service.token \\
+            --target /run/myservice/token \\
+            --user myservice --group myservice --mode 0600
+    """
+    repo = get_secrets_repo(secrets_path)
+    ent_path = get_entities_path(entities_path)
+    repo.ensure_structure()
+    
+    if not file.exists():
+        typer.echo(f"Error: Secret file not found: {file}", err=True)
+        raise typer.Exit(1)
+    
+    typer.echo(f"Importing secret '{secret_name}' for {hostname}...")
+    
+    # Get host info
+    try:
+        host = entities.get_host(hostname, ent_path)
+    except Exception as e:
+        typer.echo(f"Error: Could not get host info from entities: {e}", err=True)
+        raise typer.Exit(1)
+    
+    if host.master_key is None:
+        typer.echo(f"Error: No master key configured for {hostname}", err=True)
+        raise typer.Exit(1)
+    
+    # Ensure host config exists
+    host_config = repo.get_host_config(hostname)
+    if not host_config:
+        typer.echo(f"  Host config not found, creating with defaults...")
+        host_config = config.HostConfig(
+            hostname=hostname,
+            services=host.kerberos_services,
+        )
+    
+    # Add secret metadata to host config
+    host_config.extra_secrets[secret_name] = {
+        "target": target,
+        "user": user,
+        "group": group,
+        "mode": mode,
+    }
+    repo.set_host_config(host_config)
+    
+    # Read secret content
+    secret_content = file.read_text()
+    
+    # Get recipients
+    host_age_key = crypto.ssh_pubkey_to_age(host.master_key.public_key)
+    admin_pubkey = crypto.get_admin_public_key()
+    recipients = [host_age_key, admin_pubkey]
+    
+    # Encrypt and write
+    output_path = repo.host_build_path(hostname) / f"{secret_name}.age"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(secret_content, recipients, output_path)
+    
+    typer.secho(f"\nSecret imported successfully!", fg=typer.colors.GREEN)
+    typer.echo(f"  Output: {output_path}")
+    typer.echo(f"  Target: {target}")
+    typer.echo(f"  Owner: {user}:{group}")
+    typer.echo(f"  Mode: {mode}")
+    typer.echo(f"  Metadata stored in: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
+
+
+# =============================================================================
 # Configuration Commands
 # =============================================================================
 
@@ -616,7 +1039,14 @@ def init_host(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     services: str = typer.Option("host,ssh", "--services", help="Comma-separated Kerberos services"),
 ):
-    """Add a host to the secrets configuration."""
+    """Add a host to the secrets configuration.
+    
+    This initializes a host in the aegis-secrets repository. When you run
+    'aegis build', the following will be generated for this host:
+    - SSH host keys (ed25519, ecdsa, rsa)
+    - Nexus DDNS authentication key
+    - Kerberos keytabs (if configured)
+    """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
     
@@ -637,7 +1067,7 @@ def init_host(
     typer.echo(f"  Services: {', '.join(service_list)}")
     typer.echo(f"  Config: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
     typer.echo("")
-    typer.echo("Next: run 'aegis build' to generate secrets")
+    typer.echo("Next: run 'aegis build' to generate secrets (SSH keys, Nexus keys, etc.)")
 
 
 @app.command("add-user")
@@ -834,6 +1264,50 @@ def init_role(
     typer.secho(f"Created role: {role}", fg=typer.colors.GREEN)
     typer.echo(f"  Assigned to: {hostname}")
     typer.echo(f"  Public key: {keypair.public_key}")
+
+
+# =============================================================================
+# Nexus DDNS Commands
+# =============================================================================
+
+@app.command("nexus-keygen")
+def nexus_keygen(
+    output: Path = typer.Argument(..., help="Output file path for the key"),
+    algorithm: str = typer.Option("HmacSHA512", "--algorithm", "-a", help="HMAC algorithm (e.g., HmacSHA256, HmacSHA512)"),
+    seed: Optional[str] = typer.Option(None, "--seed", "-s", help="Seed for key generation (for reproducibility)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Print verbose output"),
+):
+    """Generate a Nexus DDNS authentication key.
+    
+    Creates an HMAC key for authenticating Nexus DDNS clients to servers.
+    The key is written in the format: ALGORITHM:BASE64_ENCODED_KEY
+    
+    Example:
+        aegis nexus-keygen server.key
+        aegis nexus-keygen client.key --algorithm HmacSHA256
+    """
+    from . import nexus
+    
+    typer.echo(f"Generating Nexus key with algorithm: {algorithm}")
+    
+    try:
+        key_path = nexus.generate_key(
+            output_path=output,
+            algorithm=algorithm,
+            seed=seed,
+            verbose=verbose,
+        )
+        
+        typer.secho(f"\nKey generated successfully!", fg=typer.colors.GREEN)
+        typer.echo(f"  Location: {key_path}")
+        
+        # Show the algorithm
+        algo, _ = nexus.read_key(key_path)
+        typer.echo(f"  Algorithm: {algo}")
+        
+    except Exception as e:
+        typer.echo(f"Error generating key: {e}", err=True)
+        raise typer.Exit(1)
 
 
 # =============================================================================

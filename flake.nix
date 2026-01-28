@@ -4,9 +4,13 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
     flake-utils.url = "github:numtide/flake-utils";
+    nexus = {
+      url = "github:fudoniten/nexus";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, nexus }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -74,6 +78,7 @@
               pkgs.openssh
               pkgs.ruby
               pkgs.krb5
+              nexus.packages.${system}.nexus-keygen
             ];
             text = ''
               export AEGIS_SCRIPTS="${scripts}"
@@ -90,6 +95,12 @@
         # System-independent outputs
         overlays.default = final: prev: {
           aegis = self.packages.${prev.system}.aegis;
+        };
+
+        # NixOS module for aegis secrets
+        nixosModules = {
+          default = import ./nix/aegis-secrets-module.nix;
+          aegis-secrets = import ./nix/aegis-secrets-module.nix;
         };
       };
 }

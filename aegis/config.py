@@ -18,7 +18,7 @@ class HostConfig:
     hostname: str
     services: list[str] = field(default_factory=lambda: ["host", "ssh"])
     filesystem_keys: list[str] = field(default_factory=list)
-    extra_secrets: dict[str, str] = field(default_factory=dict)
+    extra_secrets: dict[str, Any] = field(default_factory=dict)  # Can be str or dict with metadata
     
     @classmethod
     def from_dict(cls, hostname: str, data: dict) -> "HostConfig":

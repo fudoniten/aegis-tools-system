@@ -68,14 +68,20 @@ aegis status
 # Initialize a new host
 aegis init-host myhost --services=host,ssh
 
+# Import existing secrets
+aegis import-ssh-key lambda --key /secure/lambda.ed25519.key --key /secure/lambda.ecdsa.key
+aegis import-nexus-key lambda --file /secure/lambda.nexus.hmac
+aegis import-kerberos-realm SEA.FUDO.ORG --realm-key /secure/realm.key --principals-dir /secure/principals/
+
 # Add a user with access to specific hosts
 aegis add-user alice --hosts=host1,host2
 
-# Build all secrets (SSH keys, keytabs, user secrets)
+# Build all secrets (SSH keys, Nexus keys, keytabs, user secrets)
 aegis build
 
 # Build specific types
 aegis build-ssh-keys
+aegis build-nexus-keys
 aegis build-keytabs
 aegis build-user-secrets
 
@@ -105,10 +111,20 @@ aegis verify myhost
 
 | Command | Description |
 |---------|-------------|
-| `aegis build` | Run full build (SSH keys, keytabs, user secrets) |
+| `aegis build` | Run full build (SSH keys, Nexus keys, keytabs, user secrets) |
 | `aegis build-ssh-keys` | Generate SSH host keys |
+| `aegis build-nexus-keys` | Generate Nexus DDNS authentication keys |
 | `aegis build-keytabs` | Generate Kerberos keytabs |
 | `aegis build-user-secrets` | Process user secrets from user repos |
+
+### Import Commands
+
+| Command | Description |
+|---------|-------------|
+| `aegis import-ssh-key <host>` | Import SSH private keys (derives public keys) |
+| `aegis import-nexus-key <host>` | Import Nexus DDNS authentication key |
+| `aegis import-kerberos-realm <REALM>` | Import Kerberos realm with principals |
+| `aegis import-secret <host> <name>` | Import generic secret with metadata |
 
 ### Configuration Commands
 
