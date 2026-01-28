@@ -33,10 +33,15 @@ class Domain:
     gssapi_realm: str | None
 
 
-def _nix_eval(expr: str, entities_path: Path) -> Any:
+def _nix_eval(expr: str, entities_path: Path, apply: str | None = None) -> Any:
     """Evaluate a Nix expression and return JSON result.
     
     Uses flake-based evaluation since nix-entities is a flake.
+    
+    Args:
+        expr: Flake output expression (e.g., "entities.hosts.lambda")
+        entities_path: Path to nix-entities repo
+        apply: Optional Nix function to apply to result (e.g., "builtins.attrNames")
     """
     # Construct the flake reference
     flake_ref = f"path:{entities_path}#{expr}"
@@ -44,8 +49,12 @@ def _nix_eval(expr: str, entities_path: Path) -> Any:
     cmd = [
         "nix", "eval", "--json",
         "--extra-experimental-features", "nix-command flakes",
-        flake_ref,
     ]
+    
+    if apply:
+        cmd.extend(["--apply", apply])
+    
+    cmd.append(flake_ref)
     
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return json.loads(result.stdout)
@@ -111,11 +120,11 @@ def get_host_fqdn(hostname: str, entities_path: Path) -> str:
 
 def get_all_hosts(entities_path: Path) -> list[str]:
     """Get list of all host names."""
-    data = _nix_eval("builtins.attrNames entities.hosts", entities_path)
+    data = _nix_eval("entities.hosts", entities_path, apply="builtins.attrNames")
     return data
 
 
 def get_all_domains(entities_path: Path) -> list[str]:
     """Get list of all domain names."""
-    data = _nix_eval("builtins.attrNames entities.domains", entities_path)
+    data = _nix_eval("entities.domains", entities_path, apply="builtins.attrNames")
     return data
