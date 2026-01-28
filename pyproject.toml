@@ -1,0 +1,14 @@
+[project]
+name = "aegis-tools-system"
+version = "0.1.0"
+description = "Aegis System Administration Tools for secrets management"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
