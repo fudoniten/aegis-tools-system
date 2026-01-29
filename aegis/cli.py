@@ -445,20 +445,20 @@ def build_keytabs(
             principals_tmp = realm_tmp / "principals"
             principals_tmp.mkdir()
             
-            # Decrypt realm key
+            # Decrypt realm key (binary - Kerberos keys are not UTF-8)
             typer.echo(f"  Decrypting realm key...")
             realm_key_plain = realm_tmp / "realm.key"
-            realm_key_content = crypto.decrypt_age(realm_key_enc)
-            realm_key_plain.write_text(realm_key_content)
+            realm_key_content = crypto.decrypt_age_binary(realm_key_enc)
+            realm_key_plain.write_bytes(realm_key_content)
             
-            # Decrypt existing principals
+            # Decrypt existing principals (binary)
             principals_enc = realm_src / "principals"
             if principals_enc.exists():
                 for princ_file in principals_enc.glob("*.age"):
                     princ_name = princ_file.stem  # Remove .age
                     typer.echo(f"  Decrypting principal: {princ_name}")
-                    princ_content = crypto.decrypt_age(princ_file)
-                    (principals_tmp / f"{princ_name}.key").write_text(princ_content)
+                    princ_content = crypto.decrypt_age_binary(princ_file)
+                    (principals_tmp / f"{princ_name}.key").write_bytes(princ_content)
             
             # Instantiate the realm database
             typer.echo(f"  Instantiating realm database...")
@@ -543,14 +543,12 @@ def build_keytabs(
                 keytab_content = keytab_tmp.read_bytes()
                 keytab_output.parent.mkdir(parents=True, exist_ok=True)
                 
-                # Encode keytab as base64 for age (binary handling)
-                import base64
-                keytab_b64 = base64.b64encode(keytab_content).decode("ascii")
-                crypto.encrypt_age(keytab_b64, recipients, keytab_output)
+                # Use encrypt_age_binary for binary keytab data
+                crypto.encrypt_age_binary(keytab_content, recipients, keytab_output)
                 
                 typer.echo(f"    Wrote: {keytab_output}")
             
-            # Encrypt any new principals back to the repo
+            # Encrypt any new principals back to the repo (binary)
             if new_principals:
                 typer.echo(f"\n  Saving {len(new_principals)} new principals...")
                 principals_enc.mkdir(parents=True, exist_ok=True)
@@ -558,23 +556,23 @@ def build_keytabs(
                 for princ_file in new_principals:
                     if princ_file.exists():
                         princ_name = princ_file.stem  # e.g., "host_server.example.com"
-                        princ_content = princ_file.read_text()
+                        princ_content = princ_file.read_bytes()
                         princ_out = principals_enc / f"{princ_name}.age"
                         
                         # Encrypt for admin only (principals are sensitive)
-                        crypto.encrypt_age(princ_content, [admin_pubkey], princ_out)
+                        crypto.encrypt_age_binary(princ_content, [admin_pubkey], princ_out)
                         typer.echo(f"    Saved: {princ_out.name}")
             
-            # Generate consolidated KDC principals file
+            # Generate consolidated KDC principals file (binary)
             typer.echo(f"\n  Generating KDC principals file...")
-            all_principals = ""
+            all_principals = b""
             for princ_file in sorted(principals_tmp.glob("*.key")):
-                all_principals += princ_file.read_text()
+                all_principals += princ_file.read_bytes()
             
             if all_principals and kdc_role_pubkey:
                 kdc_principals_out = repo.build_path / "kdc" / f"{realm}-principals.age"
                 kdc_principals_out.parent.mkdir(parents=True, exist_ok=True)
-                crypto.encrypt_age(all_principals, [kdc_role_pubkey, admin_pubkey], kdc_principals_out)
+                crypto.encrypt_age_binary(all_principals, [kdc_role_pubkey, admin_pubkey], kdc_principals_out)
                 typer.echo(f"  Wrote KDC principals: {kdc_principals_out}")
             elif not kdc_role_pubkey:
                 typer.echo(f"  Warning: No KDC role configured, skipping KDC principals file")
@@ -1062,14 +1060,14 @@ def import_kerberos_realm(
     
     admin_pubkey = crypto.get_admin_public_key()
     
-    # Import realm master key
+    # Import realm master key (binary - Kerberos keys are not UTF-8)
     typer.echo(f"  Importing realm master key...")
-    realm_key_content = realm_key.read_text()
+    realm_key_content = realm_key.read_bytes()
     realm_key_out = realm_dir / "realm.key.age"
-    crypto.encrypt_age(realm_key_content, [admin_pubkey], realm_key_out)
+    crypto.encrypt_age_binary(realm_key_content, [admin_pubkey], realm_key_out)
     typer.echo(f"    Wrote {realm_key_out}")
     
-    # Import principal keys
+    # Import principal keys (binary)
     principal_files = list(principals_dir.glob("*.key"))
     if not principal_files:
         typer.echo("  Warning: No principal key files found (*.key)", err=True)
@@ -1077,10 +1075,10 @@ def import_kerberos_realm(
     typer.echo(f"  Importing {len(principal_files)} principal(s)...")
     for principal_file in principal_files:
         principal_name = principal_file.stem
-        principal_content = principal_file.read_text()
+        principal_content = principal_file.read_bytes()
         
         output_file = principals_out_dir / f"{principal_name}.age"
-        crypto.encrypt_age(principal_content, [admin_pubkey], output_file)
+        crypto.encrypt_age_binary(principal_content, [admin_pubkey], output_file)
         typer.echo(f"    - {principal_name}")
     
     typer.secho(f"\nKerberos realm imported successfully!", fg=typer.colors.GREEN)

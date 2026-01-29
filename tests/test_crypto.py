@@ -46,7 +46,7 @@ def test_multi_recipient(tmp_path: Path):
 
 def test_encrypt_requires_recipient(tmp_path: Path):
     """Encryption fails without recipients."""
-    with pytest.raises(ValueError, match="at least one recipient"):
+    with pytest.raises(ValueError, match="[Aa]t least one recipient"):
         crypto.encrypt_age("secret", [], tmp_path / "empty.age")
 
 
@@ -67,3 +67,38 @@ def test_can_decrypt_check(tmp_path: Path):
     
     assert crypto.can_decrypt(encrypted_path, identity_path) is True
     assert crypto.can_decrypt(encrypted_path, wrong_identity_path) is False
+
+
+def test_binary_encrypt_decrypt_roundtrip(tmp_path: Path):
+    """Encrypt then decrypt binary content returns original bytes."""
+    keypair = crypto.generate_age_keypair()
+    # Binary content with non-UTF-8 bytes (like Kerberos keys)
+    content = b"\x00\x01\x02\xff\xfe\xfd\x80\x90\xa0binary\x00data"
+    encrypted_path = tmp_path / "binary.age"
+    
+    crypto.encrypt_age_binary(content, [keypair.public_key], encrypted_path)
+    
+    assert encrypted_path.exists()
+    # The encrypted content should contain the base64 marker when decrypted as text
+    decrypted_text = crypto.decrypt_age(encrypted_path, identity_content=keypair.private_key)
+    assert decrypted_text.startswith("base64:")
+    
+    # Binary decrypt should return original bytes
+    decrypted = crypto.decrypt_age_binary(encrypted_path, identity_content=keypair.private_key)
+    
+    assert decrypted == content
+
+
+def test_binary_decrypt_fallback_for_text(tmp_path: Path):
+    """decrypt_age_binary falls back to encoding text if no base64 marker."""
+    keypair = crypto.generate_age_keypair()
+    content = "plain text content"
+    encrypted_path = tmp_path / "text.age"
+    
+    # Encrypt as text (no base64 marker)
+    crypto.encrypt_age(content, [keypair.public_key], encrypted_path)
+    
+    # Binary decrypt should still work, returning encoded bytes
+    decrypted = crypto.decrypt_age_binary(encrypted_path, identity_content=keypair.private_key)
+    
+    assert decrypted == content.encode("utf-8")

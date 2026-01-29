@@ -71,9 +71,61 @@ def encrypt_age(
         cmd.extend(["--recipient", recipient])
     cmd.extend(["--output", str(output_path)])
     
-    input_data = content if isinstance(content, str) else content.decode("utf-8")
+    if isinstance(content, bytes):
+        # Binary mode - pipe bytes directly
+        subprocess.run(cmd, input=content, check=True)
+    else:
+        # Text mode
+        subprocess.run(cmd, input=content, text=True, check=True)
+
+
+def encrypt_age_binary(
+    content: bytes,
+    recipients: list[str],
+    output_path: Path,
+) -> None:
+    """Encrypt binary content with age, base64-encoding it first.
     
-    subprocess.run(cmd, input=input_data, text=True, check=True)
+    Use this for binary data (like Kerberos keys) that needs to be
+    stored in age-encrypted files. The content is base64-encoded
+    before encryption so it survives text-based handling.
+    
+    Args:
+        content: Binary content to encrypt
+        recipients: List of age public keys
+        output_path: Where to write the encrypted file
+    """
+    import base64
+    encoded = base64.b64encode(content).decode("ascii")
+    # Add a marker so we know it's base64-encoded
+    marked = f"base64:{encoded}"
+    encrypt_age(marked, recipients, output_path)
+
+
+def decrypt_age_binary(
+    input_path: Path,
+    identity_path: Path | None = None,
+    identity_content: str | None = None,
+) -> bytes:
+    """Decrypt an age-encrypted file that was encrypted with encrypt_age_binary.
+    
+    This handles the base64: prefix marker automatically.
+    
+    Args:
+        input_path: Path to the encrypted file
+        identity_path: Path to the identity (private key) file
+        identity_content: Or provide the identity content directly
+        
+    Returns:
+        Decrypted content as bytes
+    """
+    import base64
+    content = decrypt_age(input_path, identity_path, identity_content)
+    if content.startswith("base64:"):
+        return base64.b64decode(content[7:])
+    else:
+        # Fallback: treat as raw text encoded to bytes
+        return content.encode("utf-8")
 
 
 def decrypt_age(
