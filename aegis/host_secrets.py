@@ -10,7 +10,7 @@ Example manifest:
     
     [ssh-host-keys]
     source = "ssh-host-keys.age"
-    target_dir = "/etc/ssh"
+    target_dir = "/run/aegis/ssh"
     user = "root"
     group = "root"
     mode = "0600"
@@ -18,7 +18,7 @@ Example manifest:
     
     [keytab]
     source = "keytab.age"
-    target = "/etc/krb5.keytab"
+    target = "/run/aegis/keytab"
     user = "root"
     group = "root"
     mode = "0600"
@@ -26,9 +26,9 @@ Example manifest:
     
     [nexus-key]
     source = "nexus-key.age"
-    target = "/run/nexus/hmac-key"
-    user = "nexus"
-    group = "nexus"
+    target = "/run/aegis/nexus-key"
+    user = "root"
+    group = "root"
     mode = "0400"
     
     [secrets.myservice-token]
@@ -52,15 +52,16 @@ import tomli_w  # type: ignore
 
 
 # Default deployment settings for different secret types
+# All paths under /run/aegis/ for safe decryption - NixOS config handles final placement
 DEFAULTS = {
     "ssh-host-keys": {
-        "target_dir": "/etc/ssh",
+        "target_dir": "/run/aegis/ssh",
         "user": "root",
         "group": "root",
         "mode": "0600",  # For private keys; public keys get 0644
     },
     "keytab": {
-        "target": "/etc/krb5.keytab",
+        "target": "/run/aegis/keytab",
         "user": "root",
         "group": "root",
         "mode": "0600",
@@ -387,9 +388,9 @@ def make_dnssec_entry(
     group: str | None = None,
 ) -> DnssecManifest:
     """Create a DNSSEC manifest with default target paths."""
-    # Default target directory based on common DNS server conventions
+    # Default target directory under /run/aegis for safe decryption
     if target_dir is None:
-        target_dir = f"/var/lib/dnssec/{domain}"
+        target_dir = f"/run/aegis/dnssec/{domain}"
     
     _user = user or "root"
     _group = group or "root"

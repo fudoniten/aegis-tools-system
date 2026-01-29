@@ -49,10 +49,10 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     manifest = host_secrets.HostSecretsManifest(hostname="testhost")
     manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entry(
         key_types=["ed25519", "ecdsa"],
-        target_dir="/etc/ssh",
+        target_dir="/run/aegis/ssh",
     )
     manifest.keytab = host_secrets.make_keytab_entry(
-        target="/etc/krb5.keytab",
+        target="/run/aegis/keytab",
     )
     manifest.nexus_key = host_secrets.make_nexus_key_entry(
         target="/run/nexus/key",
@@ -76,10 +76,10 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     
     assert loaded.hostname == "testhost"
     assert loaded.ssh_host_keys is not None
-    assert loaded.ssh_host_keys.target_dir == "/etc/ssh"
+    assert loaded.ssh_host_keys.target_dir == "/run/aegis/ssh"
     assert loaded.ssh_host_keys.key_types == ["ed25519", "ecdsa"]
     assert loaded.keytab is not None
-    assert loaded.keytab.target == "/etc/krb5.keytab"
+    assert loaded.keytab.target == "/run/aegis/keytab"
     assert loaded.keytab.encoding == "base64"
     assert loaded.nexus_key is not None
     assert loaded.nexus_key.user == "nexus"
@@ -94,7 +94,7 @@ def test_dnssec_manifest_roundtrip(tmp_path: Path):
         algorithm="ECDSAP256SHA256",
         algorithm_num=13,
         keytag=12345,
-        target_dir="/var/lib/dnssec/fudo.org",
+        target_dir="/run/aegis/dnssec/fudo.org",
         user="nsd",
         group="nsd",
     )
@@ -113,7 +113,7 @@ def test_dnssec_manifest_roundtrip(tmp_path: Path):
     assert loaded.algorithm_num == 13
     assert loaded.keytag == 12345
     assert loaded.public_key is not None
-    assert loaded.public_key.target == "/var/lib/dnssec/fudo.org/ksk.key"
+    assert loaded.public_key.target == "/run/aegis/dnssec/fudo.org/ksk.key"
     assert loaded.public_key.mode == "0644"  # Public key is world-readable
     assert loaded.private_key is not None
     assert loaded.private_key.mode == "0400"  # Private key is protected
@@ -122,13 +122,13 @@ def test_dnssec_manifest_roundtrip(tmp_path: Path):
 def test_default_values():
     """Default values are applied correctly."""
     ssh_entry = host_secrets.make_ssh_host_keys_entry(key_types=["ed25519"])
-    assert ssh_entry.target_dir == "/etc/ssh"
+    assert ssh_entry.target_dir == "/run/aegis/ssh"
     assert ssh_entry.user == "root"
     assert ssh_entry.group == "root"
     assert ssh_entry.mode == "0600"
     
     keytab_entry = host_secrets.make_keytab_entry()
-    assert keytab_entry.target == "/etc/krb5.keytab"
+    assert keytab_entry.target == "/run/aegis/keytab"
     assert keytab_entry.encoding == "base64"
     
     nexus_entry = host_secrets.make_nexus_key_entry()
