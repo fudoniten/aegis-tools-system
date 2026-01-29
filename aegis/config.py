@@ -120,6 +120,31 @@ class DomainConfig:
         return d
 
 
+@dataclass
+class DnssecConfig:
+    """Configuration for a domain's DNSSEC keys."""
+    domain: str
+    algorithm: str      # e.g., "ECDSAP256SHA256"
+    algorithm_num: int  # e.g., 13
+    keytag: int         # e.g., 11926
+    
+    @classmethod
+    def from_dict(cls, domain: str, data: dict) -> "DnssecConfig":
+        return cls(
+            domain=domain,
+            algorithm=data.get("algorithm", ""),
+            algorithm_num=data.get("algorithm_num", 0),
+            keytag=data.get("keytag", 0),
+        )
+    
+    def to_dict(self) -> dict:
+        return {
+            "algorithm": self.algorithm,
+            "algorithm_num": self.algorithm_num,
+            "keytag": self.keytag,
+        }
+
+
 class SecretsRepo:
     """Interface to the aegis-secrets repository."""
     
@@ -270,3 +295,41 @@ class SecretsRepo:
     def admin_key_path(self) -> Path:
         """Get the path to the admin public key."""
         return self.keys_path / "admin.pub"
+    
+    # DNSSEC configuration
+    
+    def dnssec_src_path(self, domain: str) -> Path:
+        """Get the source config directory for a domain's DNSSEC keys."""
+        safe_name = domain.replace(".", "_")
+        return self.src_path / "dnssec" / safe_name
+    
+    def dnssec_build_path(self, domain: str) -> Path:
+        """Get the build output directory for a domain's DNSSEC keys."""
+        safe_name = domain.replace(".", "_")
+        return self.build_path / "dnssec" / safe_name
+    
+    def get_dnssec_config(self, domain: str) -> DnssecConfig | None:
+        """Read DNSSEC configuration for a domain."""
+        config_path = self.dnssec_src_path(domain) / "config.toml"
+        if not config_path.exists():
+            return None
+        
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+        return DnssecConfig.from_dict(domain, data)
+    
+    def set_dnssec_config(self, config: DnssecConfig) -> None:
+        """Write DNSSEC configuration for a domain."""
+        config_path = self.dnssec_src_path(config.domain) / "config.toml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(config_path, "wb") as f:
+            tomli_w.dump(config.to_dict(), f)
+    
+    def list_dnssec_domains(self) -> list[str]:
+        """List all domains with DNSSEC keys configured."""
+        dnssec_dir = self.src_path / "dnssec"
+        if not dnssec_dir.exists():
+            return []
+        # Convert safe names back to domain names
+        return [p.name.replace("_", ".") for p in dnssec_dir.iterdir() if p.is_dir()]

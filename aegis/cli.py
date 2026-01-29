@@ -1173,6 +1173,277 @@ def import_secret(
 
 
 # =============================================================================
+# DNSSEC Commands
+# =============================================================================
+
+def _ensure_dns_role(
+    repo: config.SecretsRepo,
+    domain: str,
+    hostname: str,
+    entities_path: Optional[Path],
+) -> str:
+    """Ensure dns-master-<domain> role exists, create if needed.
+    
+    Returns the role's public key.
+    """
+    role_name = f"dns-master-{domain}"
+    existing = repo.get_role_config(role_name)
+    
+    if existing:
+        # Role exists, get its public key
+        role_pub_path = repo.role_build_path(role_name) / f"{role_name}.pub"
+        if not role_pub_path.exists():
+            typer.echo(f"Error: Role {role_name} exists but public key not found", err=True)
+            raise typer.Exit(1)
+        return role_pub_path.read_text().strip()
+    
+    # Create the role
+    typer.echo(f"Creating role: {role_name} (assigned to {hostname})")
+    
+    # Get master public key for the host
+    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
+    
+    # Generate role keypair
+    keypair = crypto.generate_age_keypair()
+    
+    # Encrypt role private key for the host and admin
+    admin_pubkey = crypto.get_admin_public_key()
+    host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
+    
+    role_key_path = repo.role_build_path(role_name) / f"{role_name}.age"
+    role_key_path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(keypair.private_key, [host_age_key, admin_pubkey], role_key_path)
+    
+    # Save public key
+    role_pub_path = repo.role_build_path(role_name) / f"{role_name}.pub"
+    role_pub_path.write_text(keypair.public_key)
+    
+    # Save role config
+    role_config = config.RoleConfig(name=role_name, host=hostname)
+    repo.set_role_config(role_config)
+    
+    return keypair.public_key
+
+
+@app.command("generate-dnssec-keys")
+def generate_dnssec_keys(
+    domain: str = typer.Argument(..., help="Domain name (e.g., fudo.org)"),
+    hostname: str = typer.Option(..., "--host", "-h", help="DNS master server hostname"),
+    algorithm: str = typer.Option("ECDSAP256SHA256", "--algorithm", "-a", help="DNSSEC algorithm"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
+):
+    """Generate DNSSEC Key Signing Key (KSK) for a domain.
+    
+    Creates a new DNSSEC KSK using ldns-keygen and encrypts it for the
+    dns-master-<domain> role (auto-created if needed) and the admin.
+    
+    Requires ldns-keygen to be available in PATH.
+    
+    Example:
+        aegis generate-dnssec-keys fudo.org --host polaris
+        aegis generate-dnssec-keys fudo.org --host polaris --algorithm ED25519
+    """
+    from . import dnssec
+    import tempfile
+    
+    repo = get_secrets_repo(secrets_path)
+    repo.ensure_structure()
+    
+    # Check if keys already exist
+    existing = repo.get_dnssec_config(domain)
+    if existing and not force:
+        typer.echo(f"DNSSEC keys already exist for {domain} (keytag: {existing.keytag})")
+        typer.echo("Use --force to overwrite.")
+        raise typer.Exit(1)
+    
+    # Validate algorithm
+    if algorithm not in dnssec.ALGORITHM_MAP:
+        typer.echo(f"Error: Unknown algorithm: {algorithm}", err=True)
+        typer.echo(f"Valid options: {', '.join(dnssec.ALGORITHM_MAP.keys())}")
+        raise typer.Exit(1)
+    
+    typer.echo(f"Generating DNSSEC KSK for {domain}...")
+    typer.echo(f"  Algorithm: {algorithm} ({dnssec.ALGORITHM_MAP[algorithm]})")
+    
+    # Ensure role exists and get its public key
+    role_pubkey = _ensure_dns_role(repo, domain, hostname, entities_path)
+    admin_pubkey = crypto.get_admin_public_key()
+    recipients = [role_pubkey, admin_pubkey]
+    
+    # Generate keys in temp directory
+    with tempfile.TemporaryDirectory(prefix="aegis-dnssec-") as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        try:
+            key_files = dnssec.generate_ksk(domain, tmpdir, algorithm)
+        except FileNotFoundError:
+            typer.echo("Error: ldns-keygen not found in PATH", err=True)
+            typer.echo("Install with: nix-shell -p ldns.examples")
+            raise typer.Exit(1)
+        except Exception as e:
+            typer.echo(f"Error generating keys: {e}", err=True)
+            raise typer.Exit(1)
+        
+        typer.echo(f"  Generated: {key_files.basename}")
+        typer.echo(f"  Key tag: {key_files.keytag}")
+        
+        # Create output directory
+        build_dir = repo.dnssec_build_path(domain)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Encrypt and store keys
+        typer.echo(f"Encrypting keys for: admin, dns-master-{domain}")
+        
+        # Public key (.key)
+        key_content = key_files.key_file.read_text()
+        crypto.encrypt_age(key_content, recipients, build_dir / "ksk.key.age")
+        typer.echo(f"  ksk.key.age")
+        
+        # Private key (.private)
+        private_content = key_files.private_file.read_text()
+        crypto.encrypt_age(private_content, recipients, build_dir / "ksk.private.age")
+        typer.echo(f"  ksk.private.age")
+        
+        # DS record (.ds)
+        if key_files.ds_file.exists():
+            ds_content = key_files.ds_file.read_text()
+            crypto.encrypt_age(ds_content, recipients, build_dir / "ksk.ds.age")
+            typer.echo(f"  ksk.ds.age")
+            ds_record = ds_content.strip()
+        else:
+            ds_record = None
+    
+    # Save config
+    dnssec_config = config.DnssecConfig(
+        domain=domain,
+        algorithm=algorithm,
+        algorithm_num=dnssec.ALGORITHM_MAP[algorithm],
+        keytag=key_files.keytag,
+    )
+    repo.set_dnssec_config(dnssec_config)
+    
+    typer.secho(f"\nDNSSEC keys generated successfully!", fg=typer.colors.GREEN)
+    typer.echo(f"  Location: {build_dir}")
+    typer.echo(f"  Algorithm: {algorithm} ({dnssec.ALGORITHM_MAP[algorithm]})")
+    typer.echo(f"  Key tag: {key_files.keytag}")
+    
+    if ds_record:
+        typer.echo(f"\nDS Record (submit to registrar):")
+        typer.echo(f"  {ds_record}")
+
+
+@app.command("import-dnssec-keys")
+def import_dnssec_keys(
+    domain: str = typer.Argument(..., help="Domain name (e.g., fudo.org)"),
+    keys_dir: Path = typer.Option(..., "--keys-dir", "-k", help="Directory containing DNSSEC key files"),
+    hostname: str = typer.Option(..., "--host", "-h", help="DNS master server hostname"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
+):
+    """Import existing DNSSEC Key Signing Key (KSK) for a domain.
+    
+    Imports DNSSEC key files generated by ldns-keygen:
+      - K<domain>.+<alg>+<keytag>.key      (public key)
+      - K<domain>.+<alg>+<keytag>.private  (private key)
+      - K<domain>.+<alg>+<keytag>.ds       (DS record, optional)
+    
+    The keys are encrypted for the dns-master-<domain> role (auto-created
+    if needed) and the admin.
+    
+    Example:
+        aegis import-dnssec-keys fudo.org --keys-dir /secrets/dnssec/fudo.org/ --host polaris
+    """
+    from . import dnssec
+    
+    repo = get_secrets_repo(secrets_path)
+    repo.ensure_structure()
+    
+    if not keys_dir.exists() or not keys_dir.is_dir():
+        typer.echo(f"Error: Keys directory not found: {keys_dir}", err=True)
+        raise typer.Exit(1)
+    
+    # Check if keys already exist
+    existing = repo.get_dnssec_config(domain)
+    if existing and not force:
+        typer.echo(f"DNSSEC keys already exist for {domain} (keytag: {existing.keytag})")
+        typer.echo("Use --force to overwrite.")
+        raise typer.Exit(1)
+    
+    # Find key files
+    key_files = dnssec.find_dnssec_keys(keys_dir, domain)
+    if key_files is None:
+        typer.echo(f"Error: No DNSSEC key files found for {domain} in {keys_dir}", err=True)
+        typer.echo(f"Looking for files matching: K{domain}.+<alg>+<keytag>.*")
+        raise typer.Exit(1)
+    
+    typer.echo(f"Importing DNSSEC keys for {domain}...")
+    typer.echo(f"  Found: {key_files.basename}")
+    typer.echo(f"  Algorithm: {key_files.algorithm} ({key_files.algorithm_num})")
+    typer.echo(f"  Key tag: {key_files.keytag}")
+    
+    # Check required files exist
+    if not key_files.key_file.exists():
+        typer.echo(f"Error: Public key file not found: {key_files.key_file}", err=True)
+        raise typer.Exit(1)
+    if not key_files.private_file.exists():
+        typer.echo(f"Error: Private key file not found: {key_files.private_file}", err=True)
+        raise typer.Exit(1)
+    
+    # Ensure role exists and get its public key
+    role_pubkey = _ensure_dns_role(repo, domain, hostname, entities_path)
+    admin_pubkey = crypto.get_admin_public_key()
+    recipients = [role_pubkey, admin_pubkey]
+    
+    # Create output directory
+    build_dir = repo.dnssec_build_path(domain)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Encrypt and store keys
+    typer.echo(f"Encrypting keys for: admin, dns-master-{domain}")
+    
+    # Public key (.key)
+    key_content = key_files.key_file.read_text()
+    crypto.encrypt_age(key_content, recipients, build_dir / "ksk.key.age")
+    typer.echo(f"  ksk.key.age")
+    
+    # Private key (.private)
+    private_content = key_files.private_file.read_text()
+    crypto.encrypt_age(private_content, recipients, build_dir / "ksk.private.age")
+    typer.echo(f"  ksk.private.age")
+    
+    # DS record (.ds) - optional
+    ds_record = None
+    if key_files.ds_file.exists():
+        ds_content = key_files.ds_file.read_text()
+        crypto.encrypt_age(ds_content, recipients, build_dir / "ksk.ds.age")
+        typer.echo(f"  ksk.ds.age")
+        ds_record = ds_content.strip()
+    else:
+        typer.echo(f"  (no DS record file found)")
+    
+    # Save config
+    dnssec_config = config.DnssecConfig(
+        domain=domain,
+        algorithm=key_files.algorithm,
+        algorithm_num=key_files.algorithm_num,
+        keytag=key_files.keytag,
+    )
+    repo.set_dnssec_config(dnssec_config)
+    
+    typer.secho(f"\nDNSSEC keys imported successfully!", fg=typer.colors.GREEN)
+    typer.echo(f"  Location: {build_dir}")
+    typer.echo(f"  Algorithm: {key_files.algorithm} ({key_files.algorithm_num})")
+    typer.echo(f"  Key tag: {key_files.keytag}")
+    
+    if ds_record:
+        typer.echo(f"\nDS Record (submit to registrar):")
+        typer.echo(f"  {ds_record}")
+
+
+# =============================================================================
 # Configuration Commands
 # =============================================================================
 
