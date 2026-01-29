@@ -217,6 +217,10 @@ def build_ssh_host_keys(
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     force: bool = typer.Option(False, "--force", "-f", help="Regenerate even if keys exist"),
+    target_dir: str = typer.Option("/etc/ssh", "--target-dir", help="Target directory for SSH keys"),
+    user: str = typer.Option("root", "--user", help="Owner user for key files"),
+    group: str = typer.Option("root", "--group", help="Owner group for key files"),
+    mode: str = typer.Option("0600", "--mode", help="Permissions for private key files"),
 ):
     """Generate SSH host keys for OpenSSH servers.
     
@@ -228,8 +232,13 @@ def build_ssh_host_keys(
     Keys are encrypted with the host's master key + admin key and stored
     in build/hosts/<hostname>/ssh-host-keys.age.
     
+    Deployment metadata (target path, ownership, permissions) is stored in
+    build/hosts/<hostname>/secrets.toml for NixOS to import.
+    
     Also generates SSHFP DNS records for trust establishment.
     """
+    from . import host_secrets
+    
     repo = get_secrets_repo(secrets_path)
     
     hosts = repo.list_hosts()
@@ -275,6 +284,18 @@ def build_ssh_host_keys(
         
         typer.echo(f"    Wrote {output_path}")
         
+        # Update manifest with deployment metadata
+        manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+        manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entry(
+            key_types=["ed25519", "ecdsa", "rsa"],
+            target_dir=target_dir,
+            user=user,
+            group=group,
+            mode=mode,
+        )
+        manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
+        typer.echo(f"    Updated manifest: {manifest_path}")
+        
         # Generate SSHFP records
         public_keys = [
             keys.host_ed25519.public_key,
@@ -293,6 +314,10 @@ def build_nexus_keys(
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     force: bool = typer.Option(False, "--force", "-f", help="Regenerate even if keys exist"),
     algorithm: str = typer.Option("HmacSHA512", "--algorithm", "-a", help="HMAC algorithm"),
+    target: str = typer.Option("/run/aegis/nexus-key", "--target", help="Target path for nexus key"),
+    user: str = typer.Option("root", "--user", help="Owner user"),
+    group: str = typer.Option("root", "--group", help="Owner group"),
+    mode: str = typer.Option("0400", "--mode", help="Permissions"),
 ):
     """Generate Nexus DDNS authentication keys for hosts.
     
@@ -300,8 +325,7 @@ def build_nexus_keys(
     Keys are encrypted with both the admin and host keys.
     
     Each host gets a unique key stored in build/hosts/<hostname>/nexus-key.age.
-    Nexus server hosts will automatically receive a collection of all client
-    keys via the NixOS configuration.
+    Deployment metadata is written to secrets.toml for NixOS to import.
     """
     from . import nexus
     
@@ -358,6 +382,18 @@ def build_nexus_keys(
         
         typer.echo(f"    Wrote {output_path}")
         
+        # Update manifest with deployment metadata
+        from . import host_secrets
+        manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+        manifest.nexus_key = host_secrets.make_nexus_key_entry(
+            target=target,
+            user=user,
+            group=group,
+            mode=mode,
+        )
+        host_secrets.save_host_manifest(repo.build_path, manifest)
+        typer.echo(f"    Updated manifest")
+        
         # Show the algorithm
         algo, _ = key_content.strip().split(":", 1)
         typer.echo(f"    Algorithm: {algo}")
@@ -369,8 +405,15 @@ def build_keytabs(
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     force: bool = typer.Option(False, "--force", "-f", help="Regenerate even if keytabs exist"),
+    target: str = typer.Option("/etc/krb5.keytab", "--target", help="Target path for keytab"),
+    user: str = typer.Option("root", "--user", help="Owner user for keytab"),
+    group: str = typer.Option("root", "--group", help="Owner group for keytab"),
+    mode: str = typer.Option("0600", "--mode", help="Permissions for keytab"),
 ):
-    """Generate Kerberos keytabs for hosts and KDC database."""
+    """Generate Kerberos keytabs for hosts and KDC database.
+    
+    Deployment metadata is written to secrets.toml for NixOS to import.
+    """
     from . import kerberos as krb
     import tempfile
     import shutil
@@ -547,6 +590,18 @@ def build_keytabs(
                 crypto.encrypt_age_binary(keytab_content, recipients, keytab_output)
                 
                 typer.echo(f"    Wrote: {keytab_output}")
+                
+                # Update manifest with deployment metadata
+                from . import host_secrets
+                manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+                manifest.keytab = host_secrets.make_keytab_entry(
+                    target=target,
+                    user=user,
+                    group=group,
+                    mode=mode,
+                )
+                host_secrets.save_host_manifest(repo.build_path, manifest)
+                typer.echo(f"    Updated manifest")
             
             # Encrypt any new principals back to the repo (binary)
             if new_principals:
@@ -841,6 +896,10 @@ def import_ssh_host_keys(
     key_files: list[Path] = typer.Option([], "--key", help="Path to SSH private key file (type auto-detected, can specify multiple)"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+    target_dir: str = typer.Option("/etc/ssh", "--target-dir", help="Target directory for SSH keys"),
+    user: str = typer.Option("root", "--user", help="Owner user for key files"),
+    group: str = typer.Option("root", "--group", help="Owner group for key files"),
+    mode: str = typer.Option("0600", "--mode", help="Permissions for private key files"),
 ):
     """Import SSH host keys for OpenSSH server (NOT the master key).
     
@@ -856,6 +915,7 @@ def import_ssh_host_keys(
     - Derives public keys automatically
     - Encrypts with the host's master key + admin key
     - Stores in build/hosts/<hostname>/ssh-host-keys.age
+    - Writes deployment metadata to secrets.toml for NixOS
     
     Example:
         aegis import-ssh-host-keys lambda \\
@@ -937,8 +997,23 @@ def import_ssh_host_keys(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     crypto.encrypt_age(keys_yaml, recipients, output_path)
     
+    # Update manifest with deployment metadata
+    from . import host_secrets
+    manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+    key_types = [kp.key_type for kp in keypairs]
+    manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entry(
+        key_types=key_types,
+        target_dir=target_dir,
+        user=user,
+        group=group,
+        mode=mode,
+    )
+    manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
+    
     typer.secho(f"\nSSH host keys imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Output: {output_path}")
+    typer.echo(f"  Manifest: {manifest_path}")
+    typer.echo(f"  Target: {target_dir}")
     typer.echo(f"  Encrypted for: {hostname} (master key) + admin")
     typer.echo(f"  These keys are for OpenSSH server identity.")
 
@@ -949,11 +1024,17 @@ def import_nexus_key(
     key_file: Path = typer.Option(..., "--file", help="Path to nexus HMAC key file"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
+    target: str = typer.Option("/run/aegis/nexus-key", "--target", help="Target path for nexus key"),
+    user: str = typer.Option("root", "--user", help="Owner user"),
+    group: str = typer.Option("root", "--group", help="Owner group"),
+    mode: str = typer.Option("0400", "--mode", help="Permissions"),
 ):
     """Import a Nexus DDNS authentication key for a host.
     
     Imports an existing Nexus HMAC key. The key should be in the format:
     HmacSHA512:base64encodedkey
+    
+    Deployment metadata is written to secrets.toml for NixOS to import.
     
     Example:
         aegis import-nexus-key lambda --file /secure/lambda.nexus.hmac
@@ -1013,8 +1094,21 @@ def import_nexus_key(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     crypto.encrypt_age(key_content, recipients, output_path)
     
+    # Update manifest with deployment metadata
+    from . import host_secrets
+    manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+    manifest.nexus_key = host_secrets.make_nexus_key_entry(
+        target=target,
+        user=user,
+        group=group,
+        mode=mode,
+    )
+    manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
+    
     typer.secho(f"\nNexus key imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Output: {output_path}")
+    typer.echo(f"  Manifest: {manifest_path}")
+    typer.echo(f"  Target: {target}")
     typer.echo(f"  Encrypted for: {hostname} (host) + admin")
 
 
@@ -1104,7 +1198,7 @@ def import_secret(
     
     This is for service-specific or custom secrets that don't fit the standard
     categories (SSH, Nexus, Kerberos). The secret will be encrypted and metadata
-    about target path, ownership, and permissions will be stored in the host config.
+    about target path, ownership, and permissions will be stored in secrets.toml.
     
     Example:
         aegis import-secret lambda my-service-token \\
@@ -1112,6 +1206,8 @@ def import_secret(
             --target /run/myservice/token \\
             --user myservice --group myservice --mode 0600
     """
+    from . import host_secrets
+    
     repo = get_secrets_repo(secrets_path)
     ent_path = get_entities_path(entities_path)
     repo.ensure_structure()
@@ -1141,15 +1237,7 @@ def import_secret(
             hostname=hostname,
             services=services,
         )
-    
-    # Add secret metadata to host config
-    host_config.extra_secrets[secret_name] = {
-        "target": target,
-        "user": user,
-        "group": group,
-        "mode": mode,
-    }
-    repo.set_host_config(host_config)
+        repo.set_host_config(host_config)
     
     # Read secret content
     secret_content = file.read_text()
@@ -1159,17 +1247,29 @@ def import_secret(
     admin_pubkey = crypto.get_admin_public_key()
     recipients = [host_age_key, admin_pubkey]
     
-    # Encrypt and write
-    output_path = repo.host_build_path(hostname) / f"{secret_name}.age"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Encrypt and write to secrets subdirectory
+    secrets_dir = repo.host_build_path(hostname) / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    output_path = secrets_dir / f"{secret_name}.age"
     crypto.encrypt_age(secret_content, recipients, output_path)
+    
+    # Update manifest with deployment metadata
+    manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+    manifest.secrets[secret_name] = host_secrets.make_secret_entry(
+        name=secret_name,
+        target=target,
+        user=user,
+        group=group,
+        mode=mode,
+    )
+    manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
     
     typer.secho(f"\nSecret imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Output: {output_path}")
+    typer.echo(f"  Manifest: {manifest_path}")
     typer.echo(f"  Target: {target}")
     typer.echo(f"  Owner: {user}:{group}")
     typer.echo(f"  Mode: {mode}")
-    typer.echo(f"  Metadata stored in: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
 
 
 # =============================================================================
@@ -1233,11 +1333,16 @@ def generate_dnssec_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
+    target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Target directory for keys (default: /var/lib/dnssec/<domain>)"),
+    user: str = typer.Option("root", "--user", help="Owner user for key files"),
+    group: str = typer.Option("root", "--group", help="Owner group for key files"),
 ):
     """Generate DNSSEC Key Signing Key (KSK) for a domain.
     
     Creates a new DNSSEC KSK using ldns-keygen and encrypts it for the
     dns-master-<domain> role (auto-created if needed) and the admin.
+    
+    Deployment metadata is written to secrets.toml for NixOS to import.
     
     Requires ldns-keygen to be available in PATH.
     
@@ -1315,7 +1420,7 @@ def generate_dnssec_keys(
         else:
             ds_record = None
     
-    # Save config
+    # Save config (legacy - still keep for backward compat)
     dnssec_config = config.DnssecConfig(
         domain=domain,
         algorithm=algorithm,
@@ -1324,10 +1429,26 @@ def generate_dnssec_keys(
     )
     repo.set_dnssec_config(dnssec_config)
     
+    # Save secrets manifest with deployment metadata
+    from . import host_secrets
+    dnssec_manifest = host_secrets.make_dnssec_entry(
+        domain=domain,
+        algorithm=algorithm,
+        algorithm_num=dnssec.ALGORITHM_MAP[algorithm],
+        keytag=key_files.keytag,
+        target_dir=target_dir,
+        user=user,
+        group=group,
+    )
+    manifest_path = host_secrets.save_dnssec_manifest(repo.build_path, dnssec_manifest)
+    
     typer.secho(f"\nDNSSEC keys generated successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Location: {build_dir}")
+    typer.echo(f"  Manifest: {manifest_path}")
     typer.echo(f"  Algorithm: {algorithm} ({dnssec.ALGORITHM_MAP[algorithm]})")
     typer.echo(f"  Key tag: {key_files.keytag}")
+    if dnssec_manifest.public_key:
+        typer.echo(f"  Target dir: {dnssec_manifest.public_key.target.rsplit('/', 1)[0]}")
     
     if ds_record:
         typer.echo(f"\nDS Record (submit to registrar):")
@@ -1342,6 +1463,9 @@ def import_dnssec_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
+    target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Target directory for keys (default: /var/lib/dnssec/<domain>)"),
+    user: str = typer.Option("root", "--user", help="Owner user for key files"),
+    group: str = typer.Option("root", "--group", help="Owner group for key files"),
 ):
     """Import existing DNSSEC Key Signing Key (KSK) for a domain.
     
@@ -1352,6 +1476,8 @@ def import_dnssec_keys(
     
     The keys are encrypted for the dns-master-<domain> role (auto-created
     if needed) and the admin.
+    
+    Deployment metadata is written to secrets.toml for NixOS to import.
     
     Example:
         aegis import-dnssec-keys fudo.org --keys-dir /secrets/dnssec/fudo.org/ --host polaris
@@ -1424,7 +1550,7 @@ def import_dnssec_keys(
     else:
         typer.echo(f"  (no DS record file found)")
     
-    # Save config
+    # Save config (legacy - still keep for backward compat)
     dnssec_config = config.DnssecConfig(
         domain=domain,
         algorithm=key_files.algorithm,
@@ -1433,10 +1559,26 @@ def import_dnssec_keys(
     )
     repo.set_dnssec_config(dnssec_config)
     
+    # Save secrets manifest with deployment metadata
+    from . import host_secrets
+    dnssec_manifest = host_secrets.make_dnssec_entry(
+        domain=domain,
+        algorithm=key_files.algorithm,
+        algorithm_num=key_files.algorithm_num,
+        keytag=key_files.keytag,
+        target_dir=target_dir,
+        user=user,
+        group=group,
+    )
+    manifest_path = host_secrets.save_dnssec_manifest(repo.build_path, dnssec_manifest)
+    
     typer.secho(f"\nDNSSEC keys imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Location: {build_dir}")
+    typer.echo(f"  Manifest: {manifest_path}")
     typer.echo(f"  Algorithm: {key_files.algorithm} ({key_files.algorithm_num})")
     typer.echo(f"  Key tag: {key_files.keytag}")
+    if dnssec_manifest.public_key:
+        typer.echo(f"  Target dir: {dnssec_manifest.public_key.target.rsplit('/', 1)[0]}")
     
     if ds_record:
         typer.echo(f"\nDS Record (submit to registrar):")
