@@ -104,50 +104,47 @@ def get_entities_path(entities_path: Optional[Path]) -> Path:
     raise typer.Exit(1)
 
 
-def get_host_master_pubkey(
+def get_host_age_pubkey(
     hostname: str,
     repo: config.SecretsRepo,
     entities_path: Optional[Path] = None,
 ) -> str:
-    """Get the master public key for a host.
-    
+    """Get the age public key for a host.
+
     Resolution order:
     1. Host config in aegis-secrets (src/hosts/<hostname>.toml)
-    2. nix-entities
-    
-    The master key is an SSH public key used to encrypt secrets FOR the host.
-    The host has the corresponding private key to decrypt.
-    
+    2. nix-entities (SSH key converted to age on the fly)
+
     Returns:
-        SSH public key string (e.g., "ssh-ed25519 AAAA...")
-        
+        age public key string (e.g., "age1...")
+
     Raises:
-        typer.Exit if no master key found
+        typer.Exit if no key found
     """
     # First, check host config in repo
     host_config = repo.get_host_config(hostname)
-    if host_config and host_config.master_pubkey:
-        return host_config.master_pubkey
-    
-    # Fall back to nix-entities
+    if host_config and host_config.age_pubkey:
+        return host_config.age_pubkey
+
+    # Fall back to nix-entities (entities store SSH keys; convert to age)
     if entities_path is None:
         try:
             entities_path = get_entities_path(None)
         except SystemExit:
-            typer.echo(f"Error: No master key for {hostname}", err=True)
-            typer.echo(f"Set it with: aegis set-master-key {hostname} --public-key 'ssh-ed25519 ...'", err=True)
+            typer.echo(f"Error: No age key for {hostname}", err=True)
+            typer.echo(f"Set it with: aegis set-master-key {hostname} --public-key 'age1...'", err=True)
             raise typer.Exit(1)
-    
+
     try:
         host = entities.get_host(hostname, entities_path)
         if host.master_key and host.master_key.public_key:
-            return host.master_key.public_key
+            return crypto.ssh_pubkey_to_age(host.master_key.public_key)
     except Exception as e:
         typer.echo(f"Warning: Could not get host from entities: {e}", err=True)
-    
-    typer.echo(f"Error: No master key configured for {hostname}", err=True)
+
+    typer.echo(f"Error: No age key configured for {hostname}", err=True)
     typer.echo(f"Either:", err=True)
-    typer.echo(f"  1. Set it with: aegis set-master-key {hostname} --public-key 'ssh-ed25519 ...'", err=True)
+    typer.echo(f"  1. Set it with: aegis set-master-key {hostname} --public-key 'age1...'", err=True)
     typer.echo(f"  2. Configure it in nix-entities", err=True)
     raise typer.Exit(1)
 
@@ -261,21 +258,20 @@ def build_ssh_host_keys(
         
         typer.echo(f"  Generating SSH host keys for {hostname}...")
         
-        # Get master public key (from config or entities)
+        # Get age public key (from config or entities)
         try:
-            master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
+            host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
         except SystemExit:
-            typer.echo(f"    Skipping {hostname} (no master key)", err=True)
+            typer.echo(f"    Skipping {hostname} (no age key)", err=True)
             continue
-        
+
         # Generate keys
         keys = ssh.generate_host_keys(hostname)
-        
+
         # Convert to YAML
         keys_yaml = yaml.dump(keys.to_dict(), default_flow_style=False)
-        
+
         # Get recipients
-        host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
         recipients = [host_age_key, admin_pubkey]
         
         # Encrypt and write
@@ -352,13 +348,13 @@ def build_nexus_keys(
         
         typer.echo(f"  Generating Nexus key for {hostname}...")
         
-        # Get master public key (from config or entities)
+        # Get age public key (from config or entities)
         try:
-            master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
+            host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
         except SystemExit:
-            typer.echo(f"    Skipping {hostname} (no master key)", err=True)
+            typer.echo(f"    Skipping {hostname} (no age key)", err=True)
             continue
-        
+
         # Generate key in a temp file
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -368,12 +364,11 @@ def build_nexus_keys(
                 algorithm=algorithm,
                 verbose=False,
             )
-            
+
             # Read the generated key
             key_content = tmp_key_path.read_text()
-        
+
         # Get recipients
-        host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
         recipients = [host_age_key, admin_pubkey]
         
         # Encrypt and write
@@ -518,11 +513,11 @@ def build_keytabs(
             for hostname in hostnames:
                 typer.echo(f"  Processing host: {hostname}")
                 
-                # Get master public key
+                # Get age public key
                 try:
-                    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
+                    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
                 except SystemExit:
-                    typer.echo(f"    Skipping {hostname} (no master key)", err=True)
+                    typer.echo(f"    Skipping {hostname} (no age key)", err=True)
                     continue
                 
                 # Get host info for domain and services
@@ -578,7 +573,6 @@ def build_keytabs(
                     continue
                 
                 # Encrypt keytab for host + KDC role + admin
-                host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
                 recipients = [host_age_key, admin_pubkey]
                 if kdc_role_pubkey:
                     recipients.append(kdc_role_pubkey)
@@ -723,11 +717,9 @@ def build_user_secrets(
         host_keys: dict[str, str] = {}
         for hostname in user_config.hosts:
             try:
-                master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
-                host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
-                host_keys[hostname] = host_age_key
+                host_keys[hostname] = get_host_age_pubkey(hostname, repo, entities_path)
             except SystemExit:
-                typer.echo(f"  Warning: No master key for {hostname}, skipping", err=True)
+                typer.echo(f"  Warning: No age key for {hostname}, skipping", err=True)
             except Exception as e:
                 typer.echo(f"  Warning: Could not get host {hostname}: {e}", err=True)
         
@@ -935,9 +927,9 @@ def import_ssh_host_keys(
     typer.echo(f"Importing SSH host keys for {hostname}...")
     typer.echo(f"  (These are OpenSSH server keys, NOT the master key)")
     
-    # Get master public key (from config or entities)
-    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
-    
+    # Get age public key (from config or entities)
+    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
     # Ensure host config exists (create if missing)
     host_config = repo.get_host_config(hostname)
     if not host_config:
@@ -987,11 +979,10 @@ def import_ssh_host_keys(
     
     keys_yaml = yaml.dump(keys_dict, default_flow_style=False)
     
-    # Get recipients (host master key + admin key)
-    host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
+    # Get recipients (host age key + admin key)
     admin_pubkey = crypto.get_admin_public_key()
     recipients = [host_age_key, admin_pubkey]
-    
+
     # Encrypt and write
     output_path = repo.host_build_path(hostname) / "ssh-host-keys.age"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1051,9 +1042,9 @@ def import_nexus_key(
     
     typer.echo(f"Importing Nexus key for {hostname}...")
     
-    # Get master public key
-    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
-    
+    # Get age public key
+    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
     # Ensure host config exists
     host_config = repo.get_host_config(hostname)
     if not host_config:
@@ -1072,10 +1063,10 @@ def import_nexus_key(
         )
         repo.set_host_config(host_config)
         typer.echo(f"  Created {repo.src_path / 'hosts' / f'{hostname}.toml'}")
-    
+
     # Read and validate key
     key_content = key_file.read_text().strip()
-    
+
     try:
         algo, encoded_key = nexus.read_key(key_file)
         typer.echo(f"  Algorithm: {algo}")
@@ -1083,9 +1074,8 @@ def import_nexus_key(
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
-    
+
     # Get recipients
-    host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
     admin_pubkey = crypto.get_admin_public_key()
     recipients = [host_age_key, admin_pubkey]
     
@@ -1218,9 +1208,9 @@ def import_secret(
     
     typer.echo(f"Importing secret '{secret_name}' for {hostname}...")
     
-    # Get master public key
-    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
-    
+    # Get age public key
+    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
     # Ensure host config exists
     host_config = repo.get_host_config(hostname)
     if not host_config:
@@ -1238,12 +1228,11 @@ def import_secret(
             services=services,
         )
         repo.set_host_config(host_config)
-    
+
     # Read secret content
     secret_content = file.read_text()
-    
+
     # Get recipients
-    host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
     admin_pubkey = crypto.get_admin_public_key()
     recipients = [host_age_key, admin_pubkey]
     
@@ -1300,16 +1289,15 @@ def _ensure_dns_role(
     # Create the role
     typer.echo(f"Creating role: {role_name} (assigned to {hostname})")
     
-    # Get master public key for the host
-    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
-    
+    # Get age public key for the host
+    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
     # Generate role keypair
     keypair = crypto.generate_age_keypair()
-    
+
     # Encrypt role private key for the host and admin
     admin_pubkey = crypto.get_admin_public_key()
-    host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
-    
+
     role_key_path = repo.role_build_path(role_name) / f"{role_name}.age"
     role_key_path.parent.mkdir(parents=True, exist_ok=True)
     crypto.encrypt_age(keypair.private_key, [host_age_key, admin_pubkey], role_key_path)
@@ -1598,13 +1586,13 @@ def sync_hosts(
     filter_domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Only sync hosts in this domain"),
 ):
     """Sync hosts from nix-entities to aegis-secrets.
-    
+
     This command discovers all hosts in nix-entities that have master keys
     configured and creates corresponding host configs in aegis-secrets.
-    
+
     For each host found:
     - Creates src/hosts/<hostname>.toml if it doesn't exist
-    - Sets master_pubkey from entities
+    - Sets age_pubkey (converted from the SSH master key in entities)
     - Sets kerberos services from entities
     
     This is idempotent - running it multiple times is safe. It will:
@@ -1674,32 +1662,40 @@ def sync_hosts(
             no_master_key += 1
             continue
         
+        # Convert the entities SSH master key to age format
+        try:
+            host_age_pubkey = crypto.ssh_pubkey_to_age(host.master_key.public_key)
+        except Exception as e:
+            typer.echo(f"  {hostname}: Could not convert SSH key to age: {e}", err=True)
+            no_master_key += 1
+            continue
+
         # Check if config already exists
         existing = repo.get_host_config(hostname)
         if existing:
-            # Check if master key needs updating
-            if existing.master_pubkey != host.master_key.public_key:
+            # Check if age key needs updating
+            if existing.age_pubkey != host_age_pubkey:
                 if dry_run:
-                    typer.echo(f"  {hostname}: Master key changed (would update)")
+                    typer.echo(f"  {hostname}: Age key changed (would update)")
                 else:
-                    existing.master_pubkey = host.master_key.public_key
+                    existing.age_pubkey = host_age_pubkey
                     existing.services = host.kerberos_services
                     repo.set_host_config(existing)
-                    typer.echo(f"  {hostname}: Updated master key")
+                    typer.echo(f"  {hostname}: Updated age key")
                     created += 1
             else:
                 skipped += 1
             continue
-        
+
         # Create new host config
         if dry_run:
             typer.echo(f"  {hostname}: Would create config (domain={host.domain})")
             created += 1
             continue
-        
+
         host_config = config.HostConfig(
             hostname=hostname,
-            master_pubkey=host.master_key.public_key,
+            age_pubkey=host_age_pubkey,
             services=host.kerberos_services,
         )
         repo.set_host_config(host_config)
@@ -1753,68 +1749,59 @@ def init_host(
     typer.echo(f"  Config: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
     typer.echo("")
     typer.echo("Next:")
-    typer.echo("  1. Set master key: aegis set-master-key {hostname} --public-key 'ssh-ed25519 ...'")
+    typer.echo("  1. Set master key: aegis set-master-key {hostname} --public-key 'age1...'")
     typer.echo("  2. Build secrets:  aegis build")
 
 
 @app.command("set-master-key")
 def set_master_key(
     hostname: str = typer.Argument(..., help="Hostname to set master key for"),
-    public_key: str = typer.Option(..., "--public-key", "-k", help="SSH public key (e.g., 'ssh-ed25519 AAAA...')"),
+    public_key: str = typer.Option(..., "--public-key", "-k", help="age public key (e.g., 'age1...')"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
 ):
-    """Set the master public key for a host.
-    
+    """Set the age public key for a host.
+
     The master key is used to ENCRYPT secrets for this host. The host must have
-    the corresponding private key to decrypt secrets at boot time.
-    
-    This is NOT an SSH host key for OpenSSH! This is the key Aegis uses to
+    the corresponding age private key to decrypt secrets at boot time.
+
+    This is NOT an SSH host key for OpenSSH! This is the age key Aegis uses to
     encrypt secrets that only this host can decrypt.
-    
-    The public key should be in SSH format: "ssh-ed25519 AAAA... comment"
-    
+
+    The public key should be in age format: "age1..."
+
     Typical setup:
-    1. Host has master private key at /state/master-key/key (persistent storage)
-    2. You extract the public key: ssh-keygen -y -f /state/master-key/key
-    3. You set it here: aegis set-master-key lambda --public-key "ssh-ed25519 AAAA..."
-    
+    1. Host has age private key at /state/master-key/key (persistent storage)
+    2. Extract the public key: age-keygen -y /state/master-key/key
+    3. Set it here: aegis set-master-key lambda --public-key "age1..."
+
     Example:
-        aegis set-master-key lambda --public-key "ssh-ed25519 AAAAC3Nza... lambda-master"
+        aegis set-master-key lambda --public-key "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
     """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
-    
+
     # Validate the public key format
     public_key = public_key.strip()
-    if not public_key.startswith(("ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-")):
-        typer.echo("Error: Public key must be in SSH format", err=True)
-        typer.echo("  Expected: ssh-ed25519 AAAA... or ssh-rsa AAAA... or ecdsa-sha2-...", err=True)
+    if not public_key.startswith("age1"):
+        typer.echo("Error: Public key must be in age format", err=True)
+        typer.echo("  Expected: age1... (obtain with: age-keygen -y /path/to/key)", err=True)
         raise typer.Exit(1)
-    
-    # Test that we can convert it to age format
-    try:
-        age_key = crypto.ssh_pubkey_to_age(public_key)
-    except Exception as e:
-        typer.echo(f"Error: Could not convert SSH key to age format: {e}", err=True)
-        typer.echo("  Make sure the key is a valid SSH public key", err=True)
-        raise typer.Exit(1)
-    
+
     # Get or create host config
     host_config = repo.get_host_config(hostname)
     if not host_config:
         typer.echo(f"Creating new host config for {hostname}...")
         host_config = config.HostConfig(
             hostname=hostname,
-            master_pubkey=public_key,
+            age_pubkey=public_key,
         )
     else:
-        host_config.master_pubkey = public_key
-    
+        host_config.age_pubkey = public_key
+
     repo.set_host_config(host_config)
-    
+
     typer.secho(f"Master key set for {hostname}", fg=typer.colors.GREEN)
-    typer.echo(f"  SSH public key: {public_key[:50]}...")
-    typer.echo(f"  Age public key: {age_key}")
+    typer.echo(f"  Age public key: {public_key}")
     typer.echo(f"  Config: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
     typer.echo("")
     typer.echo("Now you can encrypt secrets for this host with 'aegis build'")
@@ -1884,15 +1871,14 @@ def add_secret(
         typer.echo(f"Error: File not found: {file}", err=True)
         raise typer.Exit(1)
     
-    # Get master public key
-    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
-    
+    # Get age public key
+    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
     # Read secret
     content = file.read_text()
-    
+
     # Encrypt
     admin_pubkey = crypto.get_admin_public_key()
-    host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
     
     output_path = repo.host_build_path(hostname) / f"{name}.age"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1976,16 +1962,15 @@ def init_role(
         typer.echo(f"Role {role} already exists (assigned to {existing.host})")
         raise typer.Exit(1)
     
-    # Get master public key
-    master_pubkey = get_host_master_pubkey(hostname, repo, entities_path)
-    
+    # Get age public key
+    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
     # Generate role keypair
     typer.echo(f"Generating keypair for role {role}...")
     keypair = crypto.generate_age_keypair()
-    
+
     # Encrypt role private key for the host and admin
     admin_pubkey = crypto.get_admin_public_key()
-    host_age_key = crypto.ssh_pubkey_to_age(master_pubkey)
     
     role_key_path = repo.role_build_path(role) / f"{role}.age"
     role_key_path.parent.mkdir(parents=True, exist_ok=True)
