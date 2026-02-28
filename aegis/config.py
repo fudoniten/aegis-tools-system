@@ -15,41 +15,41 @@ import tomli_w  # type: ignore
 @dataclass
 class HostConfig:
     """Configuration for a host.
-    
+
     Attributes:
         hostname: The host's name
-        master_pubkey: The host's master key (SSH public key format).
-                       This is the key used to encrypt secrets FOR this host.
-                       The host uses the corresponding private key to decrypt.
-                       Can be set manually or pulled from nix-entities.
+        age_pubkey: The host's master key (age public key format, e.g. "age1...").
+                    This is the key used to encrypt secrets FOR this host.
+                    The host uses the corresponding private key to decrypt.
+                    Can be set manually or derived from nix-entities SSH keys.
         services: Kerberos services this host provides
         filesystem_keys: Filesystem encryption keys
         extra_secrets: Additional secrets with metadata
     """
     hostname: str
-    master_pubkey: str | None = None  # SSH public key for encrypting secrets to this host
+    age_pubkey: str | None = None  # age public key for encrypting secrets to this host
     services: list[str] = field(default_factory=lambda: ["host", "ssh"])
     filesystem_keys: list[str] = field(default_factory=list)
     extra_secrets: dict[str, Any] = field(default_factory=dict)  # Can be str or dict with metadata
-    
+
     @classmethod
     def from_dict(cls, hostname: str, data: dict) -> "HostConfig":
         return cls(
             hostname=hostname,
-            master_pubkey=data.get("master_pubkey"),
+            age_pubkey=data.get("age_pubkey"),
             services=data.get("services", ["host", "ssh"]),
             filesystem_keys=data.get("filesystem_keys", []),
             extra_secrets=data.get("extra_secrets", {}),
         )
-    
+
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
             "services": self.services,
             "filesystem_keys": self.filesystem_keys,
             "extra_secrets": self.extra_secrets,
         }
-        if self.master_pubkey:
-            d["master_pubkey"] = self.master_pubkey
+        if self.age_pubkey:
+            d["age_pubkey"] = self.age_pubkey
         return d
 
 
