@@ -45,6 +45,7 @@
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = [
+            aegisPackage
             pythonPkgs
             pkgs.age
             pkgs.ssh-to-age
