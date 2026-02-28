@@ -54,6 +54,8 @@
             # Kerberos tools
             pkgs.ruby
             pkgs.krb5
+            # Nexus key generation
+            nexus.packages.${system}.nexus-keygen
           ];
 
           shellHook = ''
