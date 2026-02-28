@@ -3,7 +3,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 import typer
 import yaml
@@ -213,11 +213,11 @@ def build_ssh_host_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
-    force: bool = typer.Option(False, "--force", "-f", help="Regenerate even if keys exist"),
-    target_dir: str = typer.Option("/run/aegis/ssh", "--target-dir", help="Target directory for SSH keys"),
-    user: str = typer.Option("root", "--user", help="Owner user for key files"),
-    group: str = typer.Option("root", "--group", help="Owner group for key files"),
-    mode: str = typer.Option("0600", "--mode", help="Permissions for private key files"),
+    force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keys exist")] = False,
+    target_dir: Annotated[str, typer.Option("--target-dir", help="Target directory for SSH keys")] = "/run/aegis/ssh",
+    user: Annotated[str, typer.Option("--user", help="Owner user for key files")] = "root",
+    group: Annotated[str, typer.Option("--group", help="Owner group for key files")] = "root",
+    mode: Annotated[str, typer.Option("--mode", help="Permissions for private key files")] = "0600",
 ):
     """Generate SSH host keys for OpenSSH servers.
     
@@ -308,12 +308,12 @@ def build_nexus_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
-    force: bool = typer.Option(False, "--force", "-f", help="Regenerate even if keys exist"),
-    algorithm: str = typer.Option("HmacSHA512", "--algorithm", "-a", help="HMAC algorithm"),
-    target: str = typer.Option("/run/aegis/nexus-key", "--target", help="Target path for nexus key"),
-    user: str = typer.Option("root", "--user", help="Owner user"),
-    group: str = typer.Option("root", "--group", help="Owner group"),
-    mode: str = typer.Option("0400", "--mode", help="Permissions"),
+    force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keys exist")] = False,
+    algorithm: Annotated[str, typer.Option("--algorithm", "-a", help="HMAC algorithm")] = "HmacSHA512",
+    target: Annotated[str, typer.Option("--target", help="Target path for nexus key")] = "/run/aegis/nexus-key",
+    user: Annotated[str, typer.Option("--user", help="Owner user")] = "root",
+    group: Annotated[str, typer.Option("--group", help="Owner group")] = "root",
+    mode: Annotated[str, typer.Option("--mode", help="Permissions")] = "0400",
 ):
     """Generate Nexus DDNS authentication keys for hosts.
     
@@ -399,11 +399,11 @@ def build_keytabs(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
-    force: bool = typer.Option(False, "--force", "-f", help="Regenerate even if keytabs exist"),
-    target: str = typer.Option("/run/aegis/keytab", "--target", help="Target path for keytab"),
-    user: str = typer.Option("root", "--user", help="Owner user for keytab"),
-    group: str = typer.Option("root", "--group", help="Owner group for keytab"),
-    mode: str = typer.Option("0600", "--mode", help="Permissions for keytab"),
+    force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keytabs exist")] = False,
+    target: Annotated[str, typer.Option("--target", help="Target path for keytab")] = "/run/aegis/keytab",
+    user: Annotated[str, typer.Option("--user", help="Owner user for keytab")] = "root",
+    group: Annotated[str, typer.Option("--group", help="Owner group for keytab")] = "root",
+    mode: Annotated[str, typer.Option("--mode", help="Permissions for keytab")] = "0600",
 ):
     """Generate Kerberos keytabs for hosts and KDC database.
     
