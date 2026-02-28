@@ -45,15 +45,9 @@
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            aegisPackage
+            self.packages.${system}.aegis
             pythonPkgs
-            pkgs.age
-            pkgs.ssh-to-age
-            pkgs.openssh
             pkgs.git
-            # Kerberos tools
-            pkgs.ruby
-            pkgs.krb5
           ];
 
           shellHook = ''
