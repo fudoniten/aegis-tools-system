@@ -21,13 +21,14 @@ class HostConfig:
         age_pubkey: The host's master key (age public key format, e.g. "age1...").
                     This is the key used to encrypt secrets FOR this host.
                     The host uses the corresponding private key to decrypt.
-                    Can be set manually or derived from nix-entities SSH keys.
+        domain: The host's DNS domain (e.g. "sea.fudo.org"), used for Kerberos FQDNs.
         services: Kerberos services this host provides
         filesystem_keys: Filesystem encryption keys
         extra_secrets: Additional secrets with metadata
     """
     hostname: str
     age_pubkey: str | None = None  # age public key for encrypting secrets to this host
+    domain: str | None = None      # DNS domain, used for Kerberos FQDN construction
     services: list[str] = field(default_factory=lambda: ["host", "ssh"])
     filesystem_keys: list[str] = field(default_factory=list)
     extra_secrets: dict[str, Any] = field(default_factory=dict)  # Can be str or dict with metadata
@@ -37,6 +38,7 @@ class HostConfig:
         return cls(
             hostname=hostname,
             age_pubkey=data.get("age_pubkey"),
+            domain=data.get("domain"),
             services=data.get("services", ["host", "ssh"]),
             filesystem_keys=data.get("filesystem_keys", []),
             extra_secrets=data.get("extra_secrets", {}),
@@ -50,6 +52,8 @@ class HostConfig:
         }
         if self.age_pubkey:
             d["age_pubkey"] = self.age_pubkey
+        if self.domain:
+            d["domain"] = self.domain
         return d
 
 

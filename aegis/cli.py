@@ -8,7 +8,7 @@ from typing import Annotated, Optional
 import typer
 import yaml
 
-from . import crypto, ssh, entities, config
+from . import crypto, ssh, config
 
 app = typer.Typer(
     name="aegis",
@@ -69,51 +69,12 @@ def get_secrets_repo(secrets_path: Optional[Path]) -> config.SecretsRepo:
     raise typer.Exit(1)
 
 
-def get_entities_path(entities_path: Optional[Path]) -> Path:
-    """Get the entities path, with default handling.
-    
-    Resolution order:
-    1. Explicit --entities-path argument
-    2. AEGIS_ENTITIES environment variable (set by dev shell)
-    3. Common relative paths
-    """
-    if entities_path is not None:
-        return entities_path
-    
-    # Check AEGIS_ENTITIES environment variable (set by nix develop)
-    env_path = os.environ.get("AEGIS_ENTITIES")
-    if env_path:
-        path = Path(env_path)
-        if path.exists():
-            return path
-    
-    # Try to find it in common locations
-    candidates = [
-        Path.cwd() / "nix-entities",
-        Path.cwd().parent / "nix-entities",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    
-    typer.echo("Error: Could not find nix-entities repo", err=True)
-    typer.echo("", err=True)
-    typer.echo("Options:", err=True)
-    typer.echo("  1. Use 'nix develop' in aegis-secrets (sets AEGIS_ENTITIES)", err=True)
-    typer.echo("  2. Use --entities-path to specify location", err=True)
-    raise typer.Exit(1)
-
 
 def get_host_age_pubkey(
     hostname: str,
     repo: config.SecretsRepo,
-    entities_path: Optional[Path] = None,
 ) -> str:
-    """Get the age public key for a host.
-
-    Resolution order:
-    1. Host config in aegis-secrets (src/hosts/<hostname>.toml)
-    2. nix-entities (SSH key converted to age on the fly)
+    """Get the age public key for a host from its config in aegis-secrets.
 
     Returns:
         age public key string (e.g., "age1...")
@@ -121,31 +82,12 @@ def get_host_age_pubkey(
     Raises:
         typer.Exit if no key found
     """
-    # First, check host config in repo
     host_config = repo.get_host_config(hostname)
     if host_config and host_config.age_pubkey:
         return host_config.age_pubkey
 
-    # Fall back to nix-entities (entities store SSH keys; convert to age)
-    if entities_path is None:
-        try:
-            entities_path = get_entities_path(None)
-        except SystemExit:
-            typer.echo(f"Error: No age key for {hostname}", err=True)
-            typer.echo(f"Set it with: aegis set-master-key {hostname} --public-key 'age1...'", err=True)
-            raise typer.Exit(1)
-
-    try:
-        host = entities.get_host(hostname, entities_path)
-        if host.master_key and host.master_key.public_key:
-            return crypto.ssh_pubkey_to_age(host.master_key.public_key)
-    except Exception as e:
-        typer.echo(f"Warning: Could not get host from entities: {e}", err=True)
-
     typer.echo(f"Error: No age key configured for {hostname}", err=True)
-    typer.echo(f"Either:", err=True)
-    typer.echo(f"  1. Set it with: aegis set-master-key {hostname} --public-key 'age1...'", err=True)
-    typer.echo(f"  2. Configure it in nix-entities", err=True)
+    typer.echo(f"Set it with: aegis set-master-key {hostname} --public-key 'age1...'", err=True)
     raise typer.Exit(1)
 
 
@@ -156,62 +98,46 @@ def get_host_age_pubkey(
 @app.command()
 def build(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to aegis-secrets repo"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e", help="Path to nix-entities repo"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be done"),
-    sync: bool = typer.Option(True, "--sync/--no-sync", help="Sync hosts from entities before building"),
-    pull: bool = typer.Option(False, "--pull", "-p", help="Git pull entities repo before syncing"),
 ):
-    """Run full build: sync hosts from entities, generate missing secrets.
-    
-    By default, this will:
-    1. Sync hosts from nix-entities (creates configs for new hosts)
-    2. Generate SSH host keys for OpenSSH
-    3. Generate Nexus DDNS keys
-    4. Generate Kerberos keytabs
-    5. Build user secrets
-    
-    Use --no-sync to skip the entities sync step.
-    Use --pull to git pull the entities repo first.
+    """Run full build: generate missing secrets for all configured hosts.
+
+    This will:
+    1. Generate SSH host keys for OpenSSH
+    2. Generate Nexus DDNS keys
+    3. Generate Kerberos keytabs
+    4. Build user secrets
     """
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
-    
+
     typer.echo("Running full build...")
-    
+
     if dry_run:
-        if sync:
-            typer.echo("  [dry-run] Would run: sync-hosts")
         typer.echo("  [dry-run] Would run: build-ssh-host-keys")
         typer.echo("  [dry-run] Would run: build-nexus-keys")
         typer.echo("  [dry-run] Would run: build-keytabs")
         typer.echo("  [dry-run] Would run: build-user-secrets")
         return
-    
-    # Sync hosts from entities
-    if sync:
-        typer.echo("\n--- Syncing Hosts from Entities ---")
-        sync_hosts(secrets_path=secrets_path, entities_path=entities_path, pull=pull, dry_run=False, filter_domain=None)
-    
+
     # Run each build step
     typer.echo("\n--- Building SSH Host Keys ---")
-    build_ssh_host_keys(secrets_path=secrets_path, entities_path=entities_path, dry_run=False)
-    
+    build_ssh_host_keys(secrets_path=secrets_path, dry_run=False)
+
     typer.echo("\n--- Building Nexus Keys ---")
-    build_nexus_keys(secrets_path=secrets_path, entities_path=entities_path, dry_run=False, algorithm="HmacSHA512")
-    
+    build_nexus_keys(secrets_path=secrets_path, dry_run=False, algorithm="HmacSHA512")
+
     typer.echo("\n--- Building Keytabs ---")
-    build_keytabs(secrets_path=secrets_path, entities_path=entities_path, dry_run=False)
-    
+    build_keytabs(secrets_path=secrets_path, dry_run=False)
+
     typer.echo("\n--- Building User Secrets ---")
-    build_user_secrets(secrets_path=secrets_path, entities_path=entities_path, dry_run=False, user=None)
-    
+    build_user_secrets(secrets_path=secrets_path, dry_run=False, user=None)
+
     typer.secho("\nBuild complete!", fg=typer.colors.GREEN)
 
 
 @app.command("build-ssh-host-keys")
 def build_ssh_host_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keys exist")] = False,
     target_dir: Annotated[str, typer.Option("--target-dir", help="Target directory for SSH keys")] = "/run/aegis/ssh",
@@ -258,9 +184,9 @@ def build_ssh_host_keys(
         
         typer.echo(f"  Generating SSH host keys for {hostname}...")
         
-        # Get age public key (from config or entities)
+        # Get age public key from host config
         try:
-            host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+            host_age_key = get_host_age_pubkey(hostname, repo)
         except SystemExit:
             typer.echo(f"    Skipping {hostname} (no age key)", err=True)
             continue
@@ -306,7 +232,6 @@ def build_ssh_host_keys(
 @app.command("build-nexus-keys")
 def build_nexus_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keys exist")] = False,
     algorithm: Annotated[str, typer.Option("--algorithm", "-a", help="HMAC algorithm")] = "HmacSHA512",
@@ -324,33 +249,32 @@ def build_nexus_keys(
     Deployment metadata is written to secrets.toml for NixOS to import.
     """
     from . import nexus
-    
+
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
-    
+
     hosts = repo.list_hosts()
     if not hosts:
         typer.echo("No hosts configured. Use 'aegis init-host' first.")
         return
-    
+
     admin_pubkey = crypto.get_admin_public_key()
-    
+
     for hostname in hosts:
         output_path = repo.host_build_path(hostname) / "nexus-key.age"
-        
+
         if output_path.exists() and not force:
             typer.echo(f"  {hostname}: Nexus key exists (use --force to regenerate)")
             continue
-        
+
         if dry_run:
             typer.echo(f"  [dry-run] Would generate Nexus key for {hostname}")
             continue
-        
+
         typer.echo(f"  Generating Nexus key for {hostname}...")
-        
-        # Get age public key (from config or entities)
+
+        # Get age public key from host config
         try:
-            host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+            host_age_key = get_host_age_pubkey(hostname, repo)
         except SystemExit:
             typer.echo(f"    Skipping {hostname} (no age key)", err=True)
             continue
@@ -397,7 +321,6 @@ def build_nexus_keys(
 @app.command("build-keytabs")
 def build_keytabs(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keytabs exist")] = False,
     target: Annotated[str, typer.Option("--target", help="Target path for keytab")] = "/run/aegis/keytab",
@@ -412,34 +335,30 @@ def build_keytabs(
     from . import kerberos as krb
     import tempfile
     import shutil
-    
+
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
-    
+
     # Get admin key for encryption
     admin_pubkey = crypto.get_admin_public_key()
-    
+
     # Find all realms we need to process
     kerberos_src = repo.src_path / "kerberos" / "realms"
     if not kerberos_src.exists():
         typer.echo("No Kerberos realms configured in src/kerberos/realms/")
         typer.echo("Use 'aegis init-realm' to create a realm first.")
         return
-    
-    # Get hosts grouped by realm
+
+    # Get hosts grouped by realm (via HostConfig.domain -> DomainConfig.realm)
     hosts_by_realm: dict[str, list[str]] = {}
     for hostname in repo.list_hosts():
-        try:
-            host = entities.get_host(hostname, ent_path)
-            if host.domain:
-                domain = entities.get_domain(host.domain, ent_path)
-                if domain.gssapi_realm:
-                    realm = domain.gssapi_realm
-                    if realm not in hosts_by_realm:
-                        hosts_by_realm[realm] = []
-                    hosts_by_realm[realm].append(hostname)
-        except Exception as e:
-            typer.echo(f"  Warning: Could not get realm for {hostname}: {e}", err=True)
+        host_config = repo.get_host_config(hostname)
+        if host_config and host_config.domain:
+            domain_config = repo.get_domain_config(host_config.domain)
+            if domain_config and domain_config.realm:
+                realm = domain_config.realm
+                if realm not in hosts_by_realm:
+                    hosts_by_realm[realm] = []
+                hosts_by_realm[realm].append(hostname)
     
     if not hosts_by_realm:
         typer.echo("No hosts with Kerberos realms found.")
@@ -513,22 +432,21 @@ def build_keytabs(
             for hostname in hostnames:
                 typer.echo(f"  Processing host: {hostname}")
                 
-                # Get age public key
+                # Get age public key from host config
                 try:
-                    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+                    host_age_key = get_host_age_pubkey(hostname, repo)
                 except SystemExit:
                     typer.echo(f"    Skipping {hostname} (no age key)", err=True)
                     continue
-                
-                # Get host info for domain and services
-                try:
-                    host = entities.get_host(hostname, ent_path)
-                except Exception as e:
-                    typer.echo(f"    Error getting host info: {e}", err=True)
+
+                # Get host info from config
+                host_config = repo.get_host_config(hostname)
+                if not host_config:
+                    typer.echo(f"    Error: No config found for {hostname}", err=True)
                     continue
-                
-                host_fqdn = f"{hostname}.{host.domain}"
-                services = host.kerberos_services
+
+                host_fqdn = f"{hostname}.{host_config.domain}" if host_config.domain else hostname
+                services = host_config.services
                 
                 # Check if we need to add principals for this host
                 needs_principals = False
@@ -632,7 +550,6 @@ def build_keytabs(
 @app.command("build-user-secrets")
 def build_user_secrets(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     user: Optional[str] = typer.Option(None, "--user", "-u", help="Process only this user"),
 ):
@@ -647,10 +564,9 @@ def build_user_secrets(
     from . import manifest as mf
     
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
-    
+
     admin_pubkey = crypto.get_admin_public_key()
-    
+
     # Get list of users to process
     if user:
         users = [user]
@@ -717,7 +633,7 @@ def build_user_secrets(
         host_keys: dict[str, str] = {}
         for hostname in user_config.hosts:
             try:
-                host_keys[hostname] = get_host_age_pubkey(hostname, repo, entities_path)
+                host_keys[hostname] = get_host_age_pubkey(hostname, repo)
             except SystemExit:
                 typer.echo(f"  Warning: No age key for {hostname}, skipping", err=True)
             except Exception as e:
@@ -887,7 +803,6 @@ def import_ssh_host_keys(
     hostname: str = typer.Argument(..., help="Hostname to import keys for"),
     key_files: list[Path] = typer.Option([], "--key", help="Path to SSH private key file (type auto-detected, can specify multiple)"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     target_dir: str = typer.Option("/run/aegis/ssh", "--target-dir", help="Target directory for SSH keys"),
     user: str = typer.Option("root", "--user", help="Owner user for key files"),
     group: str = typer.Option("root", "--group", help="Owner group for key files"),
@@ -899,8 +814,7 @@ def import_ssh_host_keys(
     to clients (ssh_host_ed25519_key, ssh_host_ecdsa_key, etc.).
     
     These are NOT the master key! The master key is used to ENCRYPT these
-    SSH host keys. The master key public should be set via 'set-master-key'
-    or come from nix-entities.
+    SSH host keys. The master key public should be set via 'set-master-key'.
     
     This command:
     - Auto-detects key type (ed25519, ecdsa, rsa)
@@ -927,25 +841,14 @@ def import_ssh_host_keys(
     typer.echo(f"Importing SSH host keys for {hostname}...")
     typer.echo(f"  (These are OpenSSH server keys, NOT the master key)")
     
-    # Get age public key (from config or entities)
-    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+    # Get age public key from host config
+    host_age_key = get_host_age_pubkey(hostname, repo)
 
     # Ensure host config exists (create if missing)
     host_config = repo.get_host_config(hostname)
     if not host_config:
         typer.echo(f"  Host config not found, creating...")
-        # Try to get services from entities if available
-        services = ["host", "ssh"]
-        try:
-            ent_path = get_entities_path(entities_path)
-            host = entities.get_host(hostname, ent_path)
-            services = host.kerberos_services
-        except Exception:
-            pass
-        host_config = config.HostConfig(
-            hostname=hostname,
-            services=services,
-        )
+        host_config = config.HostConfig(hostname=hostname)
         repo.set_host_config(host_config)
         typer.echo(f"  Created {repo.src_path / 'hosts' / f'{hostname}.toml'}")
     
@@ -1014,7 +917,6 @@ def import_nexus_key(
     hostname: str = typer.Argument(..., help="Hostname to import key for"),
     key_file: Path = typer.Option(..., "--file", help="Path to nexus HMAC key file"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     target: str = typer.Option("/run/aegis/nexus-key", "--target", help="Target path for nexus key"),
     user: str = typer.Option("root", "--user", help="Owner user"),
     group: str = typer.Option("root", "--group", help="Owner group"),
@@ -1031,36 +933,24 @@ def import_nexus_key(
         aegis import-nexus-key lambda --file /secure/lambda.nexus.hmac
     """
     from . import nexus
-    
+
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
     repo.ensure_structure()
-    
+
     if not key_file.exists():
         typer.echo(f"Error: Key file not found: {key_file}", err=True)
         raise typer.Exit(1)
-    
+
     typer.echo(f"Importing Nexus key for {hostname}...")
-    
-    # Get age public key
-    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
+    # Get age public key from host config
+    host_age_key = get_host_age_pubkey(hostname, repo)
 
     # Ensure host config exists
     host_config = repo.get_host_config(hostname)
     if not host_config:
         typer.echo(f"  Host config not found, creating...")
-        # Try to get services from entities if available
-        services = ["host", "ssh"]
-        try:
-            ent_path = get_entities_path(entities_path)
-            host = entities.get_host(hostname, ent_path)
-            services = host.kerberos_services
-        except Exception:
-            pass
-        host_config = config.HostConfig(
-            hostname=hostname,
-            services=services,
-        )
+        host_config = config.HostConfig(hostname=hostname)
         repo.set_host_config(host_config)
         typer.echo(f"  Created {repo.src_path / 'hosts' / f'{hostname}.toml'}")
 
@@ -1182,7 +1072,6 @@ def import_secret(
     group: str = typer.Option("root", "--group", help="Owner group on target host"),
     mode: str = typer.Option("0400", "--mode", help="File permissions (e.g., 0600)"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
 ):
     """Import a generic secret for a host.
     
@@ -1197,36 +1086,24 @@ def import_secret(
             --user myservice --group myservice --mode 0600
     """
     from . import host_secrets
-    
+
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
     repo.ensure_structure()
-    
+
     if not file.exists():
         typer.echo(f"Error: Secret file not found: {file}", err=True)
         raise typer.Exit(1)
-    
+
     typer.echo(f"Importing secret '{secret_name}' for {hostname}...")
-    
-    # Get age public key
-    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
+    # Get age public key from host config
+    host_age_key = get_host_age_pubkey(hostname, repo)
 
     # Ensure host config exists
     host_config = repo.get_host_config(hostname)
     if not host_config:
         typer.echo(f"  Host config not found, creating...")
-        # Try to get services from entities if available
-        services = ["host", "ssh"]
-        try:
-            ent_path = get_entities_path(entities_path)
-            host = entities.get_host(hostname, ent_path)
-            services = host.kerberos_services
-        except Exception:
-            pass
-        host_config = config.HostConfig(
-            hostname=hostname,
-            services=services,
-        )
+        host_config = config.HostConfig(hostname=hostname)
         repo.set_host_config(host_config)
 
     # Read secret content
@@ -1269,15 +1146,14 @@ def _ensure_dns_role(
     repo: config.SecretsRepo,
     domain: str,
     hostname: str,
-    entities_path: Optional[Path],
 ) -> str:
     """Ensure dns-master-<domain> role exists, create if needed.
-    
+
     Returns the role's public key.
     """
     role_name = f"dns-master-{domain}"
     existing = repo.get_role_config(role_name)
-    
+
     if existing:
         # Role exists, get its public key
         role_pub_path = repo.role_build_path(role_name) / f"{role_name}.pub"
@@ -1285,12 +1161,12 @@ def _ensure_dns_role(
             typer.echo(f"Error: Role {role_name} exists but public key not found", err=True)
             raise typer.Exit(1)
         return role_pub_path.read_text().strip()
-    
+
     # Create the role
     typer.echo(f"Creating role: {role_name} (assigned to {hostname})")
-    
+
     # Get age public key for the host
-    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+    host_age_key = get_host_age_pubkey(hostname, repo)
 
     # Generate role keypair
     keypair = crypto.generate_age_keypair()
@@ -1319,7 +1195,6 @@ def generate_dnssec_keys(
     hostname: str = typer.Option(..., "--host", "-h", help="DNS master server hostname"),
     algorithm: str = typer.Option("ECDSAP256SHA256", "--algorithm", "-a", help="DNSSEC algorithm"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
     target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Target directory for keys (default: /var/lib/dnssec/<domain>)"),
     user: str = typer.Option("root", "--user", help="Owner user for key files"),
@@ -1361,10 +1236,10 @@ def generate_dnssec_keys(
     typer.echo(f"  Algorithm: {algorithm} ({dnssec.ALGORITHM_MAP[algorithm]})")
     
     # Ensure role exists and get its public key
-    role_pubkey = _ensure_dns_role(repo, domain, hostname, entities_path)
+    role_pubkey = _ensure_dns_role(repo, domain, hostname)
     admin_pubkey = crypto.get_admin_public_key()
     recipients = [role_pubkey, admin_pubkey]
-    
+
     # Generate keys in temp directory
     with tempfile.TemporaryDirectory(prefix="aegis-dnssec-") as tmpdir:
         tmpdir = Path(tmpdir)
@@ -1449,7 +1324,6 @@ def import_dnssec_keys(
     keys_dir: Path = typer.Option(..., "--keys-dir", "-k", help="Directory containing DNSSEC key files"),
     hostname: str = typer.Option(..., "--host", "-h", help="DNS master server hostname"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
     target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Target directory for keys (default: /var/lib/dnssec/<domain>)"),
     user: str = typer.Option("root", "--user", help="Owner user for key files"),
@@ -1507,10 +1381,10 @@ def import_dnssec_keys(
         raise typer.Exit(1)
     
     # Ensure role exists and get its public key
-    role_pubkey = _ensure_dns_role(repo, domain, hostname, entities_path)
+    role_pubkey = _ensure_dns_role(repo, domain, hostname)
     admin_pubkey = crypto.get_admin_public_key()
     recipients = [role_pubkey, admin_pubkey]
-    
+
     # Create output directory
     build_dir = repo.dnssec_build_path(domain)
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -1577,174 +1451,42 @@ def import_dnssec_keys(
 # Configuration Commands
 # =============================================================================
 
-@app.command("sync-hosts")
-def sync_hosts(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
-    pull: bool = typer.Option(False, "--pull", "-p", help="Git pull entities repo before syncing"),
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be done"),
-    filter_domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Only sync hosts in this domain"),
-):
-    """Sync hosts from nix-entities to aegis-secrets.
-
-    This command discovers all hosts in nix-entities that have master keys
-    configured and creates corresponding host configs in aegis-secrets.
-
-    For each host found:
-    - Creates src/hosts/<hostname>.toml if it doesn't exist
-    - Sets age_pubkey (converted from the SSH master key in entities)
-    - Sets kerberos services from entities
-    
-    This is idempotent - running it multiple times is safe. It will:
-    - Skip hosts that already have configs
-    - Update master keys if they've changed (with --force)
-    
-    Typically run as part of the build process or when new hosts are added.
-    
-    Example:
-        aegis sync-hosts --pull
-        aegis sync-hosts --domain sea.fudo.org
-    """
-    repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
-    repo.ensure_structure()
-    
-    # Optionally pull the entities repo
-    if pull:
-        typer.echo(f"Pulling entities repo at {ent_path}...")
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["git", "pull"],
-                cwd=ent_path,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                typer.echo(f"  {result.stdout.strip()}")
-            else:
-                typer.echo(f"  Warning: git pull failed: {result.stderr}", err=True)
-        except Exception as e:
-            typer.echo(f"  Warning: Could not pull: {e}", err=True)
-    
-    typer.echo(f"Syncing hosts from {ent_path}...")
-    
-    # Get all hosts from entities
-    try:
-        all_hosts = entities.get_all_hosts(ent_path)
-    except Exception as e:
-        typer.echo(f"Error: Could not list hosts from entities: {e}", err=True)
-        raise typer.Exit(1)
-    
-    typer.echo(f"  Found {len(all_hosts)} hosts in entities")
-    
-    created = 0
-    skipped = 0
-    no_master_key = 0
-    filtered_out = 0
-    
-    for hostname in sorted(all_hosts):
-        try:
-            host = entities.get_host(hostname, ent_path)
-        except Exception as e:
-            typer.echo(f"  {hostname}: Error getting host info: {e}", err=True)
-            continue
-        
-        # Filter by domain if specified
-        if filter_domain and host.domain != filter_domain:
-            filtered_out += 1
-            continue
-        
-        # Skip hosts without master keys
-        if not host.master_key or not host.master_key.public_key:
-            if dry_run:
-                typer.echo(f"  {hostname}: No master key configured, skipping")
-            no_master_key += 1
-            continue
-        
-        # Convert the entities SSH master key to age format
-        try:
-            host_age_pubkey = crypto.ssh_pubkey_to_age(host.master_key.public_key)
-        except Exception as e:
-            typer.echo(f"  {hostname}: Could not convert SSH key to age: {e}", err=True)
-            no_master_key += 1
-            continue
-
-        # Check if config already exists
-        existing = repo.get_host_config(hostname)
-        if existing:
-            # Check if age key needs updating
-            if existing.age_pubkey != host_age_pubkey:
-                if dry_run:
-                    typer.echo(f"  {hostname}: Age key changed (would update)")
-                else:
-                    existing.age_pubkey = host_age_pubkey
-                    existing.services = host.kerberos_services
-                    repo.set_host_config(existing)
-                    typer.echo(f"  {hostname}: Updated age key")
-                    created += 1
-            else:
-                skipped += 1
-            continue
-
-        # Create new host config
-        if dry_run:
-            typer.echo(f"  {hostname}: Would create config (domain={host.domain})")
-            created += 1
-            continue
-
-        host_config = config.HostConfig(
-            hostname=hostname,
-            age_pubkey=host_age_pubkey,
-            services=host.kerberos_services,
-        )
-        repo.set_host_config(host_config)
-        typer.echo(f"  {hostname}: Created config (domain={host.domain})")
-        created += 1
-    
-    typer.echo("")
-    if dry_run:
-        typer.secho("[DRY-RUN] Summary:", fg=typer.colors.YELLOW)
-    else:
-        typer.secho("Summary:", fg=typer.colors.GREEN)
-    typer.echo(f"  Created/updated: {created}")
-    typer.echo(f"  Already configured: {skipped}")
-    typer.echo(f"  No master key: {no_master_key}")
-    if filter_domain:
-        typer.echo(f"  Filtered out (wrong domain): {filtered_out}")
-
 
 @app.command("init-host")
 def init_host(
     hostname: str = typer.Argument(..., help="Hostname to initialize"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain (e.g. sea.fudo.org), used for Kerberos FQDNs"),
     services: str = typer.Option("host,ssh", "--services", help="Comma-separated Kerberos services"),
 ):
     """Add a host to the secrets configuration.
-    
+
     This initializes a host in the aegis-secrets repository. When you run
     'aegis build', the following will be generated for this host:
     - SSH host keys (ed25519, ecdsa, rsa)
     - Nexus DDNS authentication key
-    - Kerberos keytabs (if configured)
+    - Kerberos keytabs (if domain and realm are configured)
     """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
-    
+
     existing = repo.get_host_config(hostname)
     if existing:
         typer.echo(f"Host {hostname} already configured")
         raise typer.Exit(1)
-    
+
     service_list = [s.strip() for s in services.split(",")]
-    
+
     host_config = config.HostConfig(
         hostname=hostname,
+        domain=domain,
         services=service_list,
     )
     repo.set_host_config(host_config)
-    
+
     typer.secho(f"Initialized host: {hostname}", fg=typer.colors.GREEN)
+    if domain:
+        typer.echo(f"  Domain: {domain}")
     typer.echo(f"  Services: {', '.join(service_list)}")
     typer.echo(f"  Config: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
     typer.echo("")
@@ -1863,16 +1605,15 @@ def add_secret(
     name: str = typer.Argument(..., help="Secret name"),
     file: Path = typer.Argument(..., help="File containing the secret"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
 ):
     """Add a user-provided secret for a host."""
     repo = get_secrets_repo(secrets_path)
     if not file.exists():
         typer.echo(f"Error: File not found: {file}", err=True)
         raise typer.Exit(1)
-    
-    # Get age public key
-    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+
+    # Get age public key from host config
+    host_age_key = get_host_age_pubkey(hostname, repo)
 
     # Read secret
     content = file.read_text()
@@ -1950,11 +1691,9 @@ def init_role(
     role: str = typer.Argument(..., help="Role name (e.g., kdc, dns)"),
     hostname: str = typer.Argument(..., help="Host that will have this role"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
 ):
     """Create a role and assign it to a host."""
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
     repo.ensure_structure()
     
     existing = repo.get_role_config(role)
@@ -1962,8 +1701,8 @@ def init_role(
         typer.echo(f"Role {role} already exists (assigned to {existing.host})")
         raise typer.Exit(1)
     
-    # Get age public key
-    host_age_key = get_host_age_pubkey(hostname, repo, entities_path)
+    # Get age public key from host config
+    host_age_key = get_host_age_pubkey(hostname, repo)
 
     # Generate role keypair
     typer.echo(f"Generating keypair for role {role}...")
@@ -2101,11 +1840,9 @@ def list_secrets(
 def verify(
     hostname: str = typer.Argument(..., help="Hostname to verify"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    entities_path: Optional[Path] = typer.Option(None, "--entities-path", "-e"),
 ):
     """Verify a host can decrypt its secrets."""
     repo = get_secrets_repo(secrets_path)
-    ent_path = get_entities_path(entities_path)
     
     # This would require having the host's private key, which we don't
     # In practice, verification happens at deployment time
