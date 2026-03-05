@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
-import yaml
 
 from . import crypto, ssh, config
 
@@ -152,38 +151,39 @@ def build_ssh_host_keys(
     
     These are NOT master keys! Master keys are used to encrypt these host keys.
     
-    Keys are encrypted with the host's master key + admin key and stored
-    in build/hosts/<hostname>/ssh-host-keys.age.
-    
-    Deployment metadata (target path, ownership, permissions) is stored in
-    build/hosts/<hostname>/secrets.toml for NixOS to import.
-    
+    Each private key is encrypted separately as its own age file under
+    build/hosts/<hostname>/ssh/.  The corresponding public keys are written
+    as plaintext .pub files alongside for use in DNS or known_hosts files.
+
+    Deployment metadata is stored in build/hosts/<hostname>/secrets.toml
+    for NixOS to import.
+
     Also generates SSHFP DNS records for trust establishment.
     """
     from . import host_secrets
-    
+
     repo = get_secrets_repo(secrets_path)
-    
+
     hosts = repo.list_hosts()
     if not hosts:
         typer.echo("No hosts configured. Use 'aegis init-host' first.")
         return
-    
+
     admin_pubkey = crypto.get_admin_public_key()
-    
+
     for hostname in hosts:
-        output_path = repo.host_build_path(hostname) / "ssh-host-keys.age"
-        
-        if output_path.exists() and not force:
+        ssh_dir = repo.host_build_path(hostname) / "ssh"
+
+        if ssh_dir.exists() and any(ssh_dir.glob("*.age")) and not force:
             typer.echo(f"  {hostname}: SSH host keys exist (use --force to regenerate)")
             continue
-        
+
         if dry_run:
             typer.echo(f"  [dry-run] Would generate SSH host keys for {hostname}")
             continue
-        
+
         typer.echo(f"  Generating SSH host keys for {hostname}...")
-        
+
         # Get age public key from host config
         try:
             host_age_key = get_host_age_pubkey(hostname, repo)
@@ -194,22 +194,22 @@ def build_ssh_host_keys(
         # Generate keys
         keys = ssh.generate_host_keys(hostname)
 
-        # Convert to YAML
-        keys_yaml = yaml.dump(keys.to_dict(), default_flow_style=False)
-
-        # Get recipients
+        # Encrypt each private key separately; write each public key plaintext
         recipients = [host_age_key, admin_pubkey]
-        
-        # Encrypt and write
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        crypto.encrypt_age(keys_yaml, recipients, output_path)
-        
-        typer.echo(f"    Wrote {output_path}")
-        
-        # Update manifest with deployment metadata
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+
+        for stem, keypair in keys.items():
+            age_path = ssh_dir / f"{stem}.age"
+            pub_path = ssh_dir / f"{stem}.pub"
+            crypto.encrypt_age(keypair.private_key, recipients, age_path)
+            pub_path.write_text(keypair.public_key + "\n")
+            typer.echo(f"    Wrote {age_path.name} + {pub_path.name}")
+
+        # Update manifest with one entry per private key
         manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
-        manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entry(
-            key_types=["ed25519", "ecdsa", "rsa"],
+        stems = [stem for stem, _ in keys.items()]
+        manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
+            stems=stems,
             target_dir=target_dir,
             user=user,
             group=group,
@@ -217,7 +217,7 @@ def build_ssh_host_keys(
         )
         manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
         typer.echo(f"    Updated manifest: {manifest_path}")
-        
+
         # Generate SSHFP records
         public_keys = [
             keys.host_ed25519.public_key,
@@ -819,28 +819,34 @@ def import_ssh_host_keys(
     This command:
     - Auto-detects key type (ed25519, ecdsa, rsa)
     - Derives public keys automatically
-    - Encrypts with the host's master key + admin key
-    - Stores in build/hosts/<hostname>/ssh-host-keys.age
+    - Encrypts each private key separately as its own age file
+    - Writes each public key as a plaintext .pub file alongside
     - Writes deployment metadata to secrets.toml for NixOS
-    
+
     Example:
         aegis import-ssh-host-keys lambda \\
             --key /secure/lambda.ed25519.key \\
             --key /secure/lambda.ecdsa.key
     """
-    from . import ssh_utils
-    
+    from . import ssh_utils, host_secrets
+
+    # Maps detected key_type string → SSH server filename stem
+    KEY_TYPE_TO_STEM = {
+        "ed25519": "ssh_host_ed25519_key",
+        "ecdsa": "ssh_host_ecdsa_key",
+        "rsa": "ssh_host_rsa_key",
+    }
+
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
-    
-    # Check if at least one key provided
+
     if not key_files:
         typer.echo("Error: At least one private key must be provided (use --key)", err=True)
         raise typer.Exit(1)
-    
+
     typer.echo(f"Importing SSH host keys for {hostname}...")
     typer.echo(f"  (These are OpenSSH server keys, NOT the master key)")
-    
+
     # Get age public key from host config
     host_age_key = get_host_age_pubkey(hostname, repo)
 
@@ -851,7 +857,7 @@ def import_ssh_host_keys(
         host_config = config.HostConfig(hostname=hostname)
         repo.set_host_config(host_config)
         typer.echo(f"  Created {repo.src_path / 'hosts' / f'{hostname}.toml'}")
-    
+
     # Read and validate private keys, derive public keys
     try:
         keypairs = ssh_utils.read_ssh_keypairs(
@@ -861,51 +867,46 @@ def import_ssh_host_keys(
     except (FileNotFoundError, ValueError) as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
-    
+
     if not keypairs:
         typer.echo("Error: No valid keypairs found", err=True)
         raise typer.Exit(1)
-    
+
     typer.echo(f"  Detected {len(keypairs)} keypair(s):")
     for kp in keypairs:
         typer.echo(f"    - {kp.key_type}")
         typer.echo(f"      Public key: {kp.public_key[:60]}...")
-    
-    # Convert to YAML format
-    keys_dict = {}
-    for kp in keypairs:
-        key_prefix = f"host_{kp.key_type}"
-        keys_dict[key_prefix] = {
-            "public_key": kp.public_key,
-            "private_key": kp.private_key,
-        }
-    
-    keys_yaml = yaml.dump(keys_dict, default_flow_style=False)
-    
-    # Get recipients (host age key + admin key)
+
+    # Encrypt each private key separately; write each public key plaintext
     admin_pubkey = crypto.get_admin_public_key()
     recipients = [host_age_key, admin_pubkey]
 
-    # Encrypt and write
-    output_path = repo.host_build_path(hostname) / "ssh-host-keys.age"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(keys_yaml, recipients, output_path)
-    
-    # Update manifest with deployment metadata
-    from . import host_secrets
+    ssh_dir = repo.host_build_path(hostname) / "ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+
+    stems = []
+    for kp in keypairs:
+        stem = KEY_TYPE_TO_STEM.get(kp.key_type, f"ssh_host_{kp.key_type}_key")
+        age_path = ssh_dir / f"{stem}.age"
+        pub_path = ssh_dir / f"{stem}.pub"
+        crypto.encrypt_age(kp.private_key, recipients, age_path)
+        pub_path.write_text(kp.public_key + "\n")
+        stems.append(stem)
+        typer.echo(f"    Wrote {age_path.name} + {pub_path.name}")
+
+    # Update manifest with one entry per private key
     manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
-    key_types = [kp.key_type for kp in keypairs]
-    manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entry(
-        key_types=key_types,
+    manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
+        stems=stems,
         target_dir=target_dir,
         user=user,
         group=group,
         mode=mode,
     )
     manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
-    
+
     typer.secho(f"\nSSH host keys imported successfully!", fg=typer.colors.GREEN)
-    typer.echo(f"  Output: {output_path}")
+    typer.echo(f"  Output dir: {ssh_dir}")
     typer.echo(f"  Manifest: {manifest_path}")
     typer.echo(f"  Target: {target_dir}")
     typer.echo(f"  Encrypted for: {hostname} (master key) + admin")

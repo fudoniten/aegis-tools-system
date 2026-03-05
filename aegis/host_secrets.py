@@ -7,15 +7,23 @@ The manifest is stored at build/hosts/<hostname>/secrets.toml and can be
 imported by NixOS to configure services with the correct paths.
 
 Example manifest:
-    
-    [ssh-host-keys]
-    source = "ssh-host-keys.age"
+
+    [[ssh-host-keys]]
+    source = "ssh/ssh_host_ed25519_key.age"
+    target = "ssh_host_ed25519_key"
     target_dir = "/run/aegis/ssh"
     user = "root"
     group = "root"
     mode = "0600"
-    key_types = ["ed25519", "ecdsa", "rsa"]
-    
+
+    [[ssh-host-keys]]
+    source = "ssh/ssh_host_ecdsa_key.age"
+    target = "ssh_host_ecdsa_key"
+    target_dir = "/run/aegis/ssh"
+    user = "root"
+    group = "root"
+    mode = "0600"
+
     [keytab]
     source = "keytab.age"
     target = "/run/aegis/keytab"
@@ -58,7 +66,7 @@ DEFAULTS = {
         "target_dir": "/run/aegis/ssh",
         "user": "root",
         "group": "root",
-        "mode": "0600",  # For private keys; public keys get 0644
+        "mode": "0600",
     },
     "keytab": {
         "target": "/run/aegis/keytab",
@@ -90,8 +98,7 @@ class SecretEntry:
     group: str = "root"
     mode: str = "0400"
     encoding: str | None = None    # "base64" for binary secrets
-    key_types: list[str] | None = None  # For SSH keys: which types are included
-    
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"source": self.source}
         if self.target:
@@ -103,10 +110,8 @@ class SecretEntry:
         d["mode"] = self.mode
         if self.encoding:
             d["encoding"] = self.encoding
-        if self.key_types:
-            d["key_types"] = self.key_types
         return d
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> "SecretEntry":
         return cls(
@@ -117,7 +122,6 @@ class SecretEntry:
             group=data.get("group", "root"),
             mode=data.get("mode", "0400"),
             encoding=data.get("encoding"),
-            key_types=data.get("key_types"),
         )
 
 
@@ -129,16 +133,16 @@ class HostSecretsManifest:
     metadata for all secrets that should be deployed to the host.
     """
     hostname: str
-    ssh_host_keys: SecretEntry | None = None
+    ssh_host_keys: list[SecretEntry] = field(default_factory=list)
     keytab: SecretEntry | None = None
     nexus_key: SecretEntry | None = None
     secrets: dict[str, SecretEntry] = field(default_factory=dict)
-    
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
-        
+
         if self.ssh_host_keys:
-            d["ssh-host-keys"] = self.ssh_host_keys.to_dict()
+            d["ssh-host-keys"] = [entry.to_dict() for entry in self.ssh_host_keys]
         if self.keytab:
             d["keytab"] = self.keytab.to_dict()
         if self.nexus_key:
@@ -147,15 +151,17 @@ class HostSecretsManifest:
             d["secrets"] = {
                 name: entry.to_dict() for name, entry in self.secrets.items()
             }
-        
+
         return d
-    
+
     @classmethod
     def from_dict(cls, hostname: str, data: dict) -> "HostSecretsManifest":
         manifest = cls(hostname=hostname)
-        
+
         if "ssh-host-keys" in data:
-            manifest.ssh_host_keys = SecretEntry.from_dict(data["ssh-host-keys"])
+            manifest.ssh_host_keys = [
+                SecretEntry.from_dict(e) for e in data["ssh-host-keys"]
+            ]
         if "keytab" in data:
             manifest.keytab = SecretEntry.from_dict(data["keytab"])
         if "nexus-key" in data:
@@ -304,23 +310,31 @@ def save_dnssec_manifest(build_path: Path, manifest: DnssecManifest) -> Path:
 # Helper functions for creating entries with defaults
 # =============================================================================
 
-def make_ssh_host_keys_entry(
-    key_types: list[str],
+def make_ssh_host_keys_entries(
+    stems: list[str],
     target_dir: str | None = None,
     user: str | None = None,
     group: str | None = None,
     mode: str | None = None,
-) -> SecretEntry:
-    """Create an SSH host keys manifest entry with defaults."""
+) -> list[SecretEntry]:
+    """Create SSH host key manifest entries, one per private key file.
+
+    Each entry covers a single age-encrypted private key.  The source path
+    follows the convention ``ssh/<stem>.age`` and the target filename is the
+    stem itself (i.e. the name sshd expects, e.g. ``ssh_host_ed25519_key``).
+    """
     defaults = DEFAULTS["ssh-host-keys"]
-    return SecretEntry(
-        source="ssh-host-keys.age",
-        target_dir=target_dir or defaults["target_dir"],
-        user=user or defaults["user"],
-        group=group or defaults["group"],
-        mode=mode or defaults["mode"],
-        key_types=key_types,
-    )
+    return [
+        SecretEntry(
+            source=f"ssh/{stem}.age",
+            target=stem,
+            target_dir=target_dir or defaults["target_dir"],
+            user=user or defaults["user"],
+            group=group or defaults["group"],
+            mode=mode or defaults["mode"],
+        )
+        for stem in stems
+    ]
 
 
 def make_keytab_entry(

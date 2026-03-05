@@ -47,8 +47,8 @@ def test_secret_entry_from_dict():
 def test_host_manifest_roundtrip(tmp_path: Path):
     """HostSecretsManifest saves and loads correctly."""
     manifest = host_secrets.HostSecretsManifest(hostname="testhost")
-    manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entry(
-        key_types=["ed25519", "ecdsa"],
+    manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
+        stems=["ssh_host_ed25519_key", "ssh_host_ecdsa_key"],
         target_dir="/run/aegis/ssh",
     )
     manifest.keytab = host_secrets.make_keytab_entry(
@@ -75,9 +75,11 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     loaded = host_secrets.load_host_manifest(tmp_path, "testhost")
     
     assert loaded.hostname == "testhost"
-    assert loaded.ssh_host_keys is not None
-    assert loaded.ssh_host_keys.target_dir == "/run/aegis/ssh"
-    assert loaded.ssh_host_keys.key_types == ["ed25519", "ecdsa"]
+    assert len(loaded.ssh_host_keys) == 2
+    assert loaded.ssh_host_keys[0].source == "ssh/ssh_host_ed25519_key.age"
+    assert loaded.ssh_host_keys[0].target == "ssh_host_ed25519_key"
+    assert loaded.ssh_host_keys[0].target_dir == "/run/aegis/ssh"
+    assert loaded.ssh_host_keys[1].source == "ssh/ssh_host_ecdsa_key.age"
     assert loaded.keytab is not None
     assert loaded.keytab.target == "/run/aegis/keytab"
     assert loaded.keytab.encoding == "base64"
@@ -121,11 +123,14 @@ def test_dnssec_manifest_roundtrip(tmp_path: Path):
 
 def test_default_values():
     """Default values are applied correctly."""
-    ssh_entry = host_secrets.make_ssh_host_keys_entry(key_types=["ed25519"])
-    assert ssh_entry.target_dir == "/run/aegis/ssh"
-    assert ssh_entry.user == "root"
-    assert ssh_entry.group == "root"
-    assert ssh_entry.mode == "0600"
+    ssh_entries = host_secrets.make_ssh_host_keys_entries(stems=["ssh_host_ed25519_key"])
+    assert len(ssh_entries) == 1
+    assert ssh_entries[0].source == "ssh/ssh_host_ed25519_key.age"
+    assert ssh_entries[0].target == "ssh_host_ed25519_key"
+    assert ssh_entries[0].target_dir == "/run/aegis/ssh"
+    assert ssh_entries[0].user == "root"
+    assert ssh_entries[0].group == "root"
+    assert ssh_entries[0].mode == "0600"
     
     keytab_entry = host_secrets.make_keytab_entry()
     assert keytab_entry.target == "/run/aegis/keytab"
@@ -139,7 +144,7 @@ def test_load_nonexistent_manifest(tmp_path: Path):
     """Loading a nonexistent manifest returns empty manifest."""
     manifest = host_secrets.load_host_manifest(tmp_path, "nonexistent")
     assert manifest.hostname == "nonexistent"
-    assert manifest.ssh_host_keys is None
+    assert manifest.ssh_host_keys == []
     assert manifest.keytab is None
     assert manifest.nexus_key is None
     assert manifest.secrets == {}
