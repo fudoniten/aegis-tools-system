@@ -41,18 +41,25 @@ def test_generate_host_keys():
     assert "initrd@testhost" in keys.initrd_ed25519.public_key
 
 
-def test_host_keys_to_dict():
-    """Convert host keys to dictionary."""
+def test_host_keys_items():
+    """items() yields (stem, keypair) pairs for all four keys."""
     keys = ssh.generate_host_keys("testhost")
-    d = keys.to_dict()
-    
-    assert "host" in d
-    assert "deploy" in d
-    assert "initrd" in d
-    assert "ed25519" in d["host"]
-    assert "ecdsa" in d["host"]
-    assert "private" in d["host"]["ed25519"]
-    assert "public" in d["host"]["ed25519"]
+    items = keys.items()
+
+    stems = [stem for stem, _ in items]
+    assert stems == [
+        "ssh_host_ed25519_key",
+        "ssh_host_ecdsa_key",
+        "deploy_ed25519_key",
+        "initrd_ed25519_key",
+    ]
+
+    keypairs = [kp for _, kp in items]
+    # Spot-check a couple of keypairs
+    assert keypairs[0].public_key.startswith("ssh-ed25519")
+    assert "BEGIN OPENSSH PRIVATE KEY" in keypairs[0].private_key
+    assert keypairs[1].public_key.startswith("ecdsa-sha2")
+    assert "BEGIN OPENSSH PRIVATE KEY" in keypairs[1].private_key
 
 
 def test_generate_sshfp_records():

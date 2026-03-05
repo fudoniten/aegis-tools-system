@@ -23,32 +23,18 @@ class HostSSHKeys:
     deploy_ed25519: SSHKeypair
     initrd_ed25519: SSHKeypair
     
-    def to_dict(self) -> dict:
-        """Convert to dictionary for serialization."""
-        return {
-            "host": {
-                "ed25519": {
-                    "private": self.host_ed25519.private_key,
-                    "public": self.host_ed25519.public_key,
-                },
-                "ecdsa": {
-                    "private": self.host_ecdsa.private_key,
-                    "public": self.host_ecdsa.public_key,
-                },
-            },
-            "deploy": {
-                "ed25519": {
-                    "private": self.deploy_ed25519.private_key,
-                    "public": self.deploy_ed25519.public_key,
-                },
-            },
-            "initrd": {
-                "ed25519": {
-                    "private": self.initrd_ed25519.private_key,
-                    "public": self.initrd_ed25519.public_key,
-                },
-            },
-        }
+    def items(self) -> list[tuple[str, "SSHKeypair"]]:
+        """Return (file_stem, keypair) pairs for each key.
+
+        The file stem is the intended filename on the SSH server
+        (e.g. ssh_host_ed25519_key), without any extension.
+        """
+        return [
+            ("ssh_host_ed25519_key", self.host_ed25519),
+            ("ssh_host_ecdsa_key", self.host_ecdsa),
+            ("deploy_ed25519_key", self.deploy_ed25519),
+            ("initrd_ed25519_key", self.initrd_ed25519),
+        ]
 
 
 def generate_ssh_keypair(
