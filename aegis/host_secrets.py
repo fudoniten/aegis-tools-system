@@ -98,6 +98,7 @@ class SecretEntry:
     group: str = "root"
     mode: str = "0400"
     encoding: str | None = None    # "base64" for binary secrets
+    types: str | None = None       # SSH key type ("ed25519", "ecdsa", "rsa")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"source": self.source}
@@ -110,6 +111,8 @@ class SecretEntry:
         d["mode"] = self.mode
         if self.encoding:
             d["encoding"] = self.encoding
+        if self.types:
+            d["types"] = self.types
         return d
 
     @classmethod
@@ -122,6 +125,7 @@ class SecretEntry:
             group=data.get("group", "root"),
             mode=data.get("mode", "0400"),
             encoding=data.get("encoding"),
+            types=data.get("types"),
         )
 
 
@@ -316,25 +320,35 @@ def make_ssh_host_keys_entries(
     user: str | None = None,
     group: str | None = None,
     mode: str | None = None,
+    key_types: list[str] | None = None,
 ) -> list[SecretEntry]:
     """Create SSH host key manifest entries, one per private key file.
 
     Each entry covers a single age-encrypted private key.  The source path
     follows the convention ``ssh/<stem>.age`` and the target filename is the
     stem itself (i.e. the name sshd expects, e.g. ``ssh_host_ed25519_key``).
+
+    Args:
+        stems: List of file stems (e.g. ``["ssh_host_ed25519_key"]``)
+        key_types: Optional list of SSH key types parallel to ``stems``
+                   (e.g. ``["ed25519"]``).  When provided each entry will
+                   include a ``types`` field that the ``fudoniten/aegis``
+                   NixOS module uses to configure OpenSSH.
     """
     defaults = DEFAULTS["ssh-host-keys"]
-    return [
-        SecretEntry(
+    entries = []
+    for i, stem in enumerate(stems):
+        key_type = key_types[i] if key_types and i < len(key_types) else None
+        entries.append(SecretEntry(
             source=f"ssh/{stem}.age",
             target=stem,
             target_dir=target_dir or defaults["target_dir"],
             user=user or defaults["user"],
             group=group or defaults["group"],
             mode=mode or defaults["mode"],
-        )
-        for stem in stems
-    ]
+            types=key_type,
+        ))
+    return entries
 
 
 def make_keytab_entry(
