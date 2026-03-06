@@ -208,12 +208,14 @@ def build_ssh_host_keys(
         # Update manifest with one entry per private key
         manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
         stems = [stem for stem, _ in keys.items()]
+        key_types = [keypair.key_type for _, keypair in keys.items()]
         manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
             stems=stems,
             target_dir=target_dir,
             user=user,
             group=group,
             mode=mode,
+            key_types=key_types,
         )
         manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
         typer.echo(f"    Updated manifest: {manifest_path}")
@@ -885,6 +887,7 @@ def import_ssh_host_keys(
     ssh_dir.mkdir(parents=True, exist_ok=True)
 
     stems = []
+    key_types = []
     for kp in keypairs:
         stem = KEY_TYPE_TO_STEM.get(kp.key_type, f"ssh_host_{kp.key_type}_key")
         age_path = ssh_dir / f"{stem}.age"
@@ -892,6 +895,7 @@ def import_ssh_host_keys(
         crypto.encrypt_age(kp.private_key, recipients, age_path)
         pub_path.write_text(kp.public_key + "\n")
         stems.append(stem)
+        key_types.append(kp.key_type)
         typer.echo(f"    Wrote {age_path.name} + {pub_path.name}")
 
     # Update manifest with one entry per private key
@@ -902,6 +906,7 @@ def import_ssh_host_keys(
         user=user,
         group=group,
         mode=mode,
+        key_types=key_types,
     )
     manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
 

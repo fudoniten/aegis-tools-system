@@ -50,6 +50,7 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
         stems=["ssh_host_ed25519_key", "ssh_host_ecdsa_key"],
         target_dir="/run/aegis/ssh",
+        key_types=["ed25519", "ecdsa"],
     )
     manifest.keytab = host_secrets.make_keytab_entry(
         target="/run/aegis/keytab",
@@ -79,7 +80,9 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     assert loaded.ssh_host_keys[0].source == "ssh/ssh_host_ed25519_key.age"
     assert loaded.ssh_host_keys[0].target == "ssh_host_ed25519_key"
     assert loaded.ssh_host_keys[0].target_dir == "/run/aegis/ssh"
+    assert loaded.ssh_host_keys[0].type == "ed25519"
     assert loaded.ssh_host_keys[1].source == "ssh/ssh_host_ecdsa_key.age"
+    assert loaded.ssh_host_keys[1].type == "ecdsa"
     assert loaded.keytab is not None
     assert loaded.keytab.target == "/run/aegis/keytab"
     assert loaded.keytab.encoding == "base64"
@@ -119,6 +122,29 @@ def test_dnssec_manifest_roundtrip(tmp_path: Path):
     assert loaded.public_key.mode == "0644"  # Public key is world-readable
     assert loaded.private_key is not None
     assert loaded.private_key.mode == "0400"  # Private key is protected
+
+
+def test_ssh_host_key_types_field():
+    """types field is set when key_types are provided."""
+    entries = host_secrets.make_ssh_host_keys_entries(
+        stems=["ssh_host_ed25519_key", "ssh_host_ecdsa_key"],
+        key_types=["ed25519", "ecdsa"],
+    )
+    assert entries[0].type == "ed25519"
+    assert entries[1].type == "ecdsa"
+
+    d0 = entries[0].to_dict()
+    assert d0["type"] == "ed25519"
+
+    d1 = entries[1].to_dict()
+    assert d1["type"] == "ecdsa"
+
+
+def test_ssh_host_key_types_field_absent_without_key_types():
+    """type field is absent from TOML when key_types are not provided."""
+    entries = host_secrets.make_ssh_host_keys_entries(stems=["ssh_host_ed25519_key"])
+    assert entries[0].type is None
+    assert "type" not in entries[0].to_dict()
 
 
 def test_default_values():
