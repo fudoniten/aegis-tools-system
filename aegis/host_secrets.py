@@ -15,6 +15,7 @@ Example manifest:
     user = "root"
     group = "root"
     mode = "0600"
+    type = "ed25519"
 
     [[ssh-host-keys]]
     source = "ssh/ssh_host_ecdsa_key.age"
@@ -23,6 +24,7 @@ Example manifest:
     user = "root"
     group = "root"
     mode = "0600"
+    type = "ecdsa"
 
     [keytab]
     source = "keytab.age"
@@ -98,7 +100,7 @@ class SecretEntry:
     group: str = "root"
     mode: str = "0400"
     encoding: str | None = None    # "base64" for binary secrets
-    types: str | None = None       # SSH key type ("ed25519", "ecdsa", "rsa")
+    type: str | None = None        # SSH key type ("ed25519", "ecdsa", "rsa")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"source": self.source}
@@ -111,8 +113,8 @@ class SecretEntry:
         d["mode"] = self.mode
         if self.encoding:
             d["encoding"] = self.encoding
-        if self.types:
-            d["types"] = self.types
+        if self.type:
+            d["type"] = self.type
         return d
 
     @classmethod
@@ -125,7 +127,7 @@ class SecretEntry:
             group=data.get("group", "root"),
             mode=data.get("mode", "0400"),
             encoding=data.get("encoding"),
-            types=data.get("types"),
+            type=data.get("type"),
         )
 
 
@@ -332,7 +334,7 @@ def make_ssh_host_keys_entries(
         stems: List of file stems (e.g. ``["ssh_host_ed25519_key"]``)
         key_types: Optional list of SSH key types parallel to ``stems``
                    (e.g. ``["ed25519"]``).  When provided each entry will
-                   include a ``types`` field that the ``fudoniten/aegis``
+                   include a ``type`` field that the ``fudoniten/aegis``
                    NixOS module uses to configure OpenSSH.
     """
     defaults = DEFAULTS["ssh-host-keys"]
@@ -346,7 +348,7 @@ def make_ssh_host_keys_entries(
             user=user or defaults["user"],
             group=group or defaults["group"],
             mode=mode or defaults["mode"],
-            types=key_type,
+            type=key_type,
         ))
     return entries
 

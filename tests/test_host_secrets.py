@@ -80,9 +80,9 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     assert loaded.ssh_host_keys[0].source == "ssh/ssh_host_ed25519_key.age"
     assert loaded.ssh_host_keys[0].target == "ssh_host_ed25519_key"
     assert loaded.ssh_host_keys[0].target_dir == "/run/aegis/ssh"
-    assert loaded.ssh_host_keys[0].types == "ed25519"
+    assert loaded.ssh_host_keys[0].type == "ed25519"
     assert loaded.ssh_host_keys[1].source == "ssh/ssh_host_ecdsa_key.age"
-    assert loaded.ssh_host_keys[1].types == "ecdsa"
+    assert loaded.ssh_host_keys[1].type == "ecdsa"
     assert loaded.keytab is not None
     assert loaded.keytab.target == "/run/aegis/keytab"
     assert loaded.keytab.encoding == "base64"
@@ -130,21 +130,21 @@ def test_ssh_host_key_types_field():
         stems=["ssh_host_ed25519_key", "ssh_host_ecdsa_key"],
         key_types=["ed25519", "ecdsa"],
     )
-    assert entries[0].types == "ed25519"
-    assert entries[1].types == "ecdsa"
+    assert entries[0].type == "ed25519"
+    assert entries[1].type == "ecdsa"
 
     d0 = entries[0].to_dict()
-    assert d0["types"] == "ed25519"
+    assert d0["type"] == "ed25519"
 
     d1 = entries[1].to_dict()
-    assert d1["types"] == "ecdsa"
+    assert d1["type"] == "ecdsa"
 
 
 def test_ssh_host_key_types_field_absent_without_key_types():
-    """types field is absent from TOML when key_types are not provided."""
+    """type field is absent from TOML when key_types are not provided."""
     entries = host_secrets.make_ssh_host_keys_entries(stems=["ssh_host_ed25519_key"])
-    assert entries[0].types is None
-    assert "types" not in entries[0].to_dict()
+    assert entries[0].type is None
+    assert "type" not in entries[0].to_dict()
 
 
 def test_default_values():
