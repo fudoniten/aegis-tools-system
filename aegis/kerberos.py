@@ -178,6 +178,15 @@ def instantiate_realm(
     return Path(kdc_conf_path)
 
 
+def realm_db_path(kdc_conf_path: Path) -> Path:
+    """Return the path to the Heimdal SQLite database given a kdc.conf path.
+
+    The database file is written by instantiate_realm into the same directory
+    as the kdc.conf file.
+    """
+    return kdc_conf_path.parent / "realm.db"
+
+
 def extract_host_keytab(
     hostname: str,
     kdc_conf_path: Path,

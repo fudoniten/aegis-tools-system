@@ -545,7 +545,47 @@ def build_keytabs(
                 typer.echo(f"  Wrote KDC principals: {kdc_principals_out}")
             elif not kdc_role_pubkey:
                 typer.echo(f"  Warning: No KDC role configured, skipping KDC principals file")
-    
+
+            # Save KDC database and stash for the KDC host
+            if kdc_role and kdc_role.host:
+                from . import host_secrets
+                kdc_hostname = kdc_role.host
+                kdc_host_config = repo.get_host_config(kdc_hostname)
+                if kdc_host_config and kdc_host_config.age_pubkey:
+                    db_path = krb.realm_db_path(kdc_conf)
+                    if db_path.exists():
+                        typer.echo(f"\n  Saving KDC database and stash for {kdc_hostname}...")
+                        db_recipients = [kdc_host_config.age_pubkey, admin_pubkey]
+
+                        db_output = repo.host_build_path(kdc_hostname) / "kdc-database.age"
+                        if not db_output.exists() or force:
+                            db_output.parent.mkdir(parents=True, exist_ok=True)
+                            crypto.encrypt_age_binary(db_path.read_bytes(), db_recipients, db_output)
+                            typer.echo(f"    Wrote: {db_output}")
+                        else:
+                            typer.echo(f"    KDC database exists (use --force to regenerate)")
+
+                        stash_output = repo.host_build_path(kdc_hostname) / "kdc-stash.age"
+                        if not stash_output.exists() or force:
+                            stash_output.parent.mkdir(parents=True, exist_ok=True)
+                            crypto.encrypt_age_binary(realm_key_plain.read_bytes(), db_recipients, stash_output)
+                            typer.echo(f"    Wrote: {stash_output}")
+                        else:
+                            typer.echo(f"    KDC stash exists (use --force to regenerate)")
+
+                        kdc_manifest = host_secrets.load_host_manifest(repo.build_path, kdc_hostname)
+                        kdc_manifest.kdc_database = host_secrets.make_kdc_database_entry()
+                        kdc_manifest.kdc_stash = host_secrets.make_kdc_stash_entry()
+                        host_secrets.save_host_manifest(repo.build_path, kdc_manifest)
+                        typer.echo(f"    Updated KDC host manifest")
+                    else:
+                        typer.echo(f"  Warning: KDC database not found at {db_path}", err=True)
+                else:
+                    typer.echo(
+                        f"  Warning: KDC host '{kdc_hostname}' has no age key, skipping database/stash",
+                        err=True,
+                    )
+
     typer.secho("\nKeytab build complete!", fg=typer.colors.GREEN)
 
 

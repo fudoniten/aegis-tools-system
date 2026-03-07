@@ -82,6 +82,18 @@ DEFAULTS = {
         "group": "root",
         "mode": "0400",
     },
+    "kdc-database": {
+        "target": "/run/aegis/kdc-database",
+        "user": "root",
+        "group": "root",
+        "mode": "0600",
+    },
+    "kdc-stash": {
+        "target": "/run/aegis/kdc-stash",
+        "user": "root",
+        "group": "root",
+        "mode": "0600",
+    },
     "secret": {
         "user": "root",
         "group": "root",
@@ -142,6 +154,8 @@ class HostSecretsManifest:
     ssh_host_keys: list[SecretEntry] = field(default_factory=list)
     keytab: SecretEntry | None = None
     nexus_key: SecretEntry | None = None
+    kdc_database: SecretEntry | None = None
+    kdc_stash: SecretEntry | None = None
     secrets: dict[str, SecretEntry] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -153,6 +167,10 @@ class HostSecretsManifest:
             d["keytab"] = self.keytab.to_dict()
         if self.nexus_key:
             d["nexus-key"] = self.nexus_key.to_dict()
+        if self.kdc_database:
+            d["kdc-database"] = self.kdc_database.to_dict()
+        if self.kdc_stash:
+            d["kdc-stash"] = self.kdc_stash.to_dict()
         if self.secrets:
             d["secrets"] = {
                 name: entry.to_dict() for name, entry in self.secrets.items()
@@ -172,6 +190,10 @@ class HostSecretsManifest:
             manifest.keytab = SecretEntry.from_dict(data["keytab"])
         if "nexus-key" in data:
             manifest.nexus_key = SecretEntry.from_dict(data["nexus-key"])
+        if "kdc-database" in data:
+            manifest.kdc_database = SecretEntry.from_dict(data["kdc-database"])
+        if "kdc-stash" in data:
+            manifest.kdc_stash = SecretEntry.from_dict(data["kdc-stash"])
         if "secrets" in data:
             manifest.secrets = {
                 name: SecretEntry.from_dict(entry_data)
@@ -405,6 +427,42 @@ def make_secret_entry(
         group=group or defaults["group"],
         mode=mode or defaults["mode"],
         encoding=encoding,
+    )
+
+
+def make_kdc_database_entry(
+    target: str | None = None,
+    user: str | None = None,
+    group: str | None = None,
+    mode: str | None = None,
+) -> SecretEntry:
+    """Create a KDC database manifest entry with defaults."""
+    defaults = DEFAULTS["kdc-database"]
+    return SecretEntry(
+        source="kdc-database.age",
+        target=target or defaults["target"],
+        user=user or defaults["user"],
+        group=group or defaults["group"],
+        mode=mode or defaults["mode"],
+        encoding="base64",
+    )
+
+
+def make_kdc_stash_entry(
+    target: str | None = None,
+    user: str | None = None,
+    group: str | None = None,
+    mode: str | None = None,
+) -> SecretEntry:
+    """Create a KDC stash (master key) manifest entry with defaults."""
+    defaults = DEFAULTS["kdc-stash"]
+    return SecretEntry(
+        source="kdc-stash.age",
+        target=target or defaults["target"],
+        user=user or defaults["user"],
+        group=group or defaults["group"],
+        mode=mode or defaults["mode"],
+        encoding="base64",
     )
 
 
