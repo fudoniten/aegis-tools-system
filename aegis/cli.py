@@ -112,6 +112,7 @@ def build(
     typer.echo("Running full build...")
 
     if dry_run:
+        typer.echo("  [dry-run] Would run: build-role-keys")
         typer.echo("  [dry-run] Would run: build-ssh-host-keys")
         typer.echo("  [dry-run] Would run: build-nexus-keys")
         typer.echo("  [dry-run] Would run: build-keytabs")
@@ -119,6 +120,9 @@ def build(
         return
 
     # Run each build step
+    typer.echo("\n--- Building Role Keys ---")
+    build_role_keys(secrets_path=secrets_path, dry_run=False)
+
     typer.echo("\n--- Building SSH Host Keys ---")
     build_ssh_host_keys(secrets_path=secrets_path, dry_run=False)
 
@@ -132,6 +136,80 @@ def build(
     build_user_secrets(secrets_path=secrets_path, dry_run=False, user=None)
 
     typer.secho("\nBuild complete!", fg=typer.colors.GREEN)
+
+
+@app.command("build-role-keys")
+def build_role_keys(
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n"),
+):
+    """Ensure every role member host has its per-host role key file.
+
+    For each role, decrypts the admin-held role private key and re-encrypts
+    it for every host listed in the role config, writing the result to
+    build/hosts/<hostname>/roles/<role>.age.
+
+    Also updates each host's secrets.toml manifest with the list of roles it
+    belongs to, so the NixOS module can discover them automatically.
+    """
+    from . import host_secrets
+
+    repo = get_secrets_repo(secrets_path)
+    admin_pubkey = crypto.get_admin_public_key()
+
+    for role_name in repo.list_roles():
+        role_config = repo.get_role_config(role_name)
+        if not role_config:
+            continue
+
+        role_key_path = repo.role_key_path(role_name)
+        if not role_key_path.exists():
+            typer.echo(f"  Warning: No master key for role {role_name}, skipping")
+            continue
+
+        role_privkey: str | None = None  # decrypt lazily
+
+        for hostname in role_config.hosts:
+            out_path = repo.host_role_key_path(hostname, role_name)
+            if out_path.exists():
+                continue
+
+            if dry_run:
+                typer.echo(f"  [dry-run] Would create role key: {hostname}/{role_name}")
+                continue
+
+            typer.echo(f"  Creating role key: {hostname} → {role_name}...")
+
+            if role_privkey is None:
+                try:
+                    role_privkey = crypto.decrypt_age(role_key_path)
+                except Exception as e:
+                    typer.echo(f"    Error decrypting role key {role_name}: {e}", err=True)
+                    break
+
+            try:
+                host_age_key = get_host_age_pubkey(hostname, repo)
+            except SystemExit:
+                typer.echo(f"    Skipping {hostname} (no age key)", err=True)
+                continue
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            crypto.encrypt_age(role_privkey, [host_age_key, admin_pubkey], out_path)
+            typer.echo(f"    Wrote: {out_path}")
+
+    if dry_run:
+        return
+
+    # Update each host's manifest with the roles it belongs to
+    for hostname in repo.list_hosts():
+        roles_dir = repo.host_build_path(hostname) / "roles"
+        roles = sorted(f.stem for f in roles_dir.glob("*.age")) if roles_dir.exists() else []
+        manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+        if manifest.roles != roles:
+            manifest.roles = roles
+            host_secrets.save_host_manifest(repo.build_path, manifest)
+            if roles:
+                typer.echo(f"  {hostname}: roles={', '.join(roles)}")
 
 
 @app.command("build-ssh-host-keys")
@@ -1161,38 +1239,70 @@ def _ensure_dns_role(
     existing = repo.get_role_config(role_name)
 
     if existing:
-        # Role exists, get its public key
         role_pub_path = repo.role_build_path(role_name) / f"{role_name}.pub"
         if not role_pub_path.exists():
             typer.echo(f"Error: Role {role_name} exists but public key not found", err=True)
             raise typer.Exit(1)
+        if hostname not in existing.hosts:
+            typer.echo(f"  Adding {hostname} to role {role_name}...")
+            _add_host_to_role_impl(repo, role_name, hostname)
         return role_pub_path.read_text().strip()
 
     # Create the role
-    typer.echo(f"Creating role: {role_name} (assigned to {hostname})")
+    typer.echo(f"Creating role: {role_name}")
 
-    # Get age public key for the host
     host_age_key = get_host_age_pubkey(hostname, repo)
-
-    # Generate role keypair
     keypair = crypto.generate_age_keypair()
-
-    # Encrypt role private key for the host and admin
     admin_pubkey = crypto.get_admin_public_key()
 
-    role_key_path = repo.role_build_path(role_name) / f"{role_name}.age"
+    # Store role private key encrypted for admin only
+    role_key_path = repo.role_key_path(role_name)
     role_key_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(keypair.private_key, [host_age_key, admin_pubkey], role_key_path)
-    
+    crypto.encrypt_age(keypair.private_key, [admin_pubkey], role_key_path)
+
     # Save public key
     role_pub_path = repo.role_build_path(role_name) / f"{role_name}.pub"
+    role_pub_path.parent.mkdir(parents=True, exist_ok=True)
     role_pub_path.write_text(keypair.public_key)
-    
+
+    # Create per-host role key
+    host_role_path = repo.host_role_key_path(hostname, role_name)
+    host_role_path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(keypair.private_key, [host_age_key, admin_pubkey], host_role_path)
+
     # Save role config
-    role_config = config.RoleConfig(name=role_name, host=hostname)
+    role_config = config.RoleConfig(name=role_name, hosts=[hostname])
     repo.set_role_config(role_config)
-    
+
     return keypair.public_key
+
+
+def _add_host_to_role_impl(
+    repo: config.SecretsRepo,
+    role_name: str,
+    hostname: str,
+    role_privkey: str | None = None,
+) -> None:
+    """Decrypt the role private key (if needed) and encrypt it for hostname."""
+    if role_privkey is None:
+        role_key_path = repo.role_key_path(role_name)
+        try:
+            role_privkey = crypto.decrypt_age(role_key_path)
+        except Exception as e:
+            typer.echo(f"Error decrypting role key {role_name}: {e}", err=True)
+            raise typer.Exit(1)
+
+    host_age_key = get_host_age_pubkey(hostname, repo)
+    admin_pubkey = crypto.get_admin_public_key()
+
+    out_path = repo.host_role_key_path(hostname, role_name)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(role_privkey, [host_age_key, admin_pubkey], out_path)
+
+    role_config = repo.get_role_config(role_name)
+    if role_config and hostname not in role_config.hosts:
+        role_config.hosts.append(hostname)
+        repo.set_role_config(role_config)
 
 
 @app.command("generate-dnssec-keys")
@@ -1688,50 +1798,136 @@ def init_realm(
     typer.secho(f"\nRealm {realm} initialized!", fg=typer.colors.GREEN)
     typer.echo(f"  Location: {realm_dir}")
     typer.echo(f"\nNext steps:")
-    typer.echo(f"  1. Run 'aegis init-role kdc <hostname>' to set up the KDC role")
-    typer.echo(f"  2. Run 'aegis build-keytabs' to generate host keytabs")
+    typer.echo(f"  1. Run 'aegis init-role kdc' to create the KDC role")
+    typer.echo(f"  2. Run 'aegis add-host-to-role kdc <hostname>' to add the KDC host")
+    typer.echo(f"  3. Run 'aegis build-keytabs' to generate host keytabs")
 
 
 @app.command("init-role")
 def init_role(
     role: str = typer.Argument(..., help="Role name (e.g., kdc, dns)"),
-    hostname: str = typer.Argument(..., help="Host that will have this role"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
 ):
-    """Create a role and assign it to a host."""
+    """Create a role keypair with no initial host members.
+
+    The role private key is encrypted for the admin and stored in
+    keys/roles/<role>.age.  Use 'aegis add-host-to-role' to grant hosts
+    access to this role.
+    """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
-    
+
     existing = repo.get_role_config(role)
     if existing:
-        typer.echo(f"Role {role} already exists (assigned to {existing.host})")
+        typer.echo(f"Role {role} already exists")
         raise typer.Exit(1)
-    
-    # Get age public key from host config
-    host_age_key = get_host_age_pubkey(hostname, repo)
 
-    # Generate role keypair
     typer.echo(f"Generating keypair for role {role}...")
     keypair = crypto.generate_age_keypair()
 
-    # Encrypt role private key for the host and admin
     admin_pubkey = crypto.get_admin_public_key()
-    
-    role_key_path = repo.role_build_path(role) / f"{role}.age"
+
+    # Store role private key encrypted for admin only
+    role_key_path = repo.role_key_path(role)
     role_key_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(keypair.private_key, [host_age_key, admin_pubkey], role_key_path)
-    
+    crypto.encrypt_age(keypair.private_key, [admin_pubkey], role_key_path)
+
     # Save public key
     role_pub_path = repo.role_build_path(role) / f"{role}.pub"
+    role_pub_path.parent.mkdir(parents=True, exist_ok=True)
     role_pub_path.write_text(keypair.public_key)
-    
-    # Save role config
-    role_config = config.RoleConfig(name=role, host=hostname)
+
+    # Save role config with empty hosts list
+    role_config = config.RoleConfig(name=role, hosts=[])
     repo.set_role_config(role_config)
-    
+
     typer.secho(f"Created role: {role}", fg=typer.colors.GREEN)
-    typer.echo(f"  Assigned to: {hostname}")
     typer.echo(f"  Public key: {keypair.public_key}")
+    typer.echo(f"  Role key:   {role_key_path}")
+    typer.echo(f"\nNext: aegis add-host-to-role {role} <hostname>")
+
+
+@app.command("add-host-to-role")
+def add_host_to_role(
+    role: str = typer.Argument(..., help="Role name"),
+    hostname: str = typer.Argument(..., help="Hostname to add to the role"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+):
+    """Add a host to a role, giving it access to the role's secrets.
+
+    Decrypts the admin-held role private key and re-encrypts it for the
+    target host, writing the result to
+    build/hosts/<hostname>/roles/<role>.age.
+    """
+    repo = get_secrets_repo(secrets_path)
+
+    role_config = repo.get_role_config(role)
+    if not role_config:
+        typer.echo(f"Error: Role {role} not found. Use 'aegis init-role {role}' first.", err=True)
+        raise typer.Exit(1)
+
+    if hostname in role_config.hosts:
+        typer.echo(f"Host {hostname} is already a member of role {role}")
+        raise typer.Exit(1)
+
+    role_key_path = repo.role_key_path(role)
+    if not role_key_path.exists():
+        typer.echo(f"Error: Role key not found: {role_key_path}", err=True)
+        typer.echo(f"Re-initialize the role with: aegis init-role {role}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Adding {hostname} to role {role}...")
+
+    try:
+        role_privkey = crypto.decrypt_age(role_key_path)
+    except Exception as e:
+        typer.echo(f"Error decrypting role key: {e}", err=True)
+        raise typer.Exit(1)
+
+    host_age_key = get_host_age_pubkey(hostname, repo)
+    admin_pubkey = crypto.get_admin_public_key()
+
+    out_path = repo.host_role_key_path(hostname, role)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(role_privkey, [host_age_key, admin_pubkey], out_path)
+
+    role_config.hosts.append(hostname)
+    repo.set_role_config(role_config)
+
+    typer.secho(f"Added {hostname} to role {role}", fg=typer.colors.GREEN)
+    typer.echo(f"  Role key: {out_path}")
+    typer.echo(f"  Members:  {', '.join(role_config.hosts)}")
+
+
+@app.command("remove-host-from-role")
+def remove_host_from_role(
+    role: str = typer.Argument(..., help="Role name"),
+    hostname: str = typer.Argument(..., help="Hostname to remove from the role"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+):
+    """Remove a host from a role and delete its per-host role key file."""
+    repo = get_secrets_repo(secrets_path)
+
+    role_config = repo.get_role_config(role)
+    if not role_config:
+        typer.echo(f"Error: Role {role} not found.", err=True)
+        raise typer.Exit(1)
+
+    if hostname not in role_config.hosts:
+        typer.echo(f"Host {hostname} is not a member of role {role}")
+        raise typer.Exit(1)
+
+    key_file = repo.host_role_key_path(hostname, role)
+    if key_file.exists():
+        key_file.unlink()
+        typer.echo(f"  Removed: {key_file}")
+
+    role_config.hosts = [h for h in role_config.hosts if h != hostname]
+    repo.set_role_config(role_config)
+
+    typer.secho(f"Removed {hostname} from role {role}", fg=typer.colors.GREEN)
+    if role_config.hosts:
+        typer.echo(f"  Remaining members: {', '.join(role_config.hosts)}")
 
 
 # =============================================================================
@@ -1813,7 +2009,8 @@ def status(
     for role in roles:
         role_config = repo.get_role_config(role)
         if role_config:
-            typer.echo(f"  {role}: host={role_config.host}")
+            hosts_str = ", ".join(role_config.hosts) if role_config.hosts else "(none)"
+            typer.echo(f"  {role}: hosts=[{hosts_str}]")
 
 
 @app.command("list")

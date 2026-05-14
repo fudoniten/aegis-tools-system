@@ -89,19 +89,21 @@ class UserConfig:
 class RoleConfig:
     """Configuration for a role."""
     name: str
-    host: str
-    
+    hosts: list[str] = field(default_factory=list)
+
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "RoleConfig":
-        return cls(
-            name=name,
-            host=data.get("host", ""),
-        )
-    
+        # Support both old single-host format and new multi-host format
+        if "hosts" in data:
+            hosts = data["hosts"]
+        elif "host" in data and data["host"]:
+            hosts = [data["host"]]
+        else:
+            hosts = []
+        return cls(name=name, hosts=hosts)
+
     def to_dict(self) -> dict:
-        return {
-            "host": self.host,
-        }
+        return {"hosts": self.hosts}
 
 
 @dataclass
@@ -165,6 +167,7 @@ class SecretsRepo:
         (self.src_path / "roles").mkdir(parents=True, exist_ok=True)
         (self.src_path / "users").mkdir(parents=True, exist_ok=True)
         (self.keys_path / "users").mkdir(parents=True, exist_ok=True)
+        (self.keys_path / "roles").mkdir(parents=True, exist_ok=True)
         self.build_path.mkdir(parents=True, exist_ok=True)
     
     # Host configuration
@@ -283,8 +286,16 @@ class SecretsRepo:
         return self.build_path / "domains" / safe_name
     
     def role_build_path(self, role_name: str) -> Path:
-        """Get the build output directory for a role."""
+        """Get the build output directory for a role (pubkeys, etc.)."""
         return self.build_path / "roles"
+
+    def role_key_path(self, role_name: str) -> Path:
+        """Get the path to the admin-encrypted role private key."""
+        return self.keys_path / "roles" / f"{role_name}.age"
+
+    def host_role_key_path(self, hostname: str, role_name: str) -> Path:
+        """Get the path to a host's copy of a role private key."""
+        return self.build_path / "hosts" / hostname / "roles" / f"{role_name}.age"
     
     # User keys
     
