@@ -136,6 +136,15 @@ aegis verify myhost
 | `aegis init-realm <REALM>` | Initialize a Kerberos realm |
 | `aegis init-role <role> <host>` | Create a role and assign to host |
 
+### Domain Role Commands
+
+| Command | Description |
+|---------|-------------|
+| `aegis add-host-to-role <role> <host>` | Add a host to a domain role |
+| `aegis remove-host-from-role <role> <host>` | Remove a host from a domain role |
+
+See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for detailed documentation on domain roles and two-phase decryption.
+
 ### Utility Commands
 
 | Command | Description |

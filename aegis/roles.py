@@ -1,6 +1,37 @@
 """Role management for Aegis.
 
 Roles allow secrets to be shared across multiple hosts using two-phase decryption.
+
+## Domain Roles
+
+Domain roles enable efficient secret sharing across domain hosts. Instead of
+encrypting each domain secret for all hosts, you:
+
+1. Create a domain role key
+2. Encrypt the role key for all domain hosts
+3. Encrypt domain secrets with the role key
+
+To add/remove hosts, only the role key needs to be re-encrypted.
+
+## Two-Phase Decryption
+
+Phase 1: Host decrypts role key with its master key
+Phase 2: Host decrypts domain secrets with the role key
+
+Example:
+    # Add a host to a domain
+    add_host_to_role(
+        repo_build_path=Path("aegis-secrets/build"),
+        repo_src_path=Path("aegis-secrets/src"),
+        role_name="domain-fudo.org",
+        hostname="newhost",
+        admin_identity=Path("~/.config/aegis/key.txt"),
+        admin_pubkey="age1...",
+    )
+
+See Also:
+    DOMAIN-ROLES.md - Complete documentation on domain roles
+    CLI commands: aegis add-host-to-role, aegis remove-host-from-role
 """
 
 from pathlib import Path
