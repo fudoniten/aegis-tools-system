@@ -2097,6 +2097,91 @@ def verify(
             typer.echo(f"  {secret_file.name}: WARNING (unexpected format)")
 
 
+@app.command("add-host-to-role")
+def add_host_to_role_cmd(
+    role: str = typer.Argument(..., help="Role name (e.g., domain-fudo.org)"),
+    hostname: str = typer.Argument(..., help="Host to add to the role"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+):
+    """Add a host to a role by re-encrypting the role key.
+    
+    This allows the host to decrypt secrets encrypted for this role
+    using two-phase decryption.
+    
+    Example:
+        aegis add-host-to-role domain-fudo.org newhost
+    """
+    from . import roles
+    
+    repo = get_secrets_repo(secrets_path)
+    admin_identity = Path.home() / ".config" / "aegis" / "key.txt"
+    
+    if not admin_identity.exists():
+        typer.echo(f"Error: Admin key not found at {admin_identity}", err=True)
+        typer.echo("Set up admin key first", err=True)
+        raise typer.Exit(1)
+    
+    admin_pubkey = crypto.get_admin_public_key()
+    
+    try:
+        roles.add_host_to_role(
+            repo_build_path=repo.build_path,
+            repo_src_path=repo.src_path,
+            role_name=role,
+            hostname=hostname,
+            admin_identity=admin_identity,
+            admin_pubkey=admin_pubkey,
+        )
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command("remove-host-from-role")
+def remove_host_from_role_cmd(
+    role: str = typer.Argument(..., help="Role name"),
+    hostname: str = typer.Argument(..., help="Host to remove from the role"),
+    domain_hosts: str = typer.Option(
+        ..., "--hosts",
+        help="Comma-separated list of ALL hosts that should remain in the role"
+    ),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+):
+    """Remove a host from a role by re-encrypting the role key.
+    
+    The host will no longer be able to decrypt role secrets.
+    You must specify all hosts that should remain in the role.
+    
+    Example:
+        aegis remove-host-from-role domain-fudo.org oldhost --hosts=aedile,germany,france
+    """
+    from . import roles
+    
+    repo = get_secrets_repo(secrets_path)
+    admin_identity = Path.home() / ".config" / "aegis" / "key.txt"
+    
+    if not admin_identity.exists():
+        typer.echo(f"Error: Admin key not found at {admin_identity}", err=True)
+        raise typer.Exit(1)
+    
+    admin_pubkey = crypto.get_admin_public_key()
+    all_hosts = [h.strip() for h in domain_hosts.split(",")]
+    
+    try:
+        roles.remove_host_from_role(
+            repo_build_path=repo.build_path,
+            repo_src_path=repo.src_path,
+            role_name=role,
+            hostname=hostname,
+            admin_identity=admin_identity,
+            admin_pubkey=admin_pubkey,
+            all_domain_hosts=all_hosts,
+        )
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+
 def main():
     app()
 
