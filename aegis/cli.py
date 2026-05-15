@@ -1982,35 +1982,65 @@ def nexus_keygen(
 def status(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
 ):
-    """Show what needs building."""
+    """Show configuration and build status for all hosts, users, and roles."""
+    from . import host_secrets
+
     repo = get_secrets_repo(secrets_path)
-    
+
     typer.echo("Aegis Secrets Status")
     typer.echo("=" * 40)
-    
+
+    def yn(v: bool) -> str:
+        return "yes" if v else "no"
+
     hosts = repo.list_hosts()
     users = repo.list_users()
     roles = repo.list_roles()
-    
+
     typer.echo(f"\nConfigured hosts: {len(hosts)}")
     for hostname in hosts:
+        host_config = repo.get_host_config(hostname)
         build_path = repo.host_build_path(hostname)
-        ssh_exists = (build_path / "ssh-keys.age").exists()
-        status_icon = "[green]✓[/green]" if ssh_exists else "[yellow]○[/yellow]"
-        typer.echo(f"  {hostname}: SSH={'yes' if ssh_exists else 'no'}")
-    
+
+        has_master_key = bool(host_config and host_config.age_pubkey)
+
+        ssh_dir = build_path / "ssh"
+        has_ssh = ssh_dir.is_dir() and any(ssh_dir.glob("*.age"))
+
+        has_nexus = (build_path / "nexus-key.age").exists()
+        has_keytab = (build_path / "keytab.age").exists()
+
+        roles_dir = build_path / "roles"
+        host_roles = sorted(f.stem for f in roles_dir.glob("*.age")) if roles_dir.is_dir() else []
+
+        parts = [
+            f"master-key={yn(has_master_key)}",
+            f"ssh={yn(has_ssh)}",
+            f"nexus={yn(has_nexus)}",
+            f"keytab={yn(has_keytab)}",
+        ]
+        if host_roles:
+            parts.append(f"roles=[{', '.join(host_roles)}]")
+
+        typer.echo(f"  {hostname}: {', '.join(parts)}")
+
     typer.echo(f"\nConfigured users: {len(users)}")
     for username in users:
         user_config = repo.get_user_config(username)
         if user_config:
-            typer.echo(f"  {username}: hosts={','.join(user_config.hosts)}")
-    
+            typer.echo(f"  {username}: hosts=[{', '.join(user_config.hosts)}]")
+
     typer.echo(f"\nConfigured roles: {len(roles)}")
     for role in roles:
         role_config = repo.get_role_config(role)
         if role_config:
-            hosts_str = ", ".join(role_config.hosts) if role_config.hosts else "(none)"
-            typer.echo(f"  {role}: hosts=[{hosts_str}]")
+            has_master_key = repo.role_key_path(role).exists()
+            has_pubkey = (repo.role_build_path(role) / f"{role}.pub").exists()
+            members = ", ".join(role_config.hosts) if role_config.hosts else "(none)"
+            typer.echo(
+                f"  {role}: hosts=[{members}],"
+                f" master-key={yn(has_master_key)}, pubkey={yn(has_pubkey)}"
+            )
 
 
 @app.command("list")
