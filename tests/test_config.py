@@ -18,12 +18,13 @@ def test_ensure_structure(tmp_path: Path):
     """Ensure directory structure is created."""
     repo = config.SecretsRepo(tmp_path)
     repo.ensure_structure()
-    
+
     assert (tmp_path / "src" / "hosts").exists()
     assert (tmp_path / "src" / "domains").exists()
     assert (tmp_path / "src" / "roles").exists()
     assert (tmp_path / "src" / "users").exists()
     assert (tmp_path / "keys" / "users").exists()
+    assert (tmp_path / "keys" / "roles").exists()
     assert (tmp_path / "build").exists()
 
 
@@ -62,18 +63,40 @@ def test_user_config_roundtrip(temp_repo: config.SecretsRepo):
 
 
 def test_role_config_roundtrip(temp_repo: config.SecretsRepo):
-    """Save and load role configuration."""
+    """Save and load role configuration with multiple hosts."""
     role_config = config.RoleConfig(
         name="kdc",
-        host="kdc-server",
+        hosts=["kdc-server", "kdc-replica"],
     )
-    
+
     temp_repo.set_role_config(role_config)
     loaded = temp_repo.get_role_config("kdc")
-    
+
     assert loaded is not None
     assert loaded.name == "kdc"
-    assert loaded.host == "kdc-server"
+    assert loaded.hosts == ["kdc-server", "kdc-replica"]
+
+
+def test_role_config_backward_compat(temp_repo: config.SecretsRepo):
+    """Old single-host role TOML files are read correctly."""
+    import tomli_w
+    role_path = temp_repo.src_path / "roles" / "dns.toml"
+    role_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(role_path, "wb") as f:
+        tomli_w.dump({"host": "polaris"}, f)
+
+    loaded = temp_repo.get_role_config("dns")
+    assert loaded is not None
+    assert loaded.hosts == ["polaris"]
+
+
+def test_role_config_empty_hosts(temp_repo: config.SecretsRepo):
+    """Role config with empty hosts list."""
+    role_config = config.RoleConfig(name="backup", hosts=[])
+    temp_repo.set_role_config(role_config)
+    loaded = temp_repo.get_role_config("backup")
+    assert loaded is not None
+    assert loaded.hosts == []
 
 
 def test_list_hosts(temp_repo: config.SecretsRepo):

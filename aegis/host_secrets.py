@@ -134,7 +134,7 @@ class SecretEntry:
 @dataclass
 class HostSecretsManifest:
     """Manifest of all secrets for a host.
-    
+
     This is stored at build/hosts/<hostname>/secrets.toml and contains
     metadata for all secrets that should be deployed to the host.
     """
@@ -143,6 +143,7 @@ class HostSecretsManifest:
     keytab: SecretEntry | None = None
     nexus_key: SecretEntry | None = None
     secrets: dict[str, SecretEntry] = field(default_factory=dict)
+    roles: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
@@ -157,6 +158,8 @@ class HostSecretsManifest:
             d["secrets"] = {
                 name: entry.to_dict() for name, entry in self.secrets.items()
             }
+        if self.roles:
+            d["roles"] = self.roles
 
         return d
 
@@ -177,7 +180,9 @@ class HostSecretsManifest:
                 name: SecretEntry.from_dict(entry_data)
                 for name, entry_data in data["secrets"].items()
             }
-        
+        if "roles" in data:
+            manifest.roles = data["roles"]
+
         return manifest
 
 
