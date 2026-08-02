@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 
 from aegis import host_secrets
+from aegis.config import Placement
 
 
 def test_secret_entry_to_dict():
@@ -49,23 +50,20 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     manifest = host_secrets.HostSecretsManifest(hostname="testhost")
     manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
         stems=["ssh_host_ed25519_key", "ssh_host_ecdsa_key"],
-        target_dir="/run/aegis/ssh",
+        placement=Placement(target_dir="/run/aegis/ssh"),
         key_types=["ed25519", "ecdsa"],
     )
     manifest.keytab = host_secrets.make_keytab_entry(
-        target="/run/aegis/keytab",
+        Placement(target="/run/aegis/keytab"),
     )
     manifest.nexus_key = host_secrets.make_nexus_key_entry(
-        target="/run/nexus/key",
-        user="nexus",
-        group="nexus",
+        Placement(target="/run/nexus/key", user="nexus", group="nexus"),
     )
     manifest.secrets["myservice"] = host_secrets.make_secret_entry(
         name="myservice",
-        target="/run/myservice/token",
-        user="myservice",
-        group="myservice",
-        mode="0600",
+        placement=Placement(
+            target="/run/myservice/token", user="myservice",
+            group="myservice", mode="0600"),
     )
     
     # Save
@@ -85,7 +83,9 @@ def test_host_manifest_roundtrip(tmp_path: Path):
     assert loaded.ssh_host_keys[1].type == "ecdsa"
     assert loaded.keytab is not None
     assert loaded.keytab.target == "/run/aegis/keytab"
-    assert loaded.keytab.encoding == "base64"
+    # No encoding: keytabs are stored as raw bytes now that crypto is binary
+    # clean, so the module has nothing to decode.
+    assert loaded.keytab.encoding is None
     assert loaded.nexus_key is not None
     assert loaded.nexus_key.user == "nexus"
     assert "myservice" in loaded.secrets
@@ -160,7 +160,7 @@ def test_default_values():
     
     keytab_entry = host_secrets.make_keytab_entry()
     assert keytab_entry.target == "/run/aegis/keytab"
-    assert keytab_entry.encoding == "base64"
+    assert keytab_entry.encoding is None
     
     nexus_entry = host_secrets.make_nexus_key_entry()
     assert nexus_entry.target == "/run/aegis/nexus-key"

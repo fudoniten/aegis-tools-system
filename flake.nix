@@ -48,6 +48,10 @@
             self.packages.${system}.aegis
             pythonPkgs
             pkgs.git
+            pkgs.age
+            pkgs.openssh
+            pkgs.ruby
+            pkgs.heimdal
           ];
 
           shellHook = ''
@@ -72,7 +76,12 @@
               pkgs.ssh-to-age
               pkgs.openssh
               pkgs.ruby
-              pkgs.krb5
+              # Heimdal, NOT pkgs.krb5 (which is MIT Kerberos).  Every script
+              # under scripts/ uses Heimdal-only commands: kstash, `kadmin
+              # --local --config-file=`, `dump --decrypt`, `merge`, and the
+              # sqlite: database backend.  None of those exist in MIT krb5.
+              pkgs.heimdal
+              pkgs.ldns.examples  # ldns-keygen, for DNSSEC KSKs
               nexus.packages.${system}.nexus-keygen
             ];
             text = ''

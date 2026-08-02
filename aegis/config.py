@@ -1,4 +1,16 @@
-"""Configuration management for aegis-secrets repo."""
+"""Configuration management for aegis-secrets repo.
+
+Layout::
+
+    src/        source of truth: what should exist, and where it should land
+    keys/       admin recipient set, role and user private keys
+    deploy/     generated, host-targeted output (was: build/)
+
+The goal is that ``deploy/`` is a function of ``src/`` plus existing key
+material.  Anything that describes *intent* — which hosts exist, what services
+they run, where a decrypted secret belongs and who owns it — lives in ``src/``.
+``deploy/`` holds ciphertext and the derived per-host manifest, nothing else.
+"""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +24,52 @@ except ImportError:
 import tomli_w  # type: ignore
 
 
+#: Manifest sections that a host may set placement for.  ``secret:<name>``
+#: keys are also accepted, for entries under ``[secrets]``.
+PLACEMENT_KINDS = ("ssh-host-keys", "keytab", "nexus-key")
+
+
+@dataclass
+class Placement:
+    """Where a decrypted secret belongs on the target host.
+
+    Every field is optional; unset fields fall back to the built-in defaults in
+    :mod:`aegis.host_secrets`.  Placement lives in ``src/`` so that the manifest
+    in ``deploy/`` can be regenerated from scratch without losing it.
+    """
+    target: str | None = None
+    target_dir: str | None = None
+    user: str | None = None
+    group: str | None = None
+    mode: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            k: v
+            for k, v in (
+                ("target", self.target),
+                ("target_dir", self.target_dir),
+                ("user", self.user),
+                ("group", self.group),
+                ("mode", self.mode),
+            )
+            if v is not None
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Placement":
+        return cls(
+            target=data.get("target"),
+            target_dir=data.get("target_dir"),
+            user=data.get("user"),
+            group=data.get("group"),
+            mode=data.get("mode"),
+        )
+
+    def is_empty(self) -> bool:
+        return not self.to_dict()
+
+
 @dataclass
 class HostConfig:
     """Configuration for a host.
@@ -21,26 +79,32 @@ class HostConfig:
         age_pubkey: The host's master key (age public key format, e.g. "age1...").
                     This is the key used to encrypt secrets FOR this host.
                     The host uses the corresponding private key to decrypt.
-        domain: The host's DNS domain (e.g. "sea.fudo.org"), used for Kerberos FQDNs.
         services: Kerberos services this host provides
         filesystem_keys: Filesystem encryption keys
+        placement: Per-secret deployment metadata, keyed by manifest section
+                   ("ssh-host-keys", "keytab", "nexus-key") or "secret:<name>"
         extra_secrets: Additional secrets with metadata
     """
     hostname: str
     age_pubkey: str | None = None  # age public key for encrypting secrets to this host
-    domain: str | None = None      # DNS domain, used for Kerberos FQDN construction
     services: list[str] = field(default_factory=lambda: ["host", "ssh"])
     filesystem_keys: list[str] = field(default_factory=list)
-    extra_secrets: dict[str, Any] = field(default_factory=dict)  # Can be str or dict with metadata
+    placement: dict[str, Placement] = field(default_factory=dict)
+    extra_secrets: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, hostname: str, data: dict) -> "HostConfig":
+        placement = {
+            key: Placement.from_dict(value)
+            for key, value in data.get("placement", {}).items()
+            if isinstance(value, dict)
+        }
         return cls(
             hostname=hostname,
             age_pubkey=data.get("age_pubkey"),
-            domain=data.get("domain"),
             services=data.get("services", ["host", "ssh"]),
             filesystem_keys=data.get("filesystem_keys", []),
+            placement=placement,
             extra_secrets=data.get("extra_secrets", {}),
         )
 
@@ -52,9 +116,24 @@ class HostConfig:
         }
         if self.age_pubkey:
             d["age_pubkey"] = self.age_pubkey
-        if self.domain:
-            d["domain"] = self.domain
+        placement = {
+            key: value.to_dict()
+            for key, value in sorted(self.placement.items())
+            if not value.is_empty()
+        }
+        if placement:
+            d["placement"] = placement
         return d
+
+    def placement_for(self, kind: str) -> Placement:
+        """Placement for a manifest section, or an empty one if unset."""
+        return self.placement.get(kind, Placement())
+
+    def set_placement(self, kind: str, placement: Placement) -> None:
+        if placement.is_empty():
+            self.placement.pop(kind, None)
+        else:
+            self.placement[kind] = placement
 
 
 @dataclass
@@ -64,7 +143,7 @@ class UserConfig:
     hosts: list[str]
     repo_url: str | None = None
     public_key: str | None = None  # User's age public key for manifest encryption
-    
+
     @classmethod
     def from_dict(cls, username: str, data: dict) -> "UserConfig":
         return cls(
@@ -73,7 +152,7 @@ class UserConfig:
             repo_url=data.get("repo_url"),
             public_key=data.get("public_key"),
         )
-    
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "hosts": self.hosts,
@@ -107,187 +186,199 @@ class RoleConfig:
 
 
 @dataclass
-class DomainConfig:
-    """Configuration for a domain."""
-    name: str
-    realm: str | None = None
-    
-    @classmethod
-    def from_dict(cls, name: str, data: dict) -> "DomainConfig":
-        return cls(
-            name=name,
-            realm=data.get("realm"),
-        )
-    
-    def to_dict(self) -> dict:
-        d = {}
-        if self.realm:
-            d["realm"] = self.realm
-        return d
-
-
-@dataclass
 class DnssecConfig:
     """Configuration for a domain's DNSSEC keys."""
     domain: str
     algorithm: str      # e.g., "ECDSAP256SHA256"
     algorithm_num: int  # e.g., 13
     keytag: int         # e.g., 11926
-    
+
     @classmethod
     def from_dict(cls, domain: str, data: dict) -> "DnssecConfig":
         return cls(
-            domain=domain,
+            domain=data.get("domain", domain),
             algorithm=data.get("algorithm", ""),
             algorithm_num=data.get("algorithm_num", 0),
             keytag=data.get("keytag", 0),
         )
-    
+
     def to_dict(self) -> dict:
         return {
+            # Store the real domain name so the on-disk directory name (which
+            # has dots replaced) never has to be reversed.
+            "domain": self.domain,
             "algorithm": self.algorithm,
             "algorithm_num": self.algorithm_num,
             "keytag": self.keytag,
         }
 
 
+def _safe_name(name: str) -> str:
+    """Filesystem-safe form of a dotted name (domain, realm)."""
+    return name.replace(".", "_")
+
+
 class SecretsRepo:
     """Interface to the aegis-secrets repository."""
-    
+
+    #: Generated output directory.  ``build`` is the historical name and is
+    #: still honoured if present, so an un-migrated repo keeps working.
+    DEPLOY_DIRNAME = "deploy"
+    LEGACY_DEPLOY_DIRNAME = "build"
+
     def __init__(self, path: Path):
         self.path = path
         self.src_path = path / "src"
-        self.build_path = path / "build"
         self.keys_path = path / "keys"
-    
+
+        deploy = path / self.DEPLOY_DIRNAME
+        legacy = path / self.LEGACY_DEPLOY_DIRNAME
+        if not deploy.exists() and legacy.exists():
+            self.deploy_path = legacy
+        else:
+            self.deploy_path = deploy
+
+    @property
+    def build_path(self) -> Path:
+        """Deprecated alias for :attr:`deploy_path`."""
+        return self.deploy_path
+
+    def uses_legacy_deploy_dir(self) -> bool:
+        return self.deploy_path.name == self.LEGACY_DEPLOY_DIRNAME
+
     def ensure_structure(self) -> None:
         """Create the expected directory structure if missing."""
         (self.src_path / "hosts").mkdir(parents=True, exist_ok=True)
-        (self.src_path / "domains").mkdir(parents=True, exist_ok=True)
         (self.src_path / "roles").mkdir(parents=True, exist_ok=True)
         (self.src_path / "users").mkdir(parents=True, exist_ok=True)
+        (self.src_path / "kerberos" / "realms").mkdir(parents=True, exist_ok=True)
+        (self.keys_path / "admin").mkdir(parents=True, exist_ok=True)
         (self.keys_path / "users").mkdir(parents=True, exist_ok=True)
         (self.keys_path / "roles").mkdir(parents=True, exist_ok=True)
-        self.build_path.mkdir(parents=True, exist_ok=True)
-    
+        self.deploy_path.mkdir(parents=True, exist_ok=True)
+
+    # Admin keys
+
+    def admin_keys_path(self) -> Path:
+        """Directory holding the admin recipient set (one .pub per key)."""
+        return self.keys_path / "admin"
+
+    def legacy_admin_key_path(self) -> Path:
+        """Historical single-file admin public key."""
+        return self.keys_path / "admin.pub"
+
     # Host configuration
-    
+
     def get_host_config(self, hostname: str) -> HostConfig | None:
         """Read host configuration."""
         config_path = self.src_path / "hosts" / f"{hostname}.toml"
         if not config_path.exists():
             return None
-        
+
         with open(config_path, "rb") as f:
             data = tomllib.load(f)
         return HostConfig.from_dict(hostname, data)
-    
+
     def set_host_config(self, config: HostConfig) -> None:
         """Write host configuration."""
         config_path = self.src_path / "hosts" / f"{config.hostname}.toml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(config_path, "wb") as f:
             tomli_w.dump(config.to_dict(), f)
-    
+
     def list_hosts(self) -> list[str]:
         """List all configured hosts."""
         hosts_dir = self.src_path / "hosts"
         if not hosts_dir.exists():
             return []
-        return [p.stem for p in hosts_dir.glob("*.toml")]
-    
+        return sorted(p.stem for p in hosts_dir.glob("*.toml"))
+
     # User configuration
-    
+
     def get_user_config(self, username: str) -> UserConfig | None:
         """Read user configuration."""
         config_path = self.src_path / "users" / f"{username}.toml"
         if not config_path.exists():
             return None
-        
+
         with open(config_path, "rb") as f:
             data = tomllib.load(f)
         return UserConfig.from_dict(username, data)
-    
+
     def set_user_config(self, config: UserConfig) -> None:
         """Write user configuration."""
         config_path = self.src_path / "users" / f"{config.username}.toml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(config_path, "wb") as f:
             tomli_w.dump(config.to_dict(), f)
-    
+
     def list_users(self) -> list[str]:
         """List all configured users."""
         users_dir = self.src_path / "users"
         if not users_dir.exists():
             return []
-        return [p.stem for p in users_dir.glob("*.toml")]
-    
+        return sorted(p.stem for p in users_dir.glob("*.toml"))
+
     # Role configuration
-    
+
     def get_role_config(self, role_name: str) -> RoleConfig | None:
         """Read role configuration."""
         config_path = self.src_path / "roles" / f"{role_name}.toml"
         if not config_path.exists():
             return None
-        
+
         with open(config_path, "rb") as f:
             data = tomllib.load(f)
         return RoleConfig.from_dict(role_name, data)
-    
+
     def set_role_config(self, config: RoleConfig) -> None:
         """Write role configuration."""
         config_path = self.src_path / "roles" / f"{config.name}.toml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(config_path, "wb") as f:
             tomli_w.dump(config.to_dict(), f)
-    
+
     def list_roles(self) -> list[str]:
         """List all configured roles."""
         roles_dir = self.src_path / "roles"
         if not roles_dir.exists():
             return []
-        return [p.stem for p in roles_dir.glob("*.toml")]
-    
-    # Domain configuration
-    
-    def get_domain_config(self, domain_name: str) -> DomainConfig | None:
-        """Read domain configuration."""
-        # Domain names have dots, use a safe filename
-        safe_name = domain_name.replace(".", "_")
-        config_path = self.src_path / "domains" / f"{safe_name}.toml"
-        if not config_path.exists():
-            return None
-        
-        with open(config_path, "rb") as f:
-            data = tomllib.load(f)
-        return DomainConfig.from_dict(domain_name, data)
-    
-    def set_domain_config(self, config: DomainConfig) -> None:
-        """Write domain configuration."""
-        safe_name = config.name.replace(".", "_")
-        config_path = self.src_path / "domains" / f"{safe_name}.toml"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(config_path, "wb") as f:
-            tomli_w.dump(config.to_dict(), f)
-    
-    # Build paths
-    
+        return sorted(p.stem for p in roles_dir.glob("*.toml"))
+
+    # Deploy paths
+
+    def host_deploy_path(self, hostname: str) -> Path:
+        """Get the deploy output directory for a host."""
+        return self.deploy_path / "hosts" / hostname
+
     def host_build_path(self, hostname: str) -> Path:
-        """Get the build output directory for a host."""
-        return self.build_path / "hosts" / hostname
-    
-    def domain_build_path(self, domain_name: str) -> Path:
-        """Get the build output directory for a domain."""
-        safe_name = domain_name.replace(".", "_")
-        return self.build_path / "domains" / safe_name
-    
-    def role_build_path(self, role_name: str) -> Path:
-        """Get the build output directory for a role (pubkeys, etc.)."""
-        return self.build_path / "roles"
+        """Deprecated alias for :meth:`host_deploy_path`."""
+        return self.host_deploy_path(hostname)
+
+    def list_deployed_hosts(self) -> list[str]:
+        """Hosts that have output in deploy/, whether or not they're in src/."""
+        hosts_dir = self.deploy_path / "hosts"
+        if not hosts_dir.is_dir():
+            return []
+        return sorted(p.name for p in hosts_dir.iterdir() if p.is_dir())
+
+    def roles_deploy_path(self) -> Path:
+        """Directory holding role public keys."""
+        return self.deploy_path / "roles"
+
+    def role_build_path(self, role_name: str | None = None) -> Path:
+        """Deprecated alias for :meth:`roles_deploy_path`.
+
+        The role name was never used; callers append it themselves.
+        """
+        return self.roles_deploy_path()
+
+    def role_pubkey_path(self, role_name: str) -> Path:
+        """Public key for a role."""
+        return self.roles_deploy_path() / f"{role_name}.pub"
 
     def role_key_path(self, role_name: str) -> Path:
         """Get the path to the admin-encrypted role private key."""
@@ -295,56 +386,99 @@ class SecretsRepo:
 
     def host_role_key_path(self, hostname: str, role_name: str) -> Path:
         """Get the path to a host's copy of a role private key."""
-        return self.build_path / "hosts" / hostname / "roles" / f"{role_name}.age"
-    
+        return self.host_deploy_path(hostname) / "roles" / f"{role_name}.age"
+
+    def kdc_deploy_path(self) -> Path:
+        """Directory holding per-realm KDC principal bundles."""
+        return self.deploy_path / "kdc"
+
     # User keys
-    
+
     def user_key_path(self, username: str) -> Path:
         """Get the path to a user's private key (encrypted)."""
         return self.keys_path / "users" / f"{username}.age"
-    
+
     def user_pubkey_path(self, username: str) -> Path:
         """Get the path to a user's public key."""
         return self.keys_path / "users" / f"{username}.pub"
-    
-    def admin_key_path(self) -> Path:
-        """Get the path to the admin public key."""
-        return self.keys_path / "admin.pub"
-    
+
+    # Kerberos
+
+    def realms_path(self) -> Path:
+        return self.src_path / "kerberos" / "realms"
+
+    def realm_path(self, realm: str) -> Path:
+        return self.realms_path() / realm
+
+    def realm_config_path(self, realm: str) -> Path:
+        return self.realm_path(realm) / "realm.toml"
+
+    def realm_key_path(self, realm: str) -> Path:
+        return self.realm_path(realm) / "realm.key.age"
+
+    def realm_principals_path(self, realm: str) -> Path:
+        return self.realm_path(realm) / "principals"
+
+    def list_realms(self) -> list[str]:
+        realms_dir = self.realms_path()
+        if not realms_dir.is_dir():
+            return []
+        return sorted(p.name for p in realms_dir.iterdir() if p.is_dir())
+
     # DNSSEC configuration
-    
+
     def dnssec_src_path(self, domain: str) -> Path:
         """Get the source config directory for a domain's DNSSEC keys."""
-        safe_name = domain.replace(".", "_")
-        return self.src_path / "dnssec" / safe_name
-    
+        return self.src_path / "dnssec" / _safe_name(domain)
+
+    def dnssec_deploy_path(self, domain: str) -> Path:
+        """Get the deploy output directory for a domain's DNSSEC keys."""
+        return self.deploy_path / "dnssec" / _safe_name(domain)
+
     def dnssec_build_path(self, domain: str) -> Path:
-        """Get the build output directory for a domain's DNSSEC keys."""
-        safe_name = domain.replace(".", "_")
-        return self.build_path / "dnssec" / safe_name
-    
+        """Deprecated alias for :meth:`dnssec_deploy_path`."""
+        return self.dnssec_deploy_path(domain)
+
     def get_dnssec_config(self, domain: str) -> DnssecConfig | None:
         """Read DNSSEC configuration for a domain."""
         config_path = self.dnssec_src_path(domain) / "config.toml"
         if not config_path.exists():
             return None
-        
+
         with open(config_path, "rb") as f:
             data = tomllib.load(f)
         return DnssecConfig.from_dict(domain, data)
-    
+
     def set_dnssec_config(self, config: DnssecConfig) -> None:
         """Write DNSSEC configuration for a domain."""
         config_path = self.dnssec_src_path(config.domain) / "config.toml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(config_path, "wb") as f:
             tomli_w.dump(config.to_dict(), f)
-    
+
     def list_dnssec_domains(self) -> list[str]:
-        """List all domains with DNSSEC keys configured."""
+        """List all domains with DNSSEC keys configured.
+
+        The real domain name is read from each config file rather than
+        reversing the directory name, which is not a reversible mapping for
+        domains containing underscores.
+        """
         dnssec_dir = self.src_path / "dnssec"
         if not dnssec_dir.exists():
             return []
-        # Convert safe names back to domain names
-        return [p.name.replace("_", ".") for p in dnssec_dir.iterdir() if p.is_dir()]
+
+        domains = []
+        for entry in sorted(dnssec_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            config_path = entry / "config.toml"
+            name = None
+            if config_path.exists():
+                try:
+                    with open(config_path, "rb") as f:
+                        name = tomllib.load(f).get("domain")
+                except (OSError, tomllib.TOMLDecodeError):
+                    name = None
+            domains.append(name or entry.name.replace("_", "."))
+        return domains

@@ -12,11 +12,9 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def temp_secrets_repo(tmp_path: Path) -> Path:
-    """Create a temporary secrets repo structure."""
-    repo = config.SecretsRepo(tmp_path)
-    repo.ensure_structure()
-    return tmp_path
+def temp_secrets_repo(repo_path: Path) -> Path:
+    """A temporary secrets repo with a registered admin key."""
+    return repo_path
 
 
 def test_status_empty_repo(temp_secrets_repo: Path):

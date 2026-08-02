@@ -20,12 +20,13 @@ def test_ensure_structure(tmp_path: Path):
     repo.ensure_structure()
 
     assert (tmp_path / "src" / "hosts").exists()
-    assert (tmp_path / "src" / "domains").exists()
     assert (tmp_path / "src" / "roles").exists()
     assert (tmp_path / "src" / "users").exists()
+    assert (tmp_path / "src" / "kerberos" / "realms").exists()
+    assert (tmp_path / "keys" / "admin").exists()
     assert (tmp_path / "keys" / "users").exists()
     assert (tmp_path / "keys" / "roles").exists()
-    assert (tmp_path / "build").exists()
+    assert (tmp_path / "deploy").exists()
 
 
 def test_host_config_roundtrip(temp_repo: config.SecretsRepo):
@@ -121,10 +122,59 @@ def test_list_users(temp_repo: config.SecretsRepo):
     assert sorted(users) == ["alice", "bob"]
 
 
-def test_build_paths(temp_repo: config.SecretsRepo):
-    """Get correct build output paths."""
-    assert temp_repo.host_build_path("myhost") == temp_repo.path / "build" / "hosts" / "myhost"
-    assert temp_repo.domain_build_path("example.com") == temp_repo.path / "build" / "domains" / "example_com"
+def test_deploy_paths(temp_repo: config.SecretsRepo):
+    """Get correct deploy output paths."""
+    assert temp_repo.host_deploy_path("myhost") == temp_repo.path / "deploy" / "hosts" / "myhost"
+    assert temp_repo.dnssec_deploy_path("example.com") == temp_repo.path / "deploy" / "dnssec" / "example_com"
+    # Legacy alias keeps working
+    assert temp_repo.host_build_path("myhost") == temp_repo.host_deploy_path("myhost")
+
+
+def test_legacy_build_dir_is_honoured(tmp_path: Path):
+    """A repo that still has build/ and no deploy/ keeps using build/."""
+    (tmp_path / "build" / "hosts").mkdir(parents=True)
+    repo = config.SecretsRepo(tmp_path)
+
+    assert repo.uses_legacy_deploy_dir()
+    assert repo.deploy_path == tmp_path / "build"
+    assert repo.host_deploy_path("myhost") == tmp_path / "build" / "hosts" / "myhost"
+
+
+def test_deploy_dir_preferred_when_both_exist(tmp_path: Path):
+    """Once deploy/ exists it wins over a leftover build/."""
+    (tmp_path / "build").mkdir()
+    (tmp_path / "deploy").mkdir()
+    repo = config.SecretsRepo(tmp_path)
+
+    assert not repo.uses_legacy_deploy_dir()
+    assert repo.deploy_path == tmp_path / "deploy"
+
+
+def test_placement_roundtrip(temp_repo: config.SecretsRepo):
+    """Placement survives a save/load cycle, so the manifest stays derived."""
+    host_config = config.HostConfig(hostname="testhost")
+    host_config.set_placement("keytab", config.Placement(
+        target="/etc/krb5.keytab", mode="0600"))
+    host_config.set_placement("secret:token", config.Placement(
+        target="/run/svc/token", user="svc"))
+    temp_repo.set_host_config(host_config)
+
+    loaded = temp_repo.get_host_config("testhost")
+    assert loaded is not None
+    assert loaded.placement_for("keytab").target == "/etc/krb5.keytab"
+    assert loaded.placement_for("keytab").mode == "0600"
+    assert loaded.placement_for("secret:token").user == "svc"
+    # Unset kinds come back empty rather than missing
+    assert loaded.placement_for("nexus-key").is_empty()
+
+
+def test_dnssec_domain_name_not_reversed_from_path(temp_repo: config.SecretsRepo):
+    """Domain names come from the config file, not the mangled directory name."""
+    temp_repo.set_dnssec_config(config.DnssecConfig(
+        domain="sea.fudo.org", algorithm="ECDSAP256SHA256",
+        algorithm_num=13, keytag=1234))
+
+    assert temp_repo.list_dnssec_domains() == ["sea.fudo.org"]
 
 
 def test_missing_config_returns_none(temp_repo: config.SecretsRepo):

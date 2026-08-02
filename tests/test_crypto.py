@@ -70,35 +70,78 @@ def test_can_decrypt_check(tmp_path: Path):
 
 
 def test_binary_encrypt_decrypt_roundtrip(tmp_path: Path):
-    """Encrypt then decrypt binary content returns original bytes."""
+    """Binary content round-trips byte-for-byte, with no wrapper."""
     keypair = crypto.generate_age_keypair()
-    # Binary content with non-UTF-8 bytes (like Kerberos keys)
+    # Binary content with non-UTF-8 bytes (like Kerberos realm keys)
     content = b"\x00\x01\x02\xff\xfe\xfd\x80\x90\xa0binary\x00data"
     encrypted_path = tmp_path / "binary.age"
-    
-    crypto.encrypt_age_binary(content, [keypair.public_key], encrypted_path)
-    
+
+    crypto.encrypt_age(content, [keypair.public_key], encrypted_path)
+
     assert encrypted_path.exists()
-    # The encrypted content should contain the base64 marker when decrypted as text
-    decrypted_text = crypto.decrypt_age(encrypted_path, identity_content=keypair.private_key)
-    assert decrypted_text.startswith("base64:")
-    
-    # Binary decrypt should return original bytes
-    decrypted = crypto.decrypt_age_binary(encrypted_path, identity_content=keypair.private_key)
-    
+
+    decrypted = crypto.decrypt_age_bytes(
+        encrypted_path, identity_content=keypair.private_key)
     assert decrypted == content
 
 
-def test_binary_decrypt_fallback_for_text(tmp_path: Path):
-    """decrypt_age_binary falls back to encoding text if no base64 marker."""
+def test_no_base64_sentinel_is_written(tmp_path: Path):
+    """The legacy base64: wrapper is never written any more.
+
+    It existed only because decrypt_age ran age in text mode; the NixOS module
+    never stripped it, so keytabs deployed as the literal string 'base64:...'.
+    """
     keypair = crypto.generate_age_keypair()
-    content = "plain text content"
-    encrypted_path = tmp_path / "text.age"
-    
-    # Encrypt as text (no base64 marker)
-    crypto.encrypt_age(content, [keypair.public_key], encrypted_path)
-    
-    # Binary decrypt should still work, returning encoded bytes
-    decrypted = crypto.decrypt_age_binary(encrypted_path, identity_content=keypair.private_key)
-    
-    assert decrypted == content.encode("utf-8")
+    encrypted_path = tmp_path / "binary.age"
+
+    crypto.encrypt_age(b"\x00\xffnot text", [keypair.public_key], encrypted_path)
+
+    raw = crypto.decrypt_age_bytes(
+        encrypted_path, identity_content=keypair.private_key)
+    assert not raw.startswith(b"base64:")
+
+
+def test_legacy_base64_sentinel_still_reads(tmp_path: Path):
+    """Material written by the old tooling stays readable without migration.
+
+    The Kerberos realm keys and principals already in aegis-secrets carry the
+    sentinel, so dropping read support would strand them.
+    """
+    import base64 as b64
+
+    keypair = crypto.generate_age_keypair()
+    content = b"\x00\x01\x02\xfflegacy binary"
+    encrypted_path = tmp_path / "legacy.age"
+
+    # Reproduce exactly what the old encrypt_age_binary produced
+    marked = b"base64:" + b64.b64encode(content)
+    crypto.encrypt_age(marked, [keypair.public_key], encrypted_path)
+
+    decrypted = crypto.decrypt_age_bytes(
+        encrypted_path, identity_content=keypair.private_key)
+    assert decrypted == content
+
+
+def test_recipients_are_deduplicated(tmp_path: Path):
+    """A repeated recipient is collapsed, so recipient counts stay meaningful."""
+    keypair = crypto.generate_age_keypair()
+    encrypted_path = tmp_path / "dup.age"
+
+    crypto.encrypt_age(
+        "secret",
+        [keypair.public_key, keypair.public_key, keypair.public_key],
+        encrypted_path,
+    )
+
+    assert crypto.recipients_of(encrypted_path) == 1
+
+
+def test_recipients_of_counts_stanzas(tmp_path: Path):
+    """recipients_of reports how many keys a file was encrypted to."""
+    keypairs = [crypto.generate_age_keypair() for _ in range(3)]
+    encrypted_path = tmp_path / "multi.age"
+
+    crypto.encrypt_age(
+        "secret", [k.public_key for k in keypairs], encrypted_path)
+
+    assert crypto.recipients_of(encrypted_path) == 3
