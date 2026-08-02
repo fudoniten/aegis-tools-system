@@ -2,7 +2,7 @@
   description = "Aegis System Administration Tools";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
     nexus = {
       url = "github:fudoniten/nexus";
@@ -81,7 +81,7 @@
               # --local --config-file=`, `dump --decrypt`, `merge`, and the
               # sqlite: database backend.  None of those exist in MIT krb5.
               pkgs.heimdal
-              pkgs.ldns.examples  # ldns-keygen, for DNSSEC KSKs
+              pkgs.ldns.examples # ldns-keygen, for DNSSEC KSKs
               nexus.packages.${system}.nexus-keygen
             ];
             text = ''
