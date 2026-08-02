@@ -228,6 +228,16 @@ declares that domain. `aegis check` reports either half being missing.
 | `aegis add-host-to-role <role> <host>` | Give a host the role's key |
 | `aegis set-placement <host> <kind>` | Declare where a decrypted secret belongs |
 
+### Domain Role Commands
+
+| Command | Description |
+|---------|-------------|
+| `aegis add-host-to-role <role> <host>` | Add a host to a domain role |
+| `aegis remove-host-from-role <role> <host>` | Remove a host from a domain role |
+
+See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for the concept, and the Role Commands
+section above for the commands and on-disk layout in use.
+
 ### Utility Commands
 
 | Command | Description |
