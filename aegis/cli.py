@@ -14,6 +14,10 @@ app = typer.Typer(
     name="aegis",
     help="Aegis System Administration Tools for secrets management.",
     no_args_is_help=True,
+    # Typer's rich traceback handler runs inside click's invocation, so an
+    # AegisError reaching the top would be rendered as a full traceback before
+    # main() ever saw it. Operator-facing failures deserve one line.
+    pretty_exceptions_enable=False,
 )
 
 
@@ -2238,7 +2242,7 @@ def main():
         app()
     except AegisError as e:
         typer.secho(f"Error: {e}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(1)
+        sys.exit(1)
 
 
 # Registered at import time so that `from aegis.cli import app` (tests, and

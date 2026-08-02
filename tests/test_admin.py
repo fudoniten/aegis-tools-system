@@ -106,3 +106,23 @@ def test_secrets_are_encrypted_for_every_admin(
 
     assert crypto.decrypt_age(out, identity_content=admin_key.private_key) == "recoverable"
     assert crypto.decrypt_age(out, identity_content=backup.private_key) == "recoverable"
+
+
+def test_admin_key_path_env_override(tmp_path: Path, monkeypatch):
+    """AEGIS_ADMIN_KEY lets the admin key live somewhere other than ~/.config."""
+    elsewhere = tmp_path / "offline" / "key.txt"
+    elsewhere.parent.mkdir(parents=True)
+    keypair = crypto.generate_age_keypair()
+    elsewhere.write_text(keypair.private_key + "\n")
+
+    monkeypatch.setenv("AEGIS_ADMIN_KEY", str(elsewhere))
+
+    assert crypto.default_admin_key_path() == elsewhere
+    assert crypto.get_admin_public_key() == keypair.public_key
+
+
+def test_admin_key_path_default_without_override(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("AEGIS_ADMIN_KEY", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert crypto.default_admin_key_path() == tmp_path / ".config" / "aegis" / "key.txt"

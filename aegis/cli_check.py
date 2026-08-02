@@ -16,7 +16,9 @@ from typing import Optional
 
 import typer
 
-from . import admin, config, crypto, host_secrets, realm as realm_mod
+from . import (
+    admin, config, crypto, host_secrets, realm as realm_mod, recipients,
+)
 from .errors import AegisError
 
 SEVERITY_ERROR = "error"
@@ -413,44 +415,78 @@ def _check_recipients(
     age does not reveal *which* keys a file was encrypted to, but the number
     of recipient stanzas is visible, and a count below the expected minimum is
     conclusive: something was encrypted before the recipient set grew.
+
+    Everything encrypted in the repo is covered, not just per-host output.
+    The admin-only material -- role private keys, user private keys, realm
+    master keys, every Kerberos principal -- is exactly what a lost admin key
+    makes unrecoverable, so it is the most important thing to keep in step
+    with the admin set.
     """
     if not admin_keys:
         return
 
-    n_admin = len(admin_keys)
+    policies = recipients.plan(repo, admin_keys)
+    shortfalls: dict[str, list[str]] = {}
 
-    for hostname in repo.list_hosts():
-        deploy = repo.host_deploy_path(hostname)
-        if not deploy.is_dir():
+    for policy in policies:
+        rel = _relative(repo, policy.path)
+
+        if policy.problem:
+            # Legacy files are reported once, in aggregate, further down.
+            if policy.category != recipients.CAT_LEGACY:
+                report.warn(
+                    f"recipients/{policy.category}",
+                    f"{rel}: {policy.problem}",
+                )
             continue
 
-        scope = f"host/{hostname}"
-        expected = 1 + n_admin  # host + admin set
+        found = crypto.recipients_of(policy.path)
+        if found and found < policy.expected_count:
+            shortfalls.setdefault(policy.category, []).append(
+                f"{rel} ({found} of {policy.expected_count}: {policy.label})")
 
-        for path in sorted(deploy.glob("ssh/*.age")) + sorted(deploy.glob("*.age")):
-            if path.name == "keytab.age":
-                continue
-            found = crypto.recipients_of(path)
-            if found and found < expected:
-                report.error(
-                    scope,
-                    f"{path.relative_to(repo.deploy_path)} has {found} recipients, "
-                    f"expected at least {expected} (host + {n_admin} admin)",
-                    f"aegis reencrypt --host {hostname}",
-                )
+    for category, entries in sorted(shortfalls.items()):
+        shown = entries[:4]
+        more = len(entries) - len(shown)
+        detail = "; ".join(shown) + (f"; +{more} more" if more > 0 else "")
+        hint = (
+            "aegis reencrypt"
+            if category != recipients.CAT_HOST
+            else "aegis reencrypt --host <host>"
+        )
+        report.error(
+            f"recipients/{category}",
+            f"{len(entries)} file(s) missing a recipient: {detail}",
+            hint,
+        )
 
-        keytab = deploy / "keytab.age"
-        if keytab.exists():
-            found = crypto.recipients_of(keytab)
-            # host + admin set + kdc role
-            if found and found < expected + 1:
-                report.error(
-                    scope,
-                    f"keytab.age has {found} recipients, expected at least "
-                    f"{expected + 1} (host + {n_admin} admin + KDC role); the KDC "
-                    f"cannot read this keytab",
-                    "aegis build-keytabs --force",
-                )
+    legacy = [p for p in policies if p.category == recipients.CAT_LEGACY]
+    if legacy:
+        # Group by subtree: "245 unknown files" is not actionable, but
+        # "deploy/realms: 175" points straight at what to investigate.
+        subtrees: dict[str, int] = {}
+        for policy in legacy:
+            parts = policy.path.relative_to(repo.deploy_path).parts
+            subtrees[parts[0]] = subtrees.get(parts[0], 0) + 1
+
+        detail = ", ".join(
+            f"{name}/ ({count})"
+            for name, count in sorted(subtrees.items(), key=lambda kv: -kv[1])
+        )
+        report.warn(
+            "recipients/legacy",
+            f"{len(legacy)} encrypted file(s) under {repo.deploy_path.name}/ that no "
+            f"current policy describes: {detail}. reencrypt leaves them alone, so a "
+            f"new admin key will not reach them",
+            "confirm what they are, then regenerate or delete them",
+        )
+
+
+def _relative(repo: config.SecretsRepo, path: Path) -> str:
+    try:
+        return str(path.relative_to(repo.path))
+    except ValueError:
+        return str(path)
 
 
 @dataclass
@@ -515,95 +551,169 @@ def register(app: typer.Typer) -> None:
     @app.command("reencrypt")
     def reencrypt(
         secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-        host: Optional[str] = typer.Option(None, "--host", "-H", help="Only this host"),
+        host: Optional[str] = typer.Option(None, "--host", "-H", help="Only this host's files"),
+        category: Optional[str] = typer.Option(None, "--category", "-c", help="Only this category (admin-only, host, role, user, kdc, dnssec)"),
         dry_run: bool = typer.Option(False, "--dry-run", "-n"),
+        yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
     ):
-        """Re-encrypt existing secrets for the current recipient set.
+        """Re-encrypt every secret for the current recipient set.
 
         Key material is never regenerated: each file is decrypted with the
-        admin key and re-encrypted for the host plus every registered admin
-        key.  Use this after adding an admin key, or after a host's master key
-        changes -- NOT --rotate, which mints new secrets.
+        admin key and re-encrypted for the audience it is supposed to have.
+        Run this after registering a new admin key, or after a host's master
+        key changes -- NOT --rotate, which mints new secrets.
 
-        The per-host manifest is regenerated from src/ placement at the same
+        This covers the whole repository, including the admin-only material
+        (role private keys, user private keys, realm master keys, every
+        Kerberos principal). That material is precisely what a lost admin key
+        makes unrecoverable, so a new admin key is not really redundant until
+        this has run.
+
+        Per-host manifests are regenerated from src/ placement at the same
         time, so a target path changed in src/hosts/<host>.toml takes effect.
         """
-        from .cli import get_secrets_repo, admin_recipients, get_host_age_pubkey
+        from .cli import get_secrets_repo, admin_recipients
 
         repo = get_secrets_repo(secrets_path)
         admin_keys = admin_recipients(repo)
 
-        hosts = [host] if host else repo.list_hosts()
-        total = 0
+        policies = recipients.plan(repo, admin_keys)
 
-        for hostname in hosts:
-            deploy = repo.host_deploy_path(hostname)
-            if not deploy.is_dir():
+        if host:
+            prefix = repo.host_deploy_path(host)
+            policies = [p for p in policies if _is_within(p.path, prefix)]
+        if category:
+            policies = [p for p in policies if p.category == category]
+
+        unresolvable = [p for p in policies if p.problem]
+        actionable = [p for p in policies if p.resolvable]
+
+        # Only touch files whose recipient set actually differs, so a re-run is
+        # a no-op and the git diff stays legible.
+        stale = [
+            p for p in actionable
+            if crypto.recipients_of(p.path) != p.expected_count
+        ]
+
+        if unresolvable:
+            # Group by reason rather than listing every path: 245 identical
+            # lines bury the one thing the operator has to decide about.
+            reasons: dict[str, list[str]] = {}
+            for policy in unresolvable:
+                reasons.setdefault(policy.problem or "", []).append(
+                    _relative(repo, policy.path))
+
+            typer.secho(
+                f"\n{len(unresolvable)} file(s) cannot be re-encrypted "
+                f"and keep their current recipients:",
+                fg=typer.colors.YELLOW,
+            )
+            for reason, paths in sorted(reasons.items(), key=lambda kv: -len(kv[1])):
+                typer.echo(f"  {len(paths)}x {reason}")
+                for path in sorted(paths)[:3]:
+                    typer.echo(f"       {path}")
+                if len(paths) > 3:
+                    typer.echo(f"       ... and {len(paths) - 3} more")
+
+        # Manifest refresh is independent of recipients: a target path changed
+        # in src/hosts/<host>.toml has to reach the manifest even when every
+        # file already carries the right audience.
+        refreshed = 0
+        if not dry_run and category in (None, recipients.CAT_HOST):
+            for hostname in ([host] if host else repo.list_hosts()):
+                if repo.host_deploy_path(hostname).is_dir():
+                    _refresh_manifest(repo, hostname)
+                    refreshed += 1
+
+        if not stale:
+            typer.secho(
+                "\nEvery file already carries the expected recipients.",
+                fg=typer.colors.GREEN,
+            )
+            if refreshed:
+                typer.echo(f"Refreshed {refreshed} host manifest(s) from src/.")
+            return
+
+        grouped = recipients.by_category(stale)
+        typer.echo(f"\n{len(stale)} file(s) to re-encrypt:")
+        for cat in sorted(grouped):
+            typer.echo(f"  {cat}: {len(grouped[cat])}")
+
+        if dry_run:
+            for policy in stale:
+                typer.echo(
+                    f"  [dry-run] {_relative(repo, policy.path)} "
+                    f"-> {policy.expected_count} recipients ({policy.label})")
+            return
+
+        if not yes:
+            typer.echo("")
+            typer.echo(
+                "Each file is decrypted with your admin key and written back. "
+                "Key material is unchanged.")
+            if not typer.confirm(f"Re-encrypt {len(stale)} file(s)?"):
+                raise typer.Abort()
+
+        rewritten = 0
+        failed: list[tuple[str, str]] = []
+
+        for policy in stale:
+            rel = _relative(repo, policy.path)
+            try:
+                plaintext = crypto.decrypt_age_bytes(policy.path)
+            except Exception as e:
+                # Almost always means the file predates the admin key being a
+                # recipient, so this machine cannot recover it.
+                failed.append((rel, f"cannot decrypt: {e}"))
                 continue
 
             try:
-                host_key = get_host_age_pubkey(hostname, repo)
-            except AegisError as e:
-                typer.echo(f"  Skipping {hostname}: {e}", err=True)
+                _atomic_encrypt(plaintext, policy.recipients, policy.path)
+            except Exception as e:
+                failed.append((rel, f"cannot write: {e}"))
                 continue
 
-            host_config = repo.get_host_config(hostname)
-            assert host_config is not None
+            rewritten += 1
+            typer.echo(f"  {rel}: {policy.expected_count} recipients")
 
-            kdc_pubkey = _kdc_pubkey_for(repo, hostname)
+        typer.secho(f"\nRe-encrypted {rewritten} file(s)", fg=typer.colors.GREEN)
+        if refreshed:
+            typer.echo(f"Refreshed {refreshed} host manifest(s) from src/.")
 
-            changed = 0
-            for path in sorted(deploy.rglob("*.age")):
-                relative = path.relative_to(deploy)
-
-                # Role keys and user manifests have their own recipient rules;
-                # rebuild them with their own commands rather than guessing.
-                if relative.parts[0] in ("roles", "users"):
-                    continue
-
-                recipients = [host_key, *admin_keys]
-                if path.name == "keytab.age" and kdc_pubkey:
-                    recipients.append(kdc_pubkey)
-
-                if crypto.recipients_of(path) == len(set(recipients)):
-                    continue
-
-                if dry_run:
-                    typer.echo(f"  [dry-run] would re-encrypt {hostname}/{relative}")
-                    changed += 1
-                    continue
-
-                try:
-                    plaintext = crypto.decrypt_age_bytes(path)
-                except Exception as e:
-                    typer.echo(f"  {hostname}/{relative}: cannot decrypt: {e}", err=True)
-                    continue
-
-                crypto.encrypt_age(plaintext, recipients, path)
-                typer.echo(f"  {hostname}/{relative}: {len(set(recipients))} recipients")
-                changed += 1
-
-            if not dry_run:
-                _refresh_manifest(repo, hostname)
-
-            if changed:
-                total += changed
-                typer.echo(f"  {hostname}: {changed} file(s)")
-
-        verb = "would re-encrypt" if dry_run else "re-encrypted"
-        typer.secho(f"\n{verb} {total} file(s)", fg=typer.colors.GREEN)
+        if failed:
+            typer.secho(f"{len(failed)} file(s) failed:", fg=typer.colors.RED, err=True)
+            for rel, reason in failed:
+                typer.echo(f"  {rel}: {reason}", err=True)
+            raise typer.Exit(1)
 
 
-def _kdc_pubkey_for(repo: config.SecretsRepo, hostname: str) -> str | None:
-    """The KDC role public key for whichever realm this host belongs to."""
-    for membership in realm_mod.memberships(repo):
-        if membership.hostname != hostname:
-            continue
-        realm_config = realm_mod.load(repo, membership.realm)
-        pub_path = repo.role_pubkey_path(realm_config.kdc_role)
-        if pub_path.exists():
-            return pub_path.read_text().strip()
-    return None
+def _is_within(path: Path, prefix: Path) -> bool:
+    try:
+        path.relative_to(prefix)
+        return True
+    except ValueError:
+        return False
+
+
+def _atomic_encrypt(content: bytes, recipient_keys: list[str], path: Path) -> None:
+    """Encrypt to a sibling temp file, then replace.
+
+    Writing in place would leave a truncated file if age failed part way, and
+    for admin-only material there is no second copy to fall back on.
+    """
+    import os
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        crypto.encrypt_age(content, recipient_keys, tmp)
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
 
 
 def _refresh_manifest(repo: config.SecretsRepo, hostname: str) -> None:

@@ -10,9 +10,14 @@ This matters: ``typer.Exit`` derives from ``RuntimeError``, *not* from
 "skip this host" into "abort the whole build".
 """
 
-
 class AegisError(Exception):
-    """Base class for all recoverable aegis failures."""
+    """Base class for all recoverable aegis failures.
+
+    Kept free of any CLI framework so library code stays importable on its
+    own.  :func:`aegis.cli.main` turns it into a one-line message and a
+    non-zero exit; the Typer app disables pretty tracebacks so that handler
+    is reached before anything is printed.
+    """
 
 
 class MissingHostKeyError(AegisError):

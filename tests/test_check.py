@@ -178,7 +178,7 @@ def test_recipient_shortfall_detected(repo: config.SecretsRepo, admin_key):
 
     report = cli_check.run_check(repo)
 
-    assert "expected at least 2" in _errors(report)
+    assert "missing a recipient" in _errors(report)
 
 
 def test_check_command_exits_nonzero_on_errors(repo: config.SecretsRepo):
@@ -217,7 +217,7 @@ def test_reencrypt_repairs_recipient_drift(repo: config.SecretsRepo, admin_key):
     backup = crypto.generate_age_keypair()
     admin.add_key(repo, backup.public_key, "backup")
 
-    result = runner.invoke(app, ["reencrypt", "--secrets-path", str(repo.path)])
+    result = runner.invoke(app, ["reencrypt", "--secrets-path", str(repo.path), "--yes"])
 
     assert result.exit_code == 0, result.stdout
     assert crypto.recipients_of(target) == 3
@@ -234,7 +234,7 @@ def test_reencrypt_preserves_plaintext(repo: config.SecretsRepo, admin_key):
     crypto.encrypt_age(b"\x00\xffbinary", [keypair.public_key, admin_key.public_key], target)
 
     admin.add_key(repo, crypto.generate_age_keypair().public_key, "backup")
-    runner.invoke(app, ["reencrypt", "--secrets-path", str(repo.path)])
+    runner.invoke(app, ["reencrypt", "--secrets-path", str(repo.path), "--yes"])
 
     assert crypto.decrypt_age_bytes(
         target, identity_content=keypair.private_key) == b"\x00\xffbinary"
@@ -258,7 +258,7 @@ def test_reencrypt_rebuilds_manifest_from_placement(
         target="/etc/krb5.keytab", mode="0600"))
     repo.set_host_config(host_config)
 
-    runner.invoke(app, ["reencrypt", "--secrets-path", str(repo.path)])
+    runner.invoke(app, ["reencrypt", "--secrets-path", str(repo.path), "--yes"])
 
     manifest = host_secrets.load_host_manifest(repo.deploy_path, "rama")
     assert manifest.keytab is not None

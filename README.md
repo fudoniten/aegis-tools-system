@@ -120,6 +120,7 @@ aegis verify myhost
 |----------|-------------|
 | `AEGIS_SYSTEM` | Path to aegis-secrets repository |
 | `AEGIS_SCRIPTS` | Path to Kerberos scripts (set automatically by Nix) |
+| `AEGIS_ADMIN_KEY` | Path to this machine's admin private key (default `~/.config/aegis/key.txt`) |
 
 ## Commands Reference
 
@@ -144,13 +145,36 @@ existing secrets for a changed recipient set, use `aegis reencrypt`.
 | Command | Description |
 |---------|-------------|
 | `aegis check` | Report drift between `src/` and the deploy output; exits 1 on errors |
-| `aegis reencrypt` | Re-encrypt existing secrets for the current recipient set, and refresh manifests from `src/` placement |
+| `aegis reencrypt` | Re-encrypt **every** secret in the repo for the current recipient set, and refresh manifests from `src/` placement |
+
+`reencrypt` covers the whole repository, not just per-host output: role
+private keys, user private keys, realm master keys and every Kerberos
+principal are encrypted for the admin set and nobody else, and they are
+exactly what a lost admin key makes unrecoverable. Filter with `--host` or
+`--category` (`admin-only`, `host`, `role`, `user`, `kdc`, `dnssec`); preview
+with `--dry-run`.
+
+Files whose intended audience cannot be determined — anything under
+`deploy/` that no current policy describes — are reported and left untouched.
+age does not expose the recipients of an existing file, so rewriting one means
+picking a new set blind, and a wrong guess silently destroys access.
 
 ### Admin Key Commands
 
 Every secret is encrypted for the admin set as well as its real audience, so
 those keys are the recovery path for the whole system. Keeping a second key
 offline turns loss of the everyday key into a non-event.
+
+Adding a key is two steps, and the second one matters:
+
+```bash
+aegis admin add-key --name backup --public-key age1...   # register it
+aegis reencrypt                                          # make it usable
+```
+
+Registering alone changes nothing about existing files — the new key can
+decrypt none of them until `reencrypt` has run. `add-key` reports how many
+files are still out of its reach.
 
 | Command | Description |
 |---------|-------------|

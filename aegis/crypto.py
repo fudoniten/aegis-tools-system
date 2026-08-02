@@ -14,6 +14,7 @@ keeps working without a migration.
 """
 
 import base64
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -204,7 +205,15 @@ def decrypt_age_binary(
 # Admin key ----------------------------------------------------------------
 
 def default_admin_key_path() -> Path:
-    """Path to the admin's own age private key."""
+    """Path to the admin's own age private key.
+
+    ``AEGIS_ADMIN_KEY`` overrides the default location, so an admin holding
+    the key somewhere else — a removable volume, a second identity for a
+    different repo — does not have to move it into place.
+    """
+    override = os.environ.get("AEGIS_ADMIN_KEY")
+    if override:
+        return Path(override)
     return Path.home() / ".config" / "aegis" / "key.txt"
 
 

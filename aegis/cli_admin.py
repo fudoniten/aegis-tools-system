@@ -85,9 +85,45 @@ def add_key(
 
     typer.secho(f"Registered admin key '{name}'", fg=typer.colors.GREEN)
     typer.echo(f"  {out}")
+
+    # Registering a key does not make it useful. Until existing material is
+    # re-encrypted, the new key can decrypt nothing, so say exactly how much
+    # is out of reach rather than leaving it as an exercise.
+    from . import crypto as _crypto, recipients
+
+    try:
+        policies = recipients.plan(repo, admin.recipients(repo))
+    except AegisError:
+        policies = []
+
+    stale = [
+        p for p in policies
+        if p.resolvable and _crypto.recipients_of(p.path) != p.expected_count
+    ]
+    blocked = [p for p in policies if p.problem]
+
     typer.echo("")
-    typer.echo("Existing secrets are still encrypted for the old set. To extend")
-    typer.echo("this key's reach to them:  aegis reencrypt")
+    if stale:
+        grouped = recipients.by_category(stale)
+        typer.secho(
+            f"{len(stale)} file(s) are not yet readable by this key:",
+            fg=typer.colors.YELLOW,
+        )
+        for category in sorted(grouped):
+            marker = " <- unrecoverable if the other key is lost" if (
+                category == recipients.CAT_ADMIN_ONLY) else ""
+            typer.echo(f"  {category}: {len(grouped[category])}{marker}")
+        typer.echo("")
+        typer.echo("Extend this key's reach:  aegis reencrypt")
+    else:
+        typer.echo("Every file already carries this key.")
+
+    if blocked:
+        typer.secho(
+            f"\n{len(blocked)} file(s) cannot be re-encrypted automatically; "
+            f"run 'aegis check' for details.",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @admin_app.command("remove-key")
