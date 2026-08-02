@@ -81,7 +81,7 @@
               # --local --config-file=`, `dump --decrypt`, `merge`, and the
               # sqlite: database backend.  None of those exist in MIT krb5.
               pkgs.heimdal
-              pkgs.ldns.examples  # ldns-keygen, for DNSSEC KSKs
+              pkgs.ldns.examples # ldns-keygen, for DNSSEC KSKs
               nexus.packages.${system}.nexus-keygen
             ];
             text = ''
