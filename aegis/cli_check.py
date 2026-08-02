@@ -255,6 +255,24 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
                 scope,
                 f"members not configured in src/hosts/: {', '.join(sorted(unknown))}")
 
+    # Files in the roles output directory that no role in src/ accounts for.
+    # These accumulate when a role is renamed: the new name gets a config, the
+    # old one's key material is left behind and still decrypts whatever it was
+    # encrypted for.
+    roles_dir = repo.roles_deploy_path()
+    if roles_dir.is_dir():
+        configured_roles = set(repo.list_roles())
+        for path in sorted(roles_dir.iterdir()):
+            if path.suffix not in (".age", ".pub"):
+                continue
+            if path.stem not in configured_roles:
+                report.warn(
+                    "roles",
+                    f"{path.name} has no matching config in src/roles/ "
+                    f"(orphaned by a rename?)",
+                    f"remove it, or recreate the role: aegis init-role {path.stem}",
+                )
+
     # Role key files for hosts that are no longer members: removal deletes the
     # file, so a leftover means something went wrong (or was hand-edited).
     for hostname in repo.list_deployed_hosts():

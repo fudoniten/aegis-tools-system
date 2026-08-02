@@ -628,6 +628,18 @@ def realm_export(
     out.parent.mkdir(parents=True, exist_ok=True)
     crypto.encrypt_age(bundle, [kdc_pubkey, *admin_keys], out)
 
+    # The KDC also needs the realm master key: without it the database it
+    # builds cannot be encrypted, so a principal bundle on its own is useless.
+    # In the repo the realm key is admin-only, so re-encrypt a copy here
+    # rather than widening the source of truth.
+    realm_key_out = repo.kdc_deploy_path() / f"{realm}-realm-key.age"
+    crypto.encrypt_age(
+        crypto.decrypt_age_bytes(repo.realm_key_path(realm)),
+        [kdc_pubkey, *admin_keys],
+        realm_key_out,
+    )
+
     typer.secho(f"Exported {len(principal_files)} principals", fg=typer.colors.GREEN)
-    typer.echo(f"  Wrote: {out}")
+    typer.echo(f"  Principals: {out}")
+    typer.echo(f"  Realm key:  {realm_key_out}")
     typer.echo(f"  Readable by: role {realm_config.kdc_role} + admin")

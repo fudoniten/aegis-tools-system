@@ -281,3 +281,18 @@ def test_reencrypt_dry_run_changes_nothing(repo: config.SecretsRepo, admin_key):
 
     assert result.exit_code == 0
     assert target.read_bytes() == before
+
+
+def test_orphaned_role_file_detected(repo: config.SecretsRepo):
+    """Renaming a role leaves its old key material behind, still usable."""
+    roles_dir = repo.roles_deploy_path()
+    roles_dir.mkdir(parents=True)
+    (roles_dir / "dns-fudo.org.age").write_text("x")
+
+    repo.set_role_config(config.RoleConfig(name="dns-master-fudo.org", hosts=[]))
+    repo.role_key_path("dns-master-fudo.org").write_text("x")
+    repo.role_pubkey_path("dns-master-fudo.org").write_text("age1x")
+
+    report = cli_check.run_check(repo)
+
+    assert "no matching config in src/roles/" in _messages(report)

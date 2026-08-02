@@ -709,6 +709,17 @@ def build_keytabs(
                 crypto.encrypt_age(
                     all_principals, [kdc_role_pubkey, *admin_keys], kdc_principals_out)
                 typer.echo(f"  Wrote KDC principals: {kdc_principals_out}")
+
+                # The KDC needs the realm master key to encrypt the database
+                # it builds; a principal bundle alone is not enough.
+                realm_key_out = (
+                    repo.kdc_deploy_path() / f"{realm_name}-realm-key.age")
+                crypto.encrypt_age(
+                    realm_key_plain.read_bytes(),
+                    [kdc_role_pubkey, *admin_keys],
+                    realm_key_out,
+                )
+                typer.echo(f"  Wrote KDC realm key:   {realm_key_out}")
             elif not kdc_role_pubkey:
                 typer.echo(f"  Skipped KDC principals file (no KDC role public key)")
 
