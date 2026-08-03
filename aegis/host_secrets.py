@@ -3,7 +3,7 @@
 This module manages the secrets.toml manifest file for each host, which
 contains metadata about all secrets and their deployment configuration.
 
-The manifest is stored at build/hosts/<hostname>/secrets.toml and can be
+The manifest is stored at deploy/hosts/<hostname>/secrets.toml and can be
 imported by NixOS to configure services with the correct paths.
 
 Example manifest:
@@ -32,7 +32,6 @@ Example manifest:
     user = "root"
     group = "root"
     mode = "0600"
-    encoding = "base64"
     
     [nexus-key]
     source = "nexus-key.age"
@@ -59,6 +58,8 @@ except ImportError:
     import tomli as tomllib  # type: ignore
 
 import tomli_w  # type: ignore
+
+from .config import Placement
 
 
 # Default deployment settings for different secret types
@@ -135,7 +136,7 @@ class SecretEntry:
 class HostSecretsManifest:
     """Manifest of all secrets for a host.
 
-    This is stored at build/hosts/<hostname>/secrets.toml and contains
+    This is stored at deploy/hosts/<hostname>/secrets.toml and contains
     metadata for all secrets that should be deployed to the host.
     """
     hostname: str
@@ -186,9 +187,9 @@ class HostSecretsManifest:
         return manifest
 
 
-def load_host_manifest(build_path: Path, hostname: str) -> HostSecretsManifest:
+def load_host_manifest(deploy_path: Path, hostname: str) -> HostSecretsManifest:
     """Load a host's secrets manifest, creating empty one if not exists."""
-    manifest_path = build_path / "hosts" / hostname / "secrets.toml"
+    manifest_path = deploy_path / "hosts" / hostname / "secrets.toml"
     
     if manifest_path.exists():
         with open(manifest_path, "rb") as f:
@@ -198,9 +199,9 @@ def load_host_manifest(build_path: Path, hostname: str) -> HostSecretsManifest:
     return HostSecretsManifest(hostname=hostname)
 
 
-def save_host_manifest(build_path: Path, manifest: HostSecretsManifest) -> Path:
+def save_host_manifest(deploy_path: Path, manifest: HostSecretsManifest) -> Path:
     """Save a host's secrets manifest."""
-    manifest_path = build_path / "hosts" / manifest.hostname / "secrets.toml"
+    manifest_path = deploy_path / "hosts" / manifest.hostname / "secrets.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(manifest_path, "wb") as f:
@@ -292,10 +293,10 @@ class DnssecManifest:
         return manifest
 
 
-def load_dnssec_manifest(build_path: Path, domain: str) -> DnssecManifest | None:
+def load_dnssec_manifest(deploy_path: Path, domain: str) -> DnssecManifest | None:
     """Load a domain's DNSSEC manifest."""
     safe_domain = domain.replace(".", "_")
-    manifest_path = build_path / "dnssec" / safe_domain / "secrets.toml"
+    manifest_path = deploy_path / "dnssec" / safe_domain / "secrets.toml"
     
     if not manifest_path.exists():
         return None
@@ -305,10 +306,10 @@ def load_dnssec_manifest(build_path: Path, domain: str) -> DnssecManifest | None
     return DnssecManifest.from_dict(data)
 
 
-def save_dnssec_manifest(build_path: Path, manifest: DnssecManifest) -> Path:
+def save_dnssec_manifest(deploy_path: Path, manifest: DnssecManifest) -> Path:
     """Save a domain's DNSSEC manifest."""
     safe_domain = manifest.domain.replace(".", "_")
-    manifest_path = build_path / "dnssec" / safe_domain / "secrets.toml"
+    manifest_path = deploy_path / "dnssec" / safe_domain / "secrets.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(manifest_path, "wb") as f:
@@ -323,10 +324,7 @@ def save_dnssec_manifest(build_path: Path, manifest: DnssecManifest) -> Path:
 
 def make_ssh_host_keys_entries(
     stems: list[str],
-    target_dir: str | None = None,
-    user: str | None = None,
-    group: str | None = None,
-    mode: str | None = None,
+    placement: Placement | None = None,
     key_types: list[str] | None = None,
 ) -> list[SecretEntry]:
     """Create SSH host key manifest entries, one per private key file.
@@ -337,11 +335,13 @@ def make_ssh_host_keys_entries(
 
     Args:
         stems: List of file stems (e.g. ``["ssh_host_ed25519_key"]``)
+        placement: Per-host overrides from ``src/hosts/<host>.toml``
         key_types: Optional list of SSH key types parallel to ``stems``
                    (e.g. ``["ed25519"]``).  When provided each entry will
                    include a ``type`` field that the ``fudoniten/aegis``
                    NixOS module uses to configure OpenSSH.
     """
+    placement = placement or Placement()
     defaults = DEFAULTS["ssh-host-keys"]
     entries = []
     for i, stem in enumerate(stems):
@@ -349,66 +349,65 @@ def make_ssh_host_keys_entries(
         entries.append(SecretEntry(
             source=f"ssh/{stem}.age",
             target=stem,
-            target_dir=target_dir or defaults["target_dir"],
-            user=user or defaults["user"],
-            group=group or defaults["group"],
-            mode=mode or defaults["mode"],
+            target_dir=placement.target_dir or defaults["target_dir"],
+            user=placement.user or defaults["user"],
+            group=placement.group or defaults["group"],
+            mode=placement.mode or defaults["mode"],
             type=key_type,
         ))
     return entries
 
 
-def make_keytab_entry(
-    target: str | None = None,
-    user: str | None = None,
-    group: str | None = None,
-    mode: str | None = None,
-) -> SecretEntry:
-    """Create a keytab manifest entry with defaults."""
+def make_keytab_entry(placement: Placement | None = None) -> SecretEntry:
+    """Create a keytab manifest entry.
+
+    No ``encoding`` is set: keytabs are stored as raw bytes now that the
+    crypto layer is binary clean.  The old ``base64`` encoding was never
+    honoured by the NixOS module, so keytabs deployed as the literal string
+    ``base64:...`` rather than a keytab.
+    """
+    placement = placement or Placement()
     defaults = DEFAULTS["keytab"]
     return SecretEntry(
         source="keytab.age",
-        target=target or defaults["target"],
-        user=user or defaults["user"],
-        group=group or defaults["group"],
-        mode=mode or defaults["mode"],
-        encoding="base64",
+        target=placement.target or defaults["target"],
+        user=placement.user or defaults["user"],
+        group=placement.group or defaults["group"],
+        mode=placement.mode or defaults["mode"],
     )
 
 
-def make_nexus_key_entry(
-    target: str | None = None,
-    user: str | None = None,
-    group: str | None = None,
-    mode: str | None = None,
-) -> SecretEntry:
+def make_nexus_key_entry(placement: Placement | None = None) -> SecretEntry:
     """Create a Nexus key manifest entry with defaults."""
+    placement = placement or Placement()
     defaults = DEFAULTS["nexus-key"]
     return SecretEntry(
         source="nexus-key.age",
-        target=target or defaults["target"],
-        user=user or defaults["user"],
-        group=group or defaults["group"],
-        mode=mode or defaults["mode"],
+        target=placement.target or defaults["target"],
+        user=placement.user or defaults["user"],
+        group=placement.group or defaults["group"],
+        mode=placement.mode or defaults["mode"],
     )
 
 
 def make_secret_entry(
     name: str,
-    target: str,
-    user: str | None = None,
-    group: str | None = None,
-    mode: str | None = None,
+    placement: Placement | None = None,
     encoding: str | None = None,
 ) -> SecretEntry:
-    """Create a generic secret manifest entry."""
+    """Create a generic secret manifest entry.
+
+    Falls back to ``/run/aegis/secrets/<name>`` when the host declares no
+    target, so a secret is never silently left without a destination.
+    """
+    placement = placement or Placement()
     defaults = DEFAULTS["secret"]
     return SecretEntry(
         source=f"secrets/{name}.age",
-        target=target,
-        user=user or defaults["user"],
-        group=group or defaults["group"],
-        mode=mode or defaults["mode"],
+        target=placement.target or f"/run/aegis/secrets/{name}",
+        user=placement.user or defaults["user"],
+        group=placement.group or defaults["group"],
+        mode=placement.mode or defaults["mode"],
         encoding=encoding,
     )
 

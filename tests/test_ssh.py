@@ -3,6 +3,9 @@
 import pytest
 
 from aegis import ssh
+from .conftest import requires
+
+pytestmark = requires("ssh-keygen")
 
 
 def test_generate_ssh_keypair_ed25519():

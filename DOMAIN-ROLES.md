@@ -1,5 +1,33 @@
 # Domain Roles for Aegis
 
+> **Status note.** The *concept* below — domain roles, two-phase decryption,
+> encrypting shared secrets once for a role rather than N times for N hosts —
+> is exactly how Aegis works, and the `domain-<domain>` roles in aegis-secrets
+> implement it.
+>
+> The *storage layout* in the "Directory Structure", "Creating a Domain Role"
+> and "Managing Domain Membership" sections describes a single shared
+> `role-key.age` encrypted for every member host. That is not the layout in
+> use. Aegis stores a **per-host copy** of each role key at
+> `deploy/hosts/<host>/roles/<role>.age`, which is what the NixOS module reads
+> in phase 1, and records membership in `src/roles/<role>.toml`.
+>
+> Manage membership with the commands in the Role Commands section of the
+> README, which operate on that layout:
+>
+> ```bash
+> aegis init-role <role>                     # create the keypair
+> aegis add-host-to-role <role> <host>       # grant a host the key
+> aegis remove-host-from-role <role> <host>  # revoke the copy
+> aegis build-role-keys                      # reconcile every member
+> aegis check                                # report members missing a key
+> ```
+>
+> Two shared-key artifacts predate this and are still in the repo:
+> `deploy/domains/<domain>/role-key.age` and three orphaned
+> `deploy/roles/dns-<domain>.age`. `aegis check` reports them; they need a
+> decision rather than a default (see `docs/REVIEW.md` in aegis-secrets).
+
 Domain roles enable efficient secret sharing across multiple hosts using two-phase decryption, making it easy to add or remove hosts from a domain without re-encrypting all domain secrets.
 
 ## Concept

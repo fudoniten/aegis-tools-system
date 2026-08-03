@@ -69,9 +69,9 @@ aegis status
 aegis init-host myhost --services=host,ssh
 
 # Import existing secrets
-aegis import-ssh-key lambda --key /secure/lambda.ed25519.key --key /secure/lambda.ecdsa.key
+aegis import-ssh-host-keys lambda --key /secure/lambda.ed25519.key --key /secure/lambda.ecdsa.key
 aegis import-nexus-key lambda --file /secure/lambda.nexus.hmac
-aegis import-kerberos-realm SEA.FUDO.ORG --realm-key /secure/realm.key --principals-dir /secure/principals/
+aegis realm import SEA.FUDO.ORG --realm-key /secure/realm.key --principals-dir /secure/principals/ --domain sea.fudo.org
 
 # Add a user with access to specific hosts
 aegis add-user alice --hosts=host1,host2
@@ -80,16 +80,32 @@ aegis add-user alice --hosts=host1,host2
 aegis build
 
 # Build specific types
-aegis build-ssh-keys
+aegis build-role-keys
+aegis build-ssh-host-keys
 aegis build-nexus-keys
 aegis build-keytabs
 aegis build-user-secrets
 
-# Initialize a Kerberos realm
-aegis init-realm EXAMPLE.ORG
+# Report drift between src/ and deploy/ (changes nothing, exits 1 on errors)
+aegis check
+
+# Repair recipient drift without touching key material
+aegis reencrypt --host myhost
+
+# Kerberos realms
+aegis realm init EXAMPLE.ORG --domain example.org
+aegis realm list
+aegis realm show EXAMPLE.ORG
+aegis realm add-principal EXAMPLE.ORG postgres/db.example.org --host db
+aegis realm trust EXAMPLE.ORG OTHER.ORG
+aegis realm export EXAMPLE.ORG
 
 # Create a role (e.g., KDC)
-aegis init-role kdc kdchost
+aegis init-role kdc
+aegis add-host-to-role kdc kdchost
+
+# Declare where a decrypted secret belongs
+aegis set-placement myhost keytab --target /etc/krb5.keytab --mode 0600
 
 # List secrets for a host
 aegis list myhost
@@ -104,6 +120,7 @@ aegis verify myhost
 |----------|-------------|
 | `AEGIS_SYSTEM` | Path to aegis-secrets repository |
 | `AEGIS_SCRIPTS` | Path to Kerberos scripts (set automatically by Nix) |
+| `AEGIS_ADMIN_KEY` | Path to this machine's admin private key (default `~/.config/aegis/key.txt`) |
 
 ## Commands Reference
 
@@ -111,19 +128,93 @@ aegis verify myhost
 
 | Command | Description |
 |---------|-------------|
-| `aegis build` | Run full build (SSH keys, Nexus keys, keytabs, user secrets) |
-| `aegis build-ssh-keys` | Generate SSH host keys |
+| `aegis build` | Run full build (role keys, SSH keys, Nexus keys, keytabs, user secrets) |
+| `aegis build-role-keys` | Give each role member its copy of the role key |
+| `aegis build-ssh-host-keys` | Generate SSH host keys |
 | `aegis build-nexus-keys` | Generate Nexus DDNS authentication keys |
-| `aegis build-keytabs` | Generate Kerberos keytabs |
+| `aegis build-keytabs` | Generate Kerberos keytabs and the KDC principal bundle |
 | `aegis build-user-secrets` | Process user secrets from user repos |
+
+Generators create only what is missing. `--rotate` (formerly `--force`) on the
+SSH and Nexus builders mints **new key material**, breaking `known_hosts`,
+SSHFP records and DDNS registrations; it prompts before doing so. To re-encrypt
+existing secrets for a changed recipient set, use `aegis reencrypt`.
+
+### Consistency Commands
+
+| Command | Description |
+|---------|-------------|
+| `aegis check` | Report drift between `src/` and the deploy output; exits 1 on errors |
+| `aegis reencrypt` | Re-encrypt **every** secret in the repo for the current recipient set, and refresh manifests from `src/` placement |
+
+`reencrypt` covers the whole repository, not just per-host output: role
+private keys, user private keys, realm master keys and every Kerberos
+principal are encrypted for the admin set and nobody else, and they are
+exactly what a lost admin key makes unrecoverable. Filter with `--host` or
+`--category` (`admin-only`, `host`, `role`, `user`, `kdc`, `dnssec`); preview
+with `--dry-run`.
+
+Files whose intended audience cannot be determined — anything under
+`deploy/` that no current policy describes — are reported and left untouched.
+age does not expose the recipients of an existing file, so rewriting one means
+picking a new set blind, and a wrong guess silently destroys access.
+
+### Admin Key Commands
+
+Every secret is encrypted for the admin set as well as its real audience, so
+those keys are the recovery path for the whole system. Keeping a second key
+offline turns loss of the everyday key into a non-event.
+
+Adding a key is two steps, and the second one matters:
+
+```bash
+aegis admin add-key --name backup --public-key age1...   # register it
+aegis reencrypt                                          # make it usable
+```
+
+Registering alone changes nothing about existing files — the new key can
+decrypt none of them until `reencrypt` has run. `add-key` reports how many
+files are still out of its reach.
+
+| Command | Description |
+|---------|-------------|
+| `aegis admin init` | Generate this machine's admin key if absent, and register it |
+| `aegis admin list-keys` | Show the keys this repo encrypts for |
+| `aegis admin add-key --name <n>` | Register another admin key |
+| `aegis admin remove-key --name <n>` | Unregister a key (refuses to remove the last one) |
+| `aegis admin migrate` | Convert a legacy `keys/admin.pub` to `keys/admin/` |
+
+### Realm Commands
+
+| Command | Description |
+|---------|-------------|
+| `aegis realm init <REALM>` | Create a realm (master key, initial principals, `realm.toml`) |
+| `aegis realm import <REALM>` | Import an existing realm and its principals |
+| `aegis realm list` | Realms with their domains, trusts and member hosts |
+| `aegis realm show <REALM>` | Principals grouped by kind |
+| `aegis realm set <REALM>` | Update domains, KDC role, etypes, lifetimes |
+| `aegis realm add-principal` | Add a principal (random key or password) |
+| `aegis realm remove-principal` | Remove a principal |
+| `aegis realm trust <A> <B>` | Establish cross-realm trust (bidirectional by default) |
+| `aegis realm untrust <A> <B>` | Remove cross-realm trust |
+| `aegis realm export <REALM>` | Write the KDC principal bundle |
+
+A host reaches a realm through the roles already in the repo:
+
+```
+host --(domain-<domain> role)--> domain --(realm.toml domains)--> realm
+```
+
+so a host gets a keytab once its `domain-*` role lists it *and* some realm
+declares that domain. `aegis check` reports either half being missing.
 
 ### Import Commands
 
 | Command | Description |
 |---------|-------------|
-| `aegis import-ssh-key <host>` | Import SSH private keys (derives public keys) |
+| `aegis import-ssh-host-keys <host>` | Import SSH private keys (derives public keys) |
 | `aegis import-nexus-key <host>` | Import Nexus DDNS authentication key |
-| `aegis import-kerberos-realm <REALM>` | Import Kerberos realm with principals |
+| `aegis realm import <REALM>` | Import Kerberos realm with principals |
 | `aegis import-secret <host> <name>` | Import generic secret with metadata |
 
 ### Configuration Commands
@@ -133,8 +224,9 @@ aegis verify myhost
 | `aegis init-host <hostname>` | Add a new host to configuration |
 | `aegis add-user <username>` | Add a user and generate their keypair |
 | `aegis add-secret <host> <name> <file>` | Add a custom secret for a host |
-| `aegis init-realm <REALM>` | Initialize a Kerberos realm |
-| `aegis init-role <role> <host>` | Create a role and assign to host |
+| `aegis init-role <role>` | Create a role keypair with no members |
+| `aegis add-host-to-role <role> <host>` | Give a host the role's key |
+| `aegis set-placement <host> <kind>` | Declare where a decrypted secret belongs |
 
 ### Domain Role Commands
 
@@ -143,7 +235,8 @@ aegis verify myhost
 | `aegis add-host-to-role <role> <host>` | Add a host to a domain role |
 | `aegis remove-host-from-role <role> <host>` | Remove a host from a domain role |
 
-See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for detailed documentation on domain roles and two-phase decryption.
+See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for the concept, and the Role Commands
+section above for the commands and on-disk layout in use.
 
 ### Utility Commands
 
@@ -159,18 +252,29 @@ This tool manages the `aegis-secrets` repository:
 
 ```
 aegis-secrets/
-├── src/                    # Source configuration
-│   ├── hosts/*.toml        # Host configs
+├── src/                    # Source of truth: what exists, and where it lands
+│   ├── hosts/*.toml        # Host configs, including [placement] metadata
 │   ├── users/*.toml        # User configs
 │   ├── roles/*.toml        # Role configs
-│   └── kerberos/realms/    # Kerberos realm data
+│   └── kerberos/realms/    # Realm data: realm.toml, realm key, principals
 ├── keys/                   # Encrypted keys
-│   ├── admin.pub           # Admin public key
+│   ├── admin/*.pub         # Admin recipient set
+│   ├── roles/*.age         # Role private keys
 │   └── users/*.age         # User private keys
-└── build/                  # Generated output
-    ├── hosts/<host>/       # Per-host secrets
-    └── roles/<role>/       # Per-role secrets
+└── deploy/                 # Generated, host-targeted output
+    ├── hosts/<host>/       # Per-host secrets + derived secrets.toml
+    ├── roles/<role>.pub    # Role public keys
+    └── kdc/                # Per-realm KDC principal bundles
 ```
+
+`deploy/` was previously called `build/`; a repo that still has `build/` and no
+`deploy/` keeps using it. Note that despite the name, it holds the **only**
+copy of SSH host keys, Nexus keys and DNSSEC private keys — deleting it and
+rebuilding mints new identities rather than restoring the old ones.
+
+Deployment metadata (target path, owner, mode) lives in `src/hosts/<host>.toml`
+under `[placement]`, so `deploy/hosts/<host>/secrets.toml` is a derived
+artifact. Change it with `aegis set-placement`, then `aegis reencrypt`.
 
 ## See Also
 

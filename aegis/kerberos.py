@@ -131,6 +131,87 @@ def add_host_to_realm(
     ]
 
 
+def add_principal(
+    principal: str,
+    kdc_conf_path: Path,
+    principals_path: Path,
+    password: str | None = None,
+    verbose: bool = False,
+) -> Path:
+    """Add a single principal to an instantiated realm.
+
+    Args:
+        principal: Full principal name, e.g. "kadmin/admin@FUDO.ORG" or
+                   "postgres/rama.sea.fudo.org"
+        kdc_conf_path: Path to KDC config file (from instantiate_realm)
+        principals_path: Directory to write the principal's key file into
+        password: Set this password instead of a random key.  Needed for
+                  principals a human has to authenticate as.
+        verbose: Print verbose output
+
+    Returns:
+        Path to the created principal key file
+    """
+    scripts = get_scripts_path()
+    script = scripts / "kdc-add-principal.rb"
+
+    if not script.exists():
+        raise FileNotFoundError(f"Script not found: {script}")
+
+    cmd = [
+        "ruby", str(script),
+        "--conf", str(kdc_conf_path),
+        "--principal-dir", str(principals_path),
+    ]
+
+    if password is not None:
+        cmd.extend(["--password", password])
+
+    if verbose:
+        cmd.append("--verbose")
+
+    cmd.append(principal)
+
+    subprocess.run(cmd, check=True)
+
+    # kdc-add-principal.rb replaces the first "/" with "_" for the filename
+    return principals_path / f"{principal.replace('/', '_', 1)}.key"
+
+
+def merge_principals(
+    realm: str,
+    database_path: Path,
+    principals_file: Path,
+    key_path: Path,
+    verbose: bool = False,
+) -> None:
+    """Merge an authoritative principal bundle into a live KDC database.
+
+    Principals present in ``principals_file`` win; principals that exist only
+    in the live database (users created on the KDC with kadmin) are preserved.
+    This is what lets the repo be authoritative for host and service
+    principals without clobbering locally-created ones.
+    """
+    scripts = get_scripts_path()
+    script = scripts / "kdc-merge-principals.rb"
+
+    if not script.exists():
+        raise FileNotFoundError(f"Script not found: {script}")
+
+    cmd = [
+        "ruby", str(script),
+        "--realm", realm,
+        "--database", str(database_path),
+        "--principals", str(principals_file),
+        "--key", str(key_path),
+    ]
+
+    if verbose:
+        cmd.append("--verbose")
+
+    subprocess.run(cmd, check=True)
+
+
 def instantiate_realm(
     realm: str,
     realm_data_path: Path,

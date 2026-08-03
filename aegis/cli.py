@@ -7,22 +7,50 @@ from typing import Annotated, Optional
 
 import typer
 
-from . import crypto, ssh, config
+from . import admin, crypto, ssh, config
+from .errors import AegisError, MissingHostKeyError
 
 app = typer.Typer(
     name="aegis",
     help="Aegis System Administration Tools for secrets management.",
     no_args_is_help=True,
+    # Typer's rich traceback handler runs inside click's invocation, so an
+    # AegisError reaching the top would be rendered as a full traceback before
+    # main() ever saw it. Operator-facing failures deserve one line.
+    pretty_exceptions_enable=False,
 )
 
 
+def _register_subcommands() -> None:
+    """Attach subcommand groups.
+
+    Imported lazily inside the function because cli_realm/cli_check import
+    helpers from this module.
+    """
+    from .cli_admin import admin_app
+    from .cli_realm import realm_app
+    from . import cli_check
+
+    app.add_typer(admin_app, name="admin")
+    app.add_typer(realm_app, name="realm")
+    cli_check.register(app)
+
+
 def _is_aegis_repo(path: Path) -> bool:
-    """Check if a path looks like an aegis secrets repo."""
-    return (
-        (path / "src").exists() or 
-        (path / "flake.nix").exists() and 
-        ((path / "keys").exists() or (path / "build").exists())
+    """Check if a path looks like an aegis secrets repo.
+
+    Requires *both* a src/ directory and one of keys/ or the output directory.
+    A bare src/ is not enough: plenty of unrelated projects have one, and
+    misidentifying them means ensure_structure() scaffolds an aegis tree into
+    somebody else's repo.
+    """
+    has_src = (path / "src").is_dir()
+    has_support = (
+        (path / "keys").is_dir()
+        or (path / config.SecretsRepo.DEPLOY_DIRNAME).is_dir()
+        or (path / config.SecretsRepo.LEGACY_DEPLOY_DIRNAME).is_dir()
     )
+    return has_src and has_support
 
 
 def get_secrets_repo(secrets_path: Optional[Path]) -> config.SecretsRepo:
@@ -79,15 +107,75 @@ def get_host_age_pubkey(
         age public key string (e.g., "age1...")
 
     Raises:
-        typer.Exit if no key found
+        MissingHostKeyError: if the host has no age public key configured.
+        Callers looping over hosts should catch it and skip; top-level
+        commands let it propagate to :func:`main`, which reports and exits.
     """
     host_config = repo.get_host_config(hostname)
     if host_config and host_config.age_pubkey:
         return host_config.age_pubkey
 
-    typer.echo(f"Error: No age key configured for {hostname}", err=True)
-    typer.echo(f"Set it with: aegis set-master-key {hostname} --public-key 'age1...'", err=True)
-    raise typer.Exit(1)
+    raise MissingHostKeyError(hostname)
+
+
+def admin_recipients(repo: config.SecretsRepo, *, validate: bool = True) -> list[str]:
+    """The admin public keys to encrypt for, validated against the local key.
+
+    Every secret is encrypted for the admin set as well as its real audience,
+    so this is the system's recovery path.  Validation catches the case where
+    the operator holds a key that the repo does not know about — otherwise
+    they would produce files no other admin can read, and only find out much
+    later.
+    """
+    keys = admin.recipients(repo)
+    if validate:
+        admin.validate_local_key(repo)
+    return keys
+
+
+def host_placement(
+    repo: config.SecretsRepo,
+    hostname: str,
+    kind: str,
+) -> config.Placement:
+    """Deployment metadata for a host's secret, from src/hosts/<host>.toml."""
+    host_config = repo.get_host_config(hostname)
+    if host_config is None:
+        return config.Placement()
+    return host_config.placement_for(kind)
+
+
+def record_placement(
+    repo: config.SecretsRepo,
+    hostname: str,
+    kind: str,
+    placement: config.Placement,
+) -> None:
+    """Persist placement overrides into src/ so the manifest stays derived."""
+    if placement.is_empty():
+        return
+    host_config = repo.get_host_config(hostname) or config.HostConfig(hostname=hostname)
+    existing = host_config.placement_for(kind)
+    merged = config.Placement(
+        target=placement.target or existing.target,
+        target_dir=placement.target_dir or existing.target_dir,
+        user=placement.user or existing.user,
+        group=placement.group or existing.group,
+        mode=placement.mode or existing.mode,
+    )
+    host_config.set_placement(kind, merged)
+    repo.set_host_config(host_config)
+
+
+def ensure_host_config(repo: config.SecretsRepo, hostname: str) -> config.HostConfig:
+    """Fetch a host config, creating an empty one if it does not exist."""
+    host_config = repo.get_host_config(hostname)
+    if host_config is None:
+        typer.echo(f"  Host config not found, creating...")
+        host_config = config.HostConfig(hostname=hostname)
+        repo.set_host_config(host_config)
+        typer.echo(f"  Created {repo.src_path / 'hosts' / f'{hostname}.toml'}")
+    return host_config
 
 
 # =============================================================================
@@ -155,7 +243,7 @@ def build_role_keys(
     from . import host_secrets
 
     repo = get_secrets_repo(secrets_path)
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
 
     for role_name in repo.list_roles():
         role_config = repo.get_role_config(role_name)
@@ -189,12 +277,12 @@ def build_role_keys(
 
             try:
                 host_age_key = get_host_age_pubkey(hostname, repo)
-            except SystemExit:
-                typer.echo(f"    Skipping {hostname} (no age key)", err=True)
+            except AegisError as e:
+                typer.echo(f"    Skipping {hostname}: {e}", err=True)
                 continue
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            crypto.encrypt_age(role_privkey, [host_age_key, admin_pubkey], out_path)
+            crypto.encrypt_age(role_privkey, [host_age_key, *admin_keys], out_path)
             typer.echo(f"    Wrote: {out_path}")
 
     if dry_run:
@@ -202,12 +290,12 @@ def build_role_keys(
 
     # Update each host's manifest with the roles it belongs to
     for hostname in repo.list_hosts():
-        roles_dir = repo.host_build_path(hostname) / "roles"
+        roles_dir = repo.host_deploy_path(hostname) / "roles"
         roles = sorted(f.stem for f in roles_dir.glob("*.age")) if roles_dir.exists() else []
-        manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
         if manifest.roles != roles:
             manifest.roles = roles
-            host_secrets.save_host_manifest(repo.build_path, manifest)
+            host_secrets.save_host_manifest(repo.deploy_path, manifest)
             if roles:
                 typer.echo(f"  {hostname}: roles={', '.join(roles)}")
 
@@ -216,27 +304,28 @@ def build_role_keys(
 def build_ssh_host_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
-    force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keys exist")] = False,
-    target_dir: Annotated[str, typer.Option("--target-dir", help="Target directory for SSH keys")] = "/run/aegis/ssh",
-    user: Annotated[str, typer.Option("--user", help="Owner user for key files")] = "root",
-    group: Annotated[str, typer.Option("--group", help="Owner group for key files")] = "root",
-    mode: Annotated[str, typer.Option("--mode", help="Permissions for private key files")] = "0600",
+    rotate: Annotated[bool, typer.Option("--rotate", "--force", "-f", help="DESTRUCTIVE: generate NEW key material, replacing the host's SSH identity")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt for --rotate")] = False,
 ):
     """Generate SSH host keys for OpenSSH servers.
-    
+
     This generates the keys that OpenSSH will use to identify the server
     (ssh_host_ed25519_key, ssh_host_ecdsa_key, etc.).
-    
+
     These are NOT master keys! Master keys are used to encrypt these host keys.
-    
+
     Each private key is encrypted separately as its own age file under
-    build/hosts/<hostname>/ssh/.  The corresponding public keys are written
+    deploy/hosts/<hostname>/ssh/.  The corresponding public keys are written
     as plaintext .pub files alongside for use in DNS or known_hosts files.
 
-    Deployment metadata is stored in build/hosts/<hostname>/secrets.toml
+    Deployment metadata comes from src/hosts/<hostname>.toml (see
+    'aegis set-placement') and is written to deploy/hosts/<hostname>/secrets.toml
     for NixOS to import.
 
     Also generates SSHFP DNS records for trust establishment.
+
+    To re-encrypt existing keys for a changed recipient set, use
+    'aegis reencrypt' -- NOT --rotate, which mints new keys.
     """
     from . import host_secrets
 
@@ -247,13 +336,23 @@ def build_ssh_host_keys(
         typer.echo("No hosts configured. Use 'aegis init-host' first.")
         return
 
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
+
+    if rotate and not dry_run and not yes:
+        typer.secho(
+            "--rotate replaces SSH host identities: known_hosts entries and "
+            "SSHFP records for every host with existing keys will break.\n"
+            "To re-encrypt without changing keys, use 'aegis reencrypt'.",
+            fg=typer.colors.YELLOW,
+        )
+        if not typer.confirm("Generate new SSH host keys?"):
+            raise typer.Abort()
 
     for hostname in hosts:
-        ssh_dir = repo.host_build_path(hostname) / "ssh"
+        ssh_dir = repo.host_deploy_path(hostname) / "ssh"
 
-        if ssh_dir.exists() and any(ssh_dir.glob("*.age")) and not force:
-            typer.echo(f"  {hostname}: SSH host keys exist (use --force to regenerate)")
+        if ssh_dir.exists() and any(ssh_dir.glob("*.age")) and not rotate:
+            typer.echo(f"  {hostname}: SSH host keys exist (use --rotate to replace them)")
             continue
 
         if dry_run:
@@ -265,15 +364,15 @@ def build_ssh_host_keys(
         # Get age public key from host config
         try:
             host_age_key = get_host_age_pubkey(hostname, repo)
-        except SystemExit:
-            typer.echo(f"    Skipping {hostname} (no age key)", err=True)
+        except AegisError as e:
+            typer.echo(f"    Skipping {hostname}: {e}", err=True)
             continue
 
         # Generate keys
         keys = ssh.generate_host_keys(hostname)
 
         # Encrypt each private key separately; write each public key plaintext
-        recipients = [host_age_key, admin_pubkey]
+        recipients = [host_age_key, *admin_keys]
         ssh_dir.mkdir(parents=True, exist_ok=True)
 
         for stem, keypair in keys.items():
@@ -284,18 +383,15 @@ def build_ssh_host_keys(
             typer.echo(f"    Wrote {age_path.name} + {pub_path.name}")
 
         # Update manifest with one entry per private key
-        manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
         stems = [stem for stem, _ in keys.items()]
         key_types = [keypair.key_type for _, keypair in keys.items()]
         manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
             stems=stems,
-            target_dir=target_dir,
-            user=user,
-            group=group,
-            mode=mode,
+            placement=host_placement(repo, hostname, "ssh-host-keys"),
             key_types=key_types,
         )
-        manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
+        manifest_path = host_secrets.save_host_manifest(repo.deploy_path, manifest)
         typer.echo(f"    Updated manifest: {manifest_path}")
 
         # Generate SSHFP records
@@ -313,20 +409,21 @@ def build_ssh_host_keys(
 def build_nexus_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
-    force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keys exist")] = False,
+    rotate: Annotated[bool, typer.Option("--rotate", "--force", "-f", help="DESTRUCTIVE: generate a NEW key, invalidating the host's DDNS registration")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt for --rotate")] = False,
     algorithm: Annotated[str, typer.Option("--algorithm", "-a", help="HMAC algorithm")] = "HmacSHA512",
-    target: Annotated[str, typer.Option("--target", help="Target path for nexus key")] = "/run/aegis/nexus-key",
-    user: Annotated[str, typer.Option("--user", help="Owner user")] = "root",
-    group: Annotated[str, typer.Option("--group", help="Owner group")] = "root",
-    mode: Annotated[str, typer.Option("--mode", help="Permissions")] = "0400",
 ):
     """Generate Nexus DDNS authentication keys for hosts.
-    
+
     Creates HMAC keys for each host to authenticate with Nexus DDNS servers.
-    Keys are encrypted with both the admin and host keys.
-    
-    Each host gets a unique key stored in build/hosts/<hostname>/nexus-key.age.
-    Deployment metadata is written to secrets.toml for NixOS to import.
+    Keys are encrypted for the host and the admin recipient set.
+
+    Each host gets a unique key stored in deploy/hosts/<hostname>/nexus-key.age.
+    Deployment metadata comes from src/hosts/<hostname>.toml (see
+    'aegis set-placement') and is written to secrets.toml for NixOS to import.
+
+    To re-encrypt an existing key for a changed recipient set, use
+    'aegis reencrypt' -- NOT --rotate, which mints a new key.
     """
     from . import nexus
 
@@ -337,13 +434,23 @@ def build_nexus_keys(
         typer.echo("No hosts configured. Use 'aegis init-host' first.")
         return
 
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
+
+    if rotate and not dry_run and not yes:
+        typer.secho(
+            "--rotate replaces Nexus DDNS keys: every host with an existing key "
+            "will fail to authenticate until it is redeployed.\n"
+            "To re-encrypt without changing keys, use 'aegis reencrypt'.",
+            fg=typer.colors.YELLOW,
+        )
+        if not typer.confirm("Generate new Nexus keys?"):
+            raise typer.Abort()
 
     for hostname in hosts:
-        output_path = repo.host_build_path(hostname) / "nexus-key.age"
+        output_path = repo.host_deploy_path(hostname) / "nexus-key.age"
 
-        if output_path.exists() and not force:
-            typer.echo(f"  {hostname}: Nexus key exists (use --force to regenerate)")
+        if output_path.exists() and not rotate:
+            typer.echo(f"  {hostname}: Nexus key exists (use --rotate to replace it)")
             continue
 
         if dry_run:
@@ -355,8 +462,8 @@ def build_nexus_keys(
         # Get age public key from host config
         try:
             host_age_key = get_host_age_pubkey(hostname, repo)
-        except SystemExit:
-            typer.echo(f"    Skipping {hostname} (no age key)", err=True)
+        except AegisError as e:
+            typer.echo(f"    Skipping {hostname}: {e}", err=True)
             continue
 
         # Generate key in a temp file
@@ -373,7 +480,7 @@ def build_nexus_keys(
             key_content = tmp_key_path.read_text()
 
         # Get recipients
-        recipients = [host_age_key, admin_pubkey]
+        recipients = [host_age_key, *admin_keys]
         
         # Encrypt and write
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,14 +490,11 @@ def build_nexus_keys(
         
         # Update manifest with deployment metadata
         from . import host_secrets
-        manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
         manifest.nexus_key = host_secrets.make_nexus_key_entry(
-            target=target,
-            user=user,
-            group=group,
-            mode=mode,
+            host_placement(repo, hostname, "nexus-key")
         )
-        host_secrets.save_host_manifest(repo.build_path, manifest)
+        host_secrets.save_host_manifest(repo.deploy_path, manifest)
         typer.echo(f"    Updated manifest")
         
         # Show the algorithm
@@ -402,229 +506,239 @@ def build_nexus_keys(
 def build_keytabs(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
-    force: Annotated[bool, typer.Option("--force", "-f", help="Regenerate even if keytabs exist")] = False,
-    target: Annotated[str, typer.Option("--target", help="Target path for keytab")] = "/run/aegis/keytab",
-    user: Annotated[str, typer.Option("--user", help="Owner user for keytab")] = "root",
-    group: Annotated[str, typer.Option("--group", help="Owner group for keytab")] = "root",
-    mode: Annotated[str, typer.Option("--mode", help="Permissions for keytab")] = "0600",
+    force: Annotated[bool, typer.Option("--force", "-f", help="Re-extract keytabs that already exist (does not change principal keys)")] = False,
+    realm_filter: Annotated[Optional[str], typer.Option("--realm", help="Only process this realm")] = None,
 ):
-    """Generate Kerberos keytabs for hosts and KDC database.
-    
-    Deployment metadata is written to secrets.toml for NixOS to import.
+    """Generate Kerberos keytabs for hosts, and the KDC principal bundle.
+
+    Host membership resolves through the roles already in the repo:
+
+        host --(domain-<domain> role)--> domain --(realm.toml domains)--> realm
+
+    so a host gets a keytab once its domain role lists it and some realm
+    claims that domain.  Use 'aegis realm set <REALM> --add-domain <domain>'
+    to declare the latter.
+
+    Unlike --rotate on the SSH and Nexus builders, --force here is safe: it
+    re-extracts a keytab from the principals already stored in the repo,
+    leaving key material untouched.
     """
+    from . import host_secrets, realm as realm_mod
     from . import kerberos as krb
     import tempfile
-    import shutil
 
     repo = get_secrets_repo(secrets_path)
+    admin_keys = admin_recipients(repo)
 
-    # Get admin key for encryption
-    admin_pubkey = crypto.get_admin_public_key()
-
-    # Find all realms we need to process
-    kerberos_src = repo.src_path / "kerberos" / "realms"
-    if not kerberos_src.exists():
+    if not repo.realms_path().is_dir():
         typer.echo("No Kerberos realms configured in src/kerberos/realms/")
-        typer.echo("Use 'aegis init-realm' to create a realm first.")
+        typer.echo("Use 'aegis realm init <REALM>' to create a realm first.")
         return
 
-    # Get hosts grouped by realm (via HostConfig.domain -> DomainConfig.realm)
-    hosts_by_realm: dict[str, list[str]] = {}
-    for hostname in repo.list_hosts():
-        host_config = repo.get_host_config(hostname)
-        if host_config and host_config.domain:
-            domain_config = repo.get_domain_config(host_config.domain)
-            if domain_config and domain_config.realm:
-                realm = domain_config.realm
-                if realm not in hosts_by_realm:
-                    hosts_by_realm[realm] = []
-                hosts_by_realm[realm].append(hostname)
-    
-    if not hosts_by_realm:
-        typer.echo("No hosts with Kerberos realms found.")
+    grouped = realm_mod.hosts_by_realm(repo)
+    if realm_filter:
+        grouped = {k: v for k, v in grouped.items() if k == realm_filter}
+
+    if not grouped:
+        typer.echo("No hosts resolved to a Kerberos realm.")
+        typer.echo("")
+        typer.echo("A host reaches a realm via its domain-<domain> role and the")
+        typer.echo("realm's declared domains. Check both with:")
+        typer.echo("  aegis realm list")
+        typer.echo("  aegis check")
         return
-    
-    # Get KDC role info for encryption
-    kdc_role = repo.get_role_config("kdc")
-    kdc_role_pubkey = None
-    if kdc_role:
-        kdc_pub_path = repo.role_build_path("kdc") / "kdc.pub"
-        if kdc_pub_path.exists():
-            kdc_role_pubkey = kdc_pub_path.read_text().strip()
-    
-    # Process each realm
-    for realm, hostnames in hosts_by_realm.items():
-        typer.echo(f"\nProcessing realm: {realm}")
-        
-        realm_src = kerberos_src / realm
-        if not realm_src.exists():
-            typer.echo(f"  Realm directory not found: {realm_src}")
-            typer.echo(f"  Use 'aegis init-realm {realm}' to initialize.")
+
+    for realm_name in sorted(grouped):
+        members = sorted(grouped[realm_name], key=lambda m: m.hostname)
+        typer.echo(f"\nProcessing realm: {realm_name}")
+
+        realm_config = realm_mod.load(repo, realm_name)
+
+        if not repo.realm_path(realm_name).is_dir():
+            typer.echo(f"  Realm directory not found: {repo.realm_path(realm_name)}")
+            typer.echo(f"  Use 'aegis realm init {realm_name}' to initialize.")
             continue
-        
-        # Check for encrypted realm key
-        realm_key_enc = realm_src / "realm.key.age"
+
+        realm_key_enc = repo.realm_key_path(realm_name)
         if not realm_key_enc.exists():
             typer.echo(f"  Realm key not found: {realm_key_enc}")
             continue
-        
+
+        # The KDC role must exist *before* keytabs are built: a keytab
+        # encrypted without the KDC as a recipient cannot be read by the KDC,
+        # and re-running will not repair it (the file already exists).
+        kdc_role_pubkey = None
+        kdc_pub_path = repo.role_pubkey_path(realm_config.kdc_role)
+        if kdc_pub_path.exists():
+            kdc_role_pubkey = kdc_pub_path.read_text().strip()
+        else:
+            typer.secho(
+                f"  Warning: role '{realm_config.kdc_role}' has no public key at "
+                f"{kdc_pub_path}.\n"
+                f"  Keytabs built now will NOT be readable by the KDC, and "
+                f"re-running will not fix them.\n"
+                f"  Create it first: aegis init-role {realm_config.kdc_role}",
+                fg=typer.colors.YELLOW,
+            )
+
         if dry_run:
-            typer.echo(f"  [dry-run] Would process {len(hostnames)} hosts")
-            for hostname in hostnames:
-                typer.echo(f"    - {hostname}")
+            typer.echo(f"  [dry-run] Would process {len(members)} hosts")
+            for member in members:
+                typer.echo(f"    - {member.hostname} ({member.fqdn})")
             continue
-        
-        # Create temp directory for decrypted realm data
-        with tempfile.TemporaryDirectory(prefix="aegis-krb-") as tmpdir:
-            tmpdir = Path(tmpdir)
-            realm_tmp = tmpdir / realm
+
+        with tempfile.TemporaryDirectory(prefix="aegis-krb-") as tmp:
+            tmpdir = Path(tmp)
+            realm_tmp = tmpdir / realm_name
             realm_tmp.mkdir()
             principals_tmp = realm_tmp / "principals"
             principals_tmp.mkdir()
-            
-            # Decrypt realm key (binary - Kerberos keys are not UTF-8)
+
             typer.echo(f"  Decrypting realm key...")
             realm_key_plain = realm_tmp / "realm.key"
-            realm_key_content = crypto.decrypt_age_binary(realm_key_enc)
-            realm_key_plain.write_bytes(realm_key_content)
-            
-            # Decrypt existing principals (binary)
-            principals_enc = realm_src / "principals"
+            realm_key_plain.write_bytes(crypto.decrypt_age_bytes(realm_key_enc))
+
+            principals_enc = repo.realm_principals_path(realm_name)
             if principals_enc.exists():
-                for princ_file in principals_enc.glob("*.age"):
-                    princ_name = princ_file.stem  # Remove .age
-                    typer.echo(f"  Decrypting principal: {princ_name}")
-                    princ_content = crypto.decrypt_age_binary(princ_file)
-                    (principals_tmp / f"{princ_name}.key").write_bytes(princ_content)
-            
-            # Instantiate the realm database
+                principal_files = sorted(principals_enc.glob("*.age"))
+                typer.echo(f"  Decrypting {len(principal_files)} principals...")
+                for princ_file in principal_files:
+                    princ_content = crypto.decrypt_age_bytes(princ_file)
+                    (principals_tmp / f"{princ_file.stem}.key").write_bytes(princ_content)
+
             typer.echo(f"  Instantiating realm database...")
             try:
-                kdc_conf = krb.instantiate_realm(realm, realm_tmp)
+                kdc_conf = krb.instantiate_realm(
+                    realm_name, realm_tmp, etypes=realm_config.etypes
+                )
             except Exception as e:
                 typer.echo(f"  Error instantiating realm: {e}", err=True)
                 continue
-            
-            # Track which principals we've added
+
             new_principals: list[Path] = []
-            
-            # Process each host
-            for hostname in hostnames:
-                typer.echo(f"  Processing host: {hostname}")
-                
-                # Get age public key from host config
+
+            for member in members:
+                hostname = member.hostname
+                typer.echo(f"  Processing host: {hostname} ({member.fqdn})")
+
                 try:
                     host_age_key = get_host_age_pubkey(hostname, repo)
-                except SystemExit:
-                    typer.echo(f"    Skipping {hostname} (no age key)", err=True)
+                except AegisError as e:
+                    typer.echo(f"    Skipping {hostname}: {e}", err=True)
                     continue
 
-                # Get host info from config
                 host_config = repo.get_host_config(hostname)
                 if not host_config:
                     typer.echo(f"    Error: No config found for {hostname}", err=True)
                     continue
 
-                host_fqdn = f"{hostname}.{host_config.domain}" if host_config.domain else hostname
                 services = host_config.services
-                
-                # Check if we need to add principals for this host
-                needs_principals = False
-                for svc in services:
-                    princ_file = principals_tmp / f"{svc}_{host_fqdn}.key"
-                    if not princ_file.exists():
-                        needs_principals = True
-                        break
-                
-                if needs_principals:
-                    typer.echo(f"    Adding principals: {', '.join(services)}")
+
+                missing = [
+                    svc for svc in services
+                    if not (principals_tmp / f"{svc}_{member.fqdn}.key").exists()
+                ]
+                if missing:
+                    typer.echo(f"    Adding principals: {', '.join(missing)}")
                     try:
                         added = krb.add_host_to_realm(
-                            host_fqdn,
-                            krb.RealmConfig(realm, realm_key_plain, principals_tmp),
+                            member.fqdn,
+                            krb.RealmConfig(realm_name, realm_key_plain, principals_tmp),
                             kdc_conf,
-                            services=services,
+                            services=missing,
                         )
                         new_principals.extend(added)
                     except Exception as e:
                         typer.echo(f"    Error adding principals: {e}", err=True)
                         continue
-                
-                # Check if keytab already exists
-                keytab_output = repo.host_build_path(hostname) / "keytab.age"
+
+                keytab_output = repo.host_deploy_path(hostname) / "keytab.age"
                 if keytab_output.exists() and not force:
-                    typer.echo(f"    Keytab exists (use --force to regenerate)")
+                    typer.echo(f"    Keytab exists (use --force to re-extract)")
+                    # Still reconcile the manifest: skipping it here is how a
+                    # host ends up with a keytab and no manifest entry.
+                    _sync_keytab_manifest(repo, hostname)
                     continue
-                
-                # Extract keytab
+
                 typer.echo(f"    Extracting keytab...")
                 keytab_tmp = tmpdir / f"{hostname}.keytab"
                 try:
                     krb.extract_host_keytab(
-                        host_fqdn,
-                        kdc_conf,
-                        keytab_tmp,
-                        services=services,
+                        member.fqdn, kdc_conf, keytab_tmp, services=services,
                     )
                 except Exception as e:
                     typer.echo(f"    Error extracting keytab: {e}", err=True)
                     continue
-                
-                # Encrypt keytab for host + KDC role + admin
-                recipients = [host_age_key, admin_pubkey]
+
+                recipients = [host_age_key, *admin_keys]
                 if kdc_role_pubkey:
                     recipients.append(kdc_role_pubkey)
-                
-                keytab_content = keytab_tmp.read_bytes()
+
                 keytab_output.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Use encrypt_age_binary for binary keytab data
-                crypto.encrypt_age_binary(keytab_content, recipients, keytab_output)
-                
+                crypto.encrypt_age(keytab_tmp.read_bytes(), recipients, keytab_output)
                 typer.echo(f"    Wrote: {keytab_output}")
-                
-                # Update manifest with deployment metadata
-                from . import host_secrets
-                manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
-                manifest.keytab = host_secrets.make_keytab_entry(
-                    target=target,
-                    user=user,
-                    group=group,
-                    mode=mode,
-                )
-                host_secrets.save_host_manifest(repo.build_path, manifest)
+
+                _sync_keytab_manifest(repo, hostname)
                 typer.echo(f"    Updated manifest")
-            
-            # Encrypt any new principals back to the repo (binary)
+
             if new_principals:
                 typer.echo(f"\n  Saving {len(new_principals)} new principals...")
                 principals_enc.mkdir(parents=True, exist_ok=True)
-                
                 for princ_file in new_principals:
-                    if princ_file.exists():
-                        princ_name = princ_file.stem  # e.g., "host_server.example.com"
-                        princ_content = princ_file.read_bytes()
-                        princ_out = principals_enc / f"{princ_name}.age"
-                        
-                        # Encrypt for admin only (principals are sensitive)
-                        crypto.encrypt_age_binary(princ_content, [admin_pubkey], princ_out)
-                        typer.echo(f"    Saved: {princ_out.name}")
-            
-            # Generate consolidated KDC principals file (binary)
+                    if not princ_file.exists():
+                        continue
+                    princ_out = principals_enc / f"{princ_file.stem}.age"
+                    crypto.encrypt_age(princ_file.read_bytes(), admin_keys, princ_out)
+                    typer.echo(f"    Saved: {princ_out.name}")
+
+                    principal = realm_mod.principal_from_filename(
+                        princ_file.stem, realm_config.principals)
+                    if principal not in realm_config.principals:
+                        entry = realm_mod.classify(principal, realm_name)
+                        host_for = next(
+                            (m.hostname for m in members
+                             if principal.endswith(f"/{m.fqdn}")), None)
+                        entry.host = host_for
+                        realm_config.principals[principal] = entry
+                realm_mod.save(repo, realm_config)
+
             typer.echo(f"\n  Generating KDC principals file...")
-            all_principals = b""
-            for princ_file in sorted(principals_tmp.glob("*.key")):
-                all_principals += princ_file.read_bytes()
-            
+            all_principals = b"".join(
+                f.read_bytes() for f in sorted(principals_tmp.glob("*.key"))
+            )
+
             if all_principals and kdc_role_pubkey:
-                kdc_principals_out = repo.build_path / "kdc" / f"{realm}-principals.age"
+                kdc_principals_out = repo.kdc_deploy_path() / f"{realm_name}-principals.age"
                 kdc_principals_out.parent.mkdir(parents=True, exist_ok=True)
-                crypto.encrypt_age_binary(all_principals, [kdc_role_pubkey, admin_pubkey], kdc_principals_out)
+                crypto.encrypt_age(
+                    all_principals, [kdc_role_pubkey, *admin_keys], kdc_principals_out)
                 typer.echo(f"  Wrote KDC principals: {kdc_principals_out}")
+
+                # The KDC needs the realm master key to encrypt the database
+                # it builds; a principal bundle alone is not enough.
+                realm_key_out = (
+                    repo.kdc_deploy_path() / f"{realm_name}-realm-key.age")
+                crypto.encrypt_age(
+                    realm_key_plain.read_bytes(),
+                    [kdc_role_pubkey, *admin_keys],
+                    realm_key_out,
+                )
+                typer.echo(f"  Wrote KDC realm key:   {realm_key_out}")
             elif not kdc_role_pubkey:
-                typer.echo(f"  Warning: No KDC role configured, skipping KDC principals file")
-    
+                typer.echo(f"  Skipped KDC principals file (no KDC role public key)")
+
     typer.secho("\nKeytab build complete!", fg=typer.colors.GREEN)
+
+
+def _sync_keytab_manifest(repo: config.SecretsRepo, hostname: str) -> None:
+    """Ensure the host manifest describes its keytab, per src/ placement."""
+    from . import host_secrets
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+    manifest.keytab = host_secrets.make_keytab_entry(
+        host_placement(repo, hostname, "keytab")
+    )
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
 
 
 @app.command("build-user-secrets")
@@ -645,7 +759,7 @@ def build_user_secrets(
     
     repo = get_secrets_repo(secrets_path)
 
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
 
     # Get list of users to process
     if user:
@@ -714,8 +828,8 @@ def build_user_secrets(
         for hostname in user_config.hosts:
             try:
                 host_keys[hostname] = get_host_age_pubkey(hostname, repo)
-            except SystemExit:
-                typer.echo(f"  Warning: No age key for {hostname}, skipping", err=True)
+            except AegisError as e:
+                typer.echo(f"  Warning: skipping {hostname}: {e}", err=True)
             except Exception as e:
                 typer.echo(f"  Warning: Could not get host {hostname}: {e}", err=True)
         
@@ -726,7 +840,7 @@ def build_user_secrets(
         # Create a manifest for each host (or load existing)
         host_manifests: dict[str, mf.Manifest] = {}
         for hostname in host_keys:
-            manifest_path = repo.host_build_path(hostname) / "users" / username / "manifest.age"
+            manifest_path = repo.host_deploy_path(hostname) / "users" / username / "manifest.age"
             if manifest_path.exists():
                 try:
                     host_manifests[hostname] = mf.load_manifest(
@@ -744,7 +858,7 @@ def build_user_secrets(
         if env_dir.exists():
             env_secrets = _process_user_secrets_dir_with_manifest(
                 env_dir, username, user_private_key, host_keys, 
-                admin_pubkey, repo, "env", host_manifests,
+                admin_keys, repo, "env", host_manifests,
             )
             typer.echo(f"  Processed {env_secrets} env vars")
         
@@ -753,18 +867,18 @@ def build_user_secrets(
         if files_dir.exists():
             file_secrets = _process_user_secrets_dir_with_manifest(
                 files_dir, username, user_private_key, host_keys,
-                admin_pubkey, repo, "file", host_manifests,
+                admin_keys, repo, "file", host_manifests,
             )
             typer.echo(f"  Processed {file_secrets} files")
         
         # Save manifests for each host (encrypted for host + user + admin)
         typer.echo(f"  Saving manifests...")
         for hostname, manifest in host_manifests.items():
-            manifest_path = repo.host_build_path(hostname) / "users" / username / "manifest.age"
+            manifest_path = repo.host_deploy_path(hostname) / "users" / username / "manifest.age"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             
             # Recipients: host, user (if available), admin
-            recipients = [host_keys[hostname], admin_pubkey]
+            recipients = [host_keys[hostname], *admin_keys]
             if user_pubkey:
                 recipients.append(user_pubkey)
             
@@ -808,7 +922,7 @@ def _process_user_secrets_dir_with_manifest(
     username: str,
     user_private_key: str,
     host_keys: dict[str, str],
-    admin_pubkey: str,
+    admin_keys: list[str],
     repo: config.SecretsRepo,
     secret_type: str,  # "env" or "file"
     host_manifests: dict,  # hostname -> Manifest
@@ -853,11 +967,11 @@ def _process_user_secrets_dir_with_manifest(
                 secret_type=secret_type,
             )
             
-            output_dir = repo.host_build_path(hostname) / "users" / username / "secrets"
+            output_dir = repo.host_deploy_path(hostname) / "users" / username / "secrets"
             output_file = output_dir / f"{hashed_name}.age"
             
             output_dir.mkdir(parents=True, exist_ok=True)
-            crypto.encrypt_age(secret_content, [host_key, admin_pubkey], output_file)
+            crypto.encrypt_age(secret_content, [host_key, *admin_keys], output_file)
         
         count += 1
     
@@ -958,10 +1072,10 @@ def import_ssh_host_keys(
         typer.echo(f"      Public key: {kp.public_key[:60]}...")
 
     # Encrypt each private key separately; write each public key plaintext
-    admin_pubkey = crypto.get_admin_public_key()
-    recipients = [host_age_key, admin_pubkey]
+    admin_keys = admin_recipients(repo)
+    recipients = [host_age_key, *admin_keys]
 
-    ssh_dir = repo.host_build_path(hostname) / "ssh"
+    ssh_dir = repo.host_deploy_path(hostname) / "ssh"
     ssh_dir.mkdir(parents=True, exist_ok=True)
 
     stems = []
@@ -977,16 +1091,16 @@ def import_ssh_host_keys(
         typer.echo(f"    Wrote {age_path.name} + {pub_path.name}")
 
     # Update manifest with one entry per private key
-    manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+    record_placement(repo, hostname, "ssh-host-keys", config.Placement(
+        target_dir=target_dir, user=user, group=group, mode=mode))
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
     manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
         stems=stems,
-        target_dir=target_dir,
-        user=user,
-        group=group,
-        mode=mode,
+        placement=host_placement(repo, hostname, "ssh-host-keys"),
         key_types=key_types,
     )
-    manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
+    manifest_path = host_secrets.save_host_manifest(repo.deploy_path, manifest)
 
     typer.secho(f"\nSSH host keys imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Output dir: {ssh_dir}")
@@ -1050,24 +1164,24 @@ def import_nexus_key(
         raise typer.Exit(1)
 
     # Get recipients
-    admin_pubkey = crypto.get_admin_public_key()
-    recipients = [host_age_key, admin_pubkey]
+    admin_keys = admin_recipients(repo)
+    recipients = [host_age_key, *admin_keys]
     
     # Encrypt and write
-    output_path = repo.host_build_path(hostname) / "nexus-key.age"
+    output_path = repo.host_deploy_path(hostname) / "nexus-key.age"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     crypto.encrypt_age(key_content, recipients, output_path)
     
     # Update manifest with deployment metadata
     from . import host_secrets
-    manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+    record_placement(repo, hostname, "nexus-key", config.Placement(
+        target=target, user=user, group=group, mode=mode))
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
     manifest.nexus_key = host_secrets.make_nexus_key_entry(
-        target=target,
-        user=user,
-        group=group,
-        mode=mode,
+        host_placement(repo, hostname, "nexus-key")
     )
-    manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
+    manifest_path = host_secrets.save_host_manifest(repo.deploy_path, manifest)
     
     typer.secho(f"\nNexus key imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Output: {output_path}")
@@ -1076,74 +1190,20 @@ def import_nexus_key(
     typer.echo(f"  Encrypted for: {hostname} (host) + admin")
 
 
-@app.command("import-kerberos-realm")
+@app.command("import-kerberos-realm", deprecated=True)
 def import_kerberos_realm(
     realm: str = typer.Argument(..., help="Realm name (e.g., SEA.FUDO.ORG)"),
     realm_key: Path = typer.Option(..., "--realm-key", help="Path to realm master key file"),
     principals_dir: Path = typer.Option(..., "--principals-dir", help="Path to directory containing principal key files"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain this realm serves"),
 ):
-    """Import a Kerberos realm with its master key and principal keys.
-    
-    This imports an existing Kerberos realm structure:
-    - realm.key: The realm master key
-    - principals/: Directory containing principal key files (e.g., krbtgt_REALM.key, host_fqdn.key)
-    
-    All keys will be encrypted with the admin key and stored in
-    src/kerberos/realms/<REALM>/ for use by aegis build-keytabs.
-    
-    Example:
-        aegis import-kerberos-realm SEA.FUDO.ORG \\
-            --realm-key /secure/realms/SEA.FUDO.ORG/realm.key \\
-            --principals-dir /secure/realms/SEA.FUDO.ORG/principals/
-    """
-    repo = get_secrets_repo(secrets_path)
-    repo.ensure_structure()
-    
-    if not realm_key.exists():
-        typer.echo(f"Error: Realm key not found: {realm_key}", err=True)
-        raise typer.Exit(1)
-    
-    if not principals_dir.exists() or not principals_dir.is_dir():
-        typer.echo(f"Error: Principals directory not found: {principals_dir}", err=True)
-        raise typer.Exit(1)
-    
-    typer.echo(f"Importing Kerberos realm: {realm}")
-    
-    # Create realm directory
-    realm_dir = repo.src_path / "kerberos" / "realms" / realm
-    realm_dir.mkdir(parents=True, exist_ok=True)
-    principals_out_dir = realm_dir / "principals"
-    principals_out_dir.mkdir(exist_ok=True)
-    
-    admin_pubkey = crypto.get_admin_public_key()
-    
-    # Import realm master key (binary - Kerberos keys are not UTF-8)
-    typer.echo(f"  Importing realm master key...")
-    realm_key_content = realm_key.read_bytes()
-    realm_key_out = realm_dir / "realm.key.age"
-    crypto.encrypt_age_binary(realm_key_content, [admin_pubkey], realm_key_out)
-    typer.echo(f"    Wrote {realm_key_out}")
-    
-    # Import principal keys (binary)
-    principal_files = list(principals_dir.glob("*.key"))
-    if not principal_files:
-        typer.echo("  Warning: No principal key files found (*.key)", err=True)
-    
-    typer.echo(f"  Importing {len(principal_files)} principal(s)...")
-    for principal_file in principal_files:
-        principal_name = principal_file.stem
-        principal_content = principal_file.read_bytes()
-        
-        output_file = principals_out_dir / f"{principal_name}.age"
-        crypto.encrypt_age_binary(principal_content, [admin_pubkey], output_file)
-        typer.echo(f"    - {principal_name}")
-    
-    typer.secho(f"\nKerberos realm imported successfully!", fg=typer.colors.GREEN)
-    typer.echo(f"  Location: {realm_dir}")
-    typer.echo(f"  Realm master key: {realm_key_out.name}")
-    typer.echo(f"  Principals: {len(principal_files)}")
-    typer.echo(f"\nNext: Run 'aegis build-keytabs' to generate host keytabs")
+    """Deprecated alias for 'aegis realm import'."""
+    from .cli_realm import realm_import
+
+    realm_import(realm=realm, realm_key=realm_key, principals_dir=principals_dir,
+                 secrets_path=secrets_path, domain=domain)
+
 
 
 @app.command("import-secret")
@@ -1190,29 +1250,29 @@ def import_secret(
         host_config = config.HostConfig(hostname=hostname)
         repo.set_host_config(host_config)
 
-    # Read secret content
-    secret_content = file.read_text()
+    # Read secret content as bytes: a p12, DER cert or keytab is not text.
+    secret_content = file.read_bytes()
 
     # Get recipients
-    admin_pubkey = crypto.get_admin_public_key()
-    recipients = [host_age_key, admin_pubkey]
+    admin_keys = admin_recipients(repo)
+    recipients = [host_age_key, *admin_keys]
     
     # Encrypt and write to secrets subdirectory
-    secrets_dir = repo.host_build_path(hostname) / "secrets"
+    secrets_dir = repo.host_deploy_path(hostname) / "secrets"
     secrets_dir.mkdir(parents=True, exist_ok=True)
     output_path = secrets_dir / f"{secret_name}.age"
     crypto.encrypt_age(secret_content, recipients, output_path)
     
     # Update manifest with deployment metadata
-    manifest = host_secrets.load_host_manifest(repo.build_path, hostname)
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+    record_placement(repo, hostname, f"secret:{secret_name}", config.Placement(
+        target=target, user=user, group=group, mode=mode))
+
     manifest.secrets[secret_name] = host_secrets.make_secret_entry(
         name=secret_name,
-        target=target,
-        user=user,
-        group=group,
-        mode=mode,
+        placement=host_placement(repo, hostname, f"secret:{secret_name}"),
     )
-    manifest_path = host_secrets.save_host_manifest(repo.build_path, manifest)
+    manifest_path = host_secrets.save_host_manifest(repo.deploy_path, manifest)
     
     typer.secho(f"\nSecret imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Output: {output_path}")
@@ -1239,7 +1299,7 @@ def _ensure_dns_role(
     existing = repo.get_role_config(role_name)
 
     if existing:
-        role_pub_path = repo.role_build_path(role_name) / f"{role_name}.pub"
+        role_pub_path = repo.role_pubkey_path(role_name)
         if not role_pub_path.exists():
             typer.echo(f"Error: Role {role_name} exists but public key not found", err=True)
             raise typer.Exit(1)
@@ -1253,22 +1313,22 @@ def _ensure_dns_role(
 
     host_age_key = get_host_age_pubkey(hostname, repo)
     keypair = crypto.generate_age_keypair()
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
 
     # Store role private key encrypted for admin only
     role_key_path = repo.role_key_path(role_name)
     role_key_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(keypair.private_key, [admin_pubkey], role_key_path)
+    crypto.encrypt_age(keypair.private_key, admin_keys, role_key_path)
 
     # Save public key
-    role_pub_path = repo.role_build_path(role_name) / f"{role_name}.pub"
+    role_pub_path = repo.role_pubkey_path(role_name)
     role_pub_path.parent.mkdir(parents=True, exist_ok=True)
     role_pub_path.write_text(keypair.public_key)
 
     # Create per-host role key
     host_role_path = repo.host_role_key_path(hostname, role_name)
     host_role_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(keypair.private_key, [host_age_key, admin_pubkey], host_role_path)
+    crypto.encrypt_age(keypair.private_key, [host_age_key, *admin_keys], host_role_path)
 
     # Save role config
     role_config = config.RoleConfig(name=role_name, hosts=[hostname])
@@ -1293,11 +1353,11 @@ def _add_host_to_role_impl(
             raise typer.Exit(1)
 
     host_age_key = get_host_age_pubkey(hostname, repo)
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
 
     out_path = repo.host_role_key_path(hostname, role_name)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(role_privkey, [host_age_key, admin_pubkey], out_path)
+    crypto.encrypt_age(role_privkey, [host_age_key, *admin_keys], out_path)
 
     role_config = repo.get_role_config(role_name)
     if role_config and hostname not in role_config.hosts:
@@ -1353,8 +1413,8 @@ def generate_dnssec_keys(
     
     # Ensure role exists and get its public key
     role_pubkey = _ensure_dns_role(repo, domain, hostname)
-    admin_pubkey = crypto.get_admin_public_key()
-    recipients = [role_pubkey, admin_pubkey]
+    admin_keys = admin_recipients(repo)
+    recipients = [role_pubkey, *admin_keys]
 
     # Generate keys in temp directory
     with tempfile.TemporaryDirectory(prefix="aegis-dnssec-") as tmpdir:
@@ -1419,7 +1479,7 @@ def generate_dnssec_keys(
         user=user,
         group=group,
     )
-    manifest_path = host_secrets.save_dnssec_manifest(repo.build_path, dnssec_manifest)
+    manifest_path = host_secrets.save_dnssec_manifest(repo.deploy_path, dnssec_manifest)
     
     typer.secho(f"\nDNSSEC keys generated successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Location: {build_dir}")
@@ -1498,8 +1558,8 @@ def import_dnssec_keys(
     
     # Ensure role exists and get its public key
     role_pubkey = _ensure_dns_role(repo, domain, hostname)
-    admin_pubkey = crypto.get_admin_public_key()
-    recipients = [role_pubkey, admin_pubkey]
+    admin_keys = admin_recipients(repo)
+    recipients = [role_pubkey, *admin_keys]
 
     # Create output directory
     build_dir = repo.dnssec_build_path(domain)
@@ -1548,7 +1608,7 @@ def import_dnssec_keys(
         user=user,
         group=group,
     )
-    manifest_path = host_secrets.save_dnssec_manifest(repo.build_path, dnssec_manifest)
+    manifest_path = host_secrets.save_dnssec_manifest(repo.deploy_path, dnssec_manifest)
     
     typer.secho(f"\nDNSSEC keys imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Location: {build_dir}")
@@ -1572,7 +1632,7 @@ def import_dnssec_keys(
 def init_host(
     hostname: str = typer.Argument(..., help="Hostname to initialize"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain (e.g. sea.fudo.org), used for Kerberos FQDNs"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain (e.g. sea.fudo.org); adds the host to the domain-<domain> role"),
     services: str = typer.Option("host,ssh", "--services", help="Comma-separated Kerberos services"),
 ):
     """Add a host to the secrets configuration.
@@ -1581,7 +1641,11 @@ def init_host(
     'aegis build', the following will be generated for this host:
     - SSH host keys (ed25519, ecdsa, rsa)
     - Nexus DDNS authentication key
-    - Kerberos keytabs (if domain and realm are configured)
+    - Kerberos keytabs (if the host's domain is claimed by a realm)
+
+    Domain membership is recorded as membership in the 'domain-<domain>' role
+    rather than as a field on the host, so there is exactly one place that
+    answers "which hosts are in this domain".
     """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
@@ -1595,19 +1659,32 @@ def init_host(
 
     host_config = config.HostConfig(
         hostname=hostname,
-        domain=domain,
         services=service_list,
     )
     repo.set_host_config(host_config)
 
     typer.secho(f"Initialized host: {hostname}", fg=typer.colors.GREEN)
-    if domain:
-        typer.echo(f"  Domain: {domain}")
     typer.echo(f"  Services: {', '.join(service_list)}")
     typer.echo(f"  Config: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
+
+    if domain:
+        from . import realm as realm_mod
+
+        role_name = f"{realm_mod.DOMAIN_ROLE_PREFIX}{domain}"
+        role_config = repo.get_role_config(role_name)
+        if role_config is None:
+            typer.echo(f"  Domain: {domain} (role {role_name} does not exist yet)")
+            typer.echo(f"    Create it with: aegis init-role {role_name}")
+        else:
+            if hostname not in role_config.hosts:
+                role_config.hosts = sorted(role_config.hosts + [hostname])
+                repo.set_role_config(role_config)
+            typer.echo(f"  Domain: {domain} (added to role {role_name})")
+            typer.echo(f"    Grant the key with: aegis add-host-to-role {role_name} {hostname}")
+
     typer.echo("")
     typer.echo("Next:")
-    typer.echo("  1. Set master key: aegis set-master-key {hostname} --public-key 'age1...'")
+    typer.echo(f"  1. Set master key: aegis set-master-key {hostname} --public-key 'age1...'")
     typer.echo("  2. Build secrets:  aegis build")
 
 
@@ -1688,10 +1765,10 @@ def add_user(
     keypair = crypto.generate_age_keypair()
     
     # Encrypt private key for admin
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
     user_key_path = repo.user_key_path(username)
     user_key_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(keypair.private_key, [admin_pubkey], user_key_path)
+    crypto.encrypt_age(keypair.private_key, admin_keys, user_key_path)
     
     # Save public key (for manifest encryption)
     user_pubkey_path = repo.user_pubkey_path(username)
@@ -1735,12 +1812,12 @@ def add_secret(
     content = file.read_text()
 
     # Encrypt
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
     
-    output_path = repo.host_build_path(hostname) / f"{name}.age"
+    output_path = repo.host_deploy_path(hostname) / f"{name}.age"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    crypto.encrypt_age(content, [host_age_key, admin_pubkey], output_path)
+    crypto.encrypt_age(content, [host_age_key, *admin_keys], output_path)
     
     typer.secho(f"Added secret: {name} for {hostname}", fg=typer.colors.GREEN)
     typer.echo(f"  Wrote: {output_path}")
@@ -1750,57 +1827,18 @@ def add_secret(
 # Role Commands
 # =============================================================================
 
-@app.command("init-realm")
+@app.command("init-realm", deprecated=True)
 def init_realm(
     realm: str = typer.Argument(..., help="Realm name (e.g., FUDO.ORG)"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain this realm serves"),
 ):
-    """Initialize a new Kerberos realm."""
-    from . import kerberos as krb
-    import tempfile
-    
-    repo = get_secrets_repo(secrets_path)
-    repo.ensure_structure()
-    
-    realm_dir = repo.src_path / "kerberos" / "realms" / realm
-    if realm_dir.exists():
-        typer.echo(f"Realm {realm} already exists at {realm_dir}")
-        raise typer.Exit(1)
-    
-    typer.echo(f"Initializing Kerberos realm: {realm}")
-    
-    admin_pubkey = crypto.get_admin_public_key()
-    
-    with tempfile.TemporaryDirectory(prefix="aegis-realm-init-") as tmpdir:
-        tmpdir = Path(tmpdir)
-        
-        # Initialize realm in temp directory
-        typer.echo("  Generating realm master key and initial database...")
-        realm_config = krb.initialize_realm(realm, tmpdir, verbose=True)
-        
-        # Create encrypted realm directory
-        realm_dir.mkdir(parents=True, exist_ok=True)
-        principals_dir = realm_dir / "principals"
-        principals_dir.mkdir()
-        
-        # Encrypt realm key
-        typer.echo("  Encrypting realm key...")
-        realm_key_content = realm_config.key_path.read_text()
-        crypto.encrypt_age(realm_key_content, [admin_pubkey], realm_dir / "realm.key.age")
-        
-        # Encrypt any initial principals (usually just krbtgt)
-        for princ_file in realm_config.principals_path.glob("*.key"):
-            princ_name = princ_file.stem
-            typer.echo(f"  Encrypting principal: {princ_name}")
-            princ_content = princ_file.read_text()
-            crypto.encrypt_age(princ_content, [admin_pubkey], principals_dir / f"{princ_name}.age")
-    
-    typer.secho(f"\nRealm {realm} initialized!", fg=typer.colors.GREEN)
-    typer.echo(f"  Location: {realm_dir}")
-    typer.echo(f"\nNext steps:")
-    typer.echo(f"  1. Run 'aegis init-role kdc' to create the KDC role")
-    typer.echo(f"  2. Run 'aegis add-host-to-role kdc <hostname>' to add the KDC host")
-    typer.echo(f"  3. Run 'aegis build-keytabs' to generate host keytabs")
+    """Deprecated alias for 'aegis realm init'."""
+    from .cli_realm import realm_init
+
+    realm_init(realm=realm, secrets_path=secrets_path, domain=domain,
+               kdc_role="kdc", etypes=None)
+
 
 
 @app.command("init-role")
@@ -1825,15 +1863,15 @@ def init_role(
     typer.echo(f"Generating keypair for role {role}...")
     keypair = crypto.generate_age_keypair()
 
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
 
     # Store role private key encrypted for admin only
     role_key_path = repo.role_key_path(role)
     role_key_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(keypair.private_key, [admin_pubkey], role_key_path)
+    crypto.encrypt_age(keypair.private_key, admin_keys, role_key_path)
 
     # Save public key
-    role_pub_path = repo.role_build_path(role) / f"{role}.pub"
+    role_pub_path = repo.role_pubkey_path(role)
     role_pub_path.parent.mkdir(parents=True, exist_ok=True)
     role_pub_path.write_text(keypair.public_key)
 
@@ -1885,11 +1923,11 @@ def add_host_to_role(
         raise typer.Exit(1)
 
     host_age_key = get_host_age_pubkey(hostname, repo)
-    admin_pubkey = crypto.get_admin_public_key()
+    admin_keys = admin_recipients(repo)
 
     out_path = repo.host_role_key_path(hostname, role)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    crypto.encrypt_age(role_privkey, [host_age_key, admin_pubkey], out_path)
+    crypto.encrypt_age(role_privkey, [host_age_key, *admin_keys], out_path)
 
     role_config.hosts.append(hostname)
     repo.set_role_config(role_config)
@@ -2000,7 +2038,7 @@ def status(
     typer.echo(f"\nConfigured hosts: {len(hosts)}")
     for hostname in hosts:
         host_config = repo.get_host_config(hostname)
-        build_path = repo.host_build_path(hostname)
+        build_path = repo.host_deploy_path(hostname)
 
         has_master_key = bool(host_config and host_config.age_pubkey)
 
@@ -2035,7 +2073,7 @@ def status(
         role_config = repo.get_role_config(role)
         if role_config:
             has_master_key = repo.role_key_path(role).exists()
-            has_pubkey = (repo.role_build_path(role) / f"{role}.pub").exists()
+            has_pubkey = (repo.role_pubkey_path(role)).exists()
             members = ", ".join(role_config.hosts) if role_config.hosts else "(none)"
             typer.echo(
                 f"  {role}: hosts=[{members}],"
@@ -2058,15 +2096,23 @@ def list_secrets(
     
     for host in hosts:
         typer.echo(f"\n{host}:")
-        build_path = repo.host_build_path(host)
-        
-        if not build_path.exists():
-            typer.echo("  (no build output)")
+        deploy = repo.host_deploy_path(host)
+
+        if not deploy.exists():
+            typer.echo("  (no output)")
             continue
-        
-        for secret_file in sorted(build_path.glob("*.age")):
+
+        # Recurse: most of a host's secrets live in ssh/, roles/, secrets/ and
+        # users/, so a top-level glob reports one file where there are eleven.
+        files = sorted(deploy.rglob("*.age"))
+        if not files:
+            typer.echo("  (no secrets)")
+            continue
+
+        for secret_file in files:
             size = secret_file.stat().st_size
-            typer.echo(f"  {secret_file.name} ({size} bytes)")
+            rel = secret_file.relative_to(deploy)
+            typer.echo(f"  {rel} ({size} bytes)")
 
 
 @app.command("verify")
@@ -2083,107 +2129,125 @@ def verify(
     typer.echo("  Note: Full verification requires the host's private key")
     typer.echo("  Checking that secrets exist and are properly formatted...")
     
-    build_path = repo.host_build_path(hostname)
-    if not build_path.exists():
-        typer.echo("  No build output found")
+    deploy = repo.host_deploy_path(hostname)
+    if not deploy.exists():
+        typer.echo("  No output found")
         raise typer.Exit(1)
-    
-    for secret_file in build_path.glob("*.age"):
-        # Just check it's valid age format (starts with age header)
-        content = secret_file.read_text()
-        if content.startswith("-----BEGIN AGE ENCRYPTED FILE-----"):
-            typer.echo(f"  {secret_file.name}: OK (valid age format)")
+
+    try:
+        expected = len(admin_recipients(repo, validate=False)) + 1
+    except AegisError:
+        expected = None
+
+    problems = 0
+    for secret_file in sorted(deploy.rglob("*.age")):
+        rel = secret_file.relative_to(deploy)
+        header = secret_file.read_bytes()[:40]
+        if not header.startswith(b"-----BEGIN AGE ENCRYPTED FILE-----"):
+            typer.secho(f"  {rel}: WARNING (unexpected format)", fg=typer.colors.YELLOW)
+            problems += 1
+            continue
+
+        count = crypto.recipients_of(secret_file)
+        note = f"{count} recipients" if count else "valid age format"
+        if expected and count and count < expected and rel.parts[0] != "users":
+            typer.secho(
+                f"  {rel}: WARNING ({count} recipients, expected >= {expected})",
+                fg=typer.colors.YELLOW,
+            )
+            problems += 1
         else:
-            typer.echo(f"  {secret_file.name}: WARNING (unexpected format)")
+            typer.echo(f"  {rel}: OK ({note})")
+
+    if problems:
+        typer.echo("")
+        typer.secho(f"{problems} file(s) need attention; see 'aegis check'",
+                    fg=typer.colors.YELLOW)
 
 
-@app.command("add-host-to-role")
-def add_host_to_role_cmd(
-    role: str = typer.Argument(..., help="Role name (e.g., domain-fudo.org)"),
-    hostname: str = typer.Argument(..., help="Host to add to the role"),
+@app.command("set-placement")
+def set_placement(
+    hostname: str = typer.Argument(..., help="Hostname"),
+    kind: str = typer.Argument(..., help="'ssh-host-keys', 'keytab', 'nexus-key', or 'secret:<name>'"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    target: Optional[str] = typer.Option(None, "--target", help="Destination path on the host"),
+    target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Destination directory (SSH keys)"),
+    user: Optional[str] = typer.Option(None, "--user", help="Owner user"),
+    group: Optional[str] = typer.Option(None, "--group", help="Owner group"),
+    mode: Optional[str] = typer.Option(None, "--mode", help="File permissions, e.g. 0400"),
+    clear: bool = typer.Option(False, "--clear", help="Remove overrides and fall back to defaults"),
 ):
-    """Add a host to a role by re-encrypting the role key.
-    
-    This allows the host to decrypt secrets encrypted for this role
-    using two-phase decryption.
-    
+    """Declare where a host's decrypted secret belongs.
+
+    Placement lives in src/hosts/<host>.toml, so the manifest in the deploy
+    directory stays a derived artifact: it can be regenerated from scratch
+    without losing target paths.  Previously these were flags on the build
+    commands, which meant the only copy lived in generated output and changing
+    one required regenerating the key.
+
+    Run 'aegis reencrypt --host <host>' afterwards to refresh the manifest.
+
     Example:
-        aegis add-host-to-role domain-fudo.org newhost
+        aegis set-placement rama secret:db-password \\
+            --target /run/postgresql/password --user postgres --mode 0400
     """
-    from . import roles
-    
     repo = get_secrets_repo(secrets_path)
-    admin_identity = Path.home() / ".config" / "aegis" / "key.txt"
-    
-    if not admin_identity.exists():
-        typer.echo(f"Error: Admin key not found at {admin_identity}", err=True)
-        typer.echo("Set up admin key first", err=True)
-        raise typer.Exit(1)
-    
-    admin_pubkey = crypto.get_admin_public_key()
-    
-    try:
-        roles.add_host_to_role(
-            repo_build_path=repo.build_path,
-            repo_src_path=repo.src_path,
-            role_name=role,
-            hostname=hostname,
-            admin_identity=admin_identity,
-            admin_pubkey=admin_pubkey,
+
+    known = set(config.PLACEMENT_KINDS)
+    if kind not in known and not kind.startswith("secret:"):
+        typer.echo(
+            f"Error: unknown placement kind {kind!r}.\n"
+            f"Expected one of {', '.join(sorted(known))}, or 'secret:<name>'.",
+            err=True,
         )
-    except Exception as e:
-        typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 
+    host_config = repo.get_host_config(hostname)
+    if host_config is None:
+        typer.echo(f"Error: host {hostname} is not configured", err=True)
+        typer.echo(f"Add it with: aegis init-host {hostname}", err=True)
+        raise typer.Exit(1)
 
-@app.command("remove-host-from-role")
-def remove_host_from_role_cmd(
-    role: str = typer.Argument(..., help="Role name"),
-    hostname: str = typer.Argument(..., help="Host to remove from the role"),
-    domain_hosts: str = typer.Option(
-        ..., "--hosts",
-        help="Comma-separated list of ALL hosts that should remain in the role"
-    ),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-):
-    """Remove a host from a role by re-encrypting the role key.
-    
-    The host will no longer be able to decrypt role secrets.
-    You must specify all hosts that should remain in the role.
-    
-    Example:
-        aegis remove-host-from-role domain-fudo.org oldhost --hosts=aedile,germany,france
-    """
-    from . import roles
-    
-    repo = get_secrets_repo(secrets_path)
-    admin_identity = Path.home() / ".config" / "aegis" / "key.txt"
-    
-    if not admin_identity.exists():
-        typer.echo(f"Error: Admin key not found at {admin_identity}", err=True)
-        raise typer.Exit(1)
-    
-    admin_pubkey = crypto.get_admin_public_key()
-    all_hosts = [h.strip() for h in domain_hosts.split(",")]
-    
-    try:
-        roles.remove_host_from_role(
-            repo_build_path=repo.build_path,
-            repo_src_path=repo.src_path,
-            role_name=role,
-            hostname=hostname,
-            admin_identity=admin_identity,
-            admin_pubkey=admin_pubkey,
-            all_domain_hosts=all_hosts,
-        )
-    except Exception as e:
-        typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(1)
+    if clear:
+        host_config.placement.pop(kind, None)
+        repo.set_host_config(host_config)
+        typer.secho(f"Cleared placement for {hostname}/{kind}", fg=typer.colors.GREEN)
+        return
+
+    placement = config.Placement(
+        target=target, target_dir=target_dir, user=user, group=group, mode=mode)
+    if placement.is_empty():
+        current = host_config.placement_for(kind)
+        typer.echo(f"{hostname}/{kind}: {current.to_dict() or '(defaults)'}")
+        return
+
+    record_placement(repo, hostname, kind, placement)
+
+    updated = repo.get_host_config(hostname)
+    assert updated is not None
+    typer.secho(f"Set placement for {hostname}/{kind}", fg=typer.colors.GREEN)
+    for key, value in sorted(updated.placement_for(kind).to_dict().items()):
+        typer.echo(f"  {key}: {value}")
+    typer.echo("")
+    typer.echo(f"Apply it: aegis reencrypt --host {hostname}")
 
 
 def main():
-    app()
+    """Entry point.
+
+    Library code raises AegisError; this is the single place that turns it
+    into a process exit, so per-item loops can catch and skip instead.
+    """
+    try:
+        app()
+    except AegisError as e:
+        typer.secho(f"Error: {e}", fg=typer.colors.RED, err=True)
+        sys.exit(1)
+
+
+# Registered at import time so that `from aegis.cli import app` (tests, and
+# any embedding) sees the full command surface, not just the top-level ones.
+_register_subcommands()
 
 
 if __name__ == "__main__":
