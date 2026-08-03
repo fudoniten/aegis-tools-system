@@ -296,3 +296,19 @@ def test_orphaned_role_file_detected(repo: config.SecretsRepo):
     report = cli_check.run_check(repo)
 
     assert "no matching config in src/roles/" in _messages(report)
+
+
+def test_unfinished_rotation_is_reported(repo: config.SecretsRepo):
+    """A retained pre-rekey key means the old key is still valid."""
+    repo.realm_principals_path("A.ORG").mkdir(parents=True)
+    realm_mod.save(repo, realm_mod.RealmConfig(name="A.ORG", domains=["a.org"]))
+    add_host(repo, "hosta")
+    repo.set_role_config(config.RoleConfig(name="domain-a.org", hosts=["hosta"]))
+    previous = repo.realm_previous_principals_path("A.ORG")
+    previous.mkdir(parents=True)
+    (previous / "host_hosta.a.org.age").write_text("x")
+
+    report = cli_check.run_check(repo)
+
+    assert "mid-rotation" in _messages(report)
+    assert "--prune" in "\n".join(f.hint or "" for f in report.findings)

@@ -366,3 +366,20 @@ def test_undecryptable_file_reported_not_silently_skipped(
 
     assert result.exit_code == 1
     assert "cannot decrypt" in result.stdout + str(result.stderr or "")
+
+
+def test_retained_prerekey_keys_are_admin_only(repo: config.SecretsRepo, admin_key):
+    """A retained key is live key material and must stay in the admin set.
+
+    Classifying it as 'legacy' would leave it out of reencrypt, so a new admin
+    key could not read it.
+    """
+    realm_mod.save(repo, realm_mod.RealmConfig(name="A.ORG", domains=["a.org"]))
+    repo.realm_principals_path("A.ORG").mkdir(parents=True, exist_ok=True)
+    previous = repo.realm_previous_principals_path("A.ORG")
+    _write_encrypted(previous / "host_x.a.org.age", b"old-key", [admin_key.public_key])
+
+    policy = _plan(repo)["src/kerberos/realms/A.ORG/principals/previous/host_x.a.org.age"]
+
+    assert policy.category == recipients.CAT_ADMIN_ONLY
+    assert policy.resolvable

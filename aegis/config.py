@@ -419,6 +419,14 @@ class SecretsRepo:
     def realm_principals_path(self, realm: str) -> Path:
         return self.realm_path(realm) / "principals"
 
+    def realm_previous_principals_path(self, realm: str) -> Path:
+        """Keys retained from before a rekey, so keytabs can carry both kvnos.
+
+        A separate directory rather than a filename suffix, so that listing
+        current principals stays a plain non-recursive glob.
+        """
+        return self.realm_principals_path(realm) / "previous"
+
     def list_realms(self) -> list[str]:
         realms_dir = self.realms_path()
         if not realms_dir.is_dir():

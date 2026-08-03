@@ -147,3 +147,38 @@ def test_realm_of_domain(repo: config.SecretsRepo):
 
     assert realm_mod.realm_of_domain(repo, "sea.fudo.org") == "SEA.FUDO.ORG"
     assert realm_mod.realm_of_domain(repo, "elsewhere.org") is None
+
+
+# =============================================================================
+# Rekey: retained pre-rotation keys
+# =============================================================================
+
+def test_previous_principals_empty_by_default(repo: config.SecretsRepo):
+    _make_realm(repo, "A.ORG", ["a.org"])
+
+    assert realm_mod.previous_principals(repo, "A.ORG") == []
+
+
+def test_previous_principals_lists_retained(repo: config.SecretsRepo):
+    """A retained key marks a rotation that has not been finished."""
+    _make_realm(repo, "A.ORG", ["a.org"])
+    previous = repo.realm_previous_principals_path("A.ORG")
+    previous.mkdir(parents=True)
+    (previous / "host_x.a.org.age").write_text("x")
+
+    assert realm_mod.previous_principals(repo, "A.ORG") == ["host/x.a.org"]
+
+
+def test_retained_keys_do_not_appear_as_current_principals(
+    repo: config.SecretsRepo
+):
+    """previous/ is a subdirectory precisely so the current listing is a
+    plain non-recursive glob."""
+    _make_realm(repo, "A.ORG", ["a.org"])
+    principals = repo.realm_principals_path("A.ORG")
+    (principals / "host_x.a.org.age").write_text("x")
+    previous = repo.realm_previous_principals_path("A.ORG")
+    previous.mkdir(parents=True)
+    (previous / "host_x.a.org.age").write_text("old")
+
+    assert realm_mod.stored_principals(repo, "A.ORG") == ["host/x.a.org"]
