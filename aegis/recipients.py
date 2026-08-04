@@ -237,6 +237,12 @@ def _admin_only_files(
                 policies.append(
                     _admin_only(path, resolver, f"{realm_name} principal"))
 
+        previous = repo.realm_previous_principals_path(realm_name)
+        if previous.is_dir():
+            for path in sorted(previous.glob("*.age")):
+                policies.append(_admin_only(
+                    path, resolver, f"{realm_name} principal (pre-rekey)"))
+
     return policies
 
 

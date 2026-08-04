@@ -410,6 +410,116 @@ def realm_add_principal(
         typer.echo(f"  Run: aegis build-keytabs --force --realm {realm}")
 
 
+@realm_app.command("rekey-principal")
+def realm_rekey_principal(
+    realm: str = typer.Argument(..., help="Realm name"),
+    principal: str = typer.Argument(..., help="Principal to rotate"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    password: Optional[str] = typer.Option(None, "--password", help="Set this password instead of a random key"),
+    prune: bool = typer.Option(False, "--prune", help="Drop the retained previous key instead of rotating"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Rotate a principal's key, keeping the previous one for a grace period.
+
+    A Kerberos keytab can hold several kvnos for the same principal, so a
+    rotation does not have to be a hard cutover. This retains the pre-rotation
+    key under principals/previous/, and 'aegis build-keytabs' emits keytabs
+    carrying both. Services keep authenticating with the old key until they
+    receive the new keytab.
+
+    The rotation is finished by dropping the old key once every affected host
+    has been redeployed:
+
+        aegis realm rekey-principal REALM principal --prune
+
+    'aegis check' reports principals with a retained key, so an unfinished
+    rotation does not go unnoticed.
+    """
+    repo = _repo(secrets_path)
+    realm_config = realm_mod.require_realm(repo, realm)
+    admin_keys = _admin_keys(repo)
+
+    stem = realm_mod.principal_filename(principal)
+    current = repo.realm_principals_path(realm) / f"{stem}.age"
+    previous = repo.realm_previous_principals_path(realm) / f"{stem}.age"
+
+    if prune:
+        if not previous.exists():
+            typer.echo(f"No retained previous key for {principal}")
+            raise typer.Exit(1)
+        if not yes:
+            typer.secho(
+                "Any host still holding only the old keytab will stop "
+                "authenticating once this key is dropped.",
+                fg=typer.colors.YELLOW,
+            )
+            if not typer.confirm(f"Drop the previous key for {principal}?"):
+                raise typer.Abort()
+        previous.unlink()
+        typer.secho(f"Dropped previous key for {principal}", fg=typer.colors.GREEN)
+        typer.echo(f"  Rebuild keytabs: aegis build-keytabs --force --realm {realm}")
+        return
+
+    if not current.exists():
+        typer.echo(f"Principal not found: {principal} ({current})", err=True)
+        raise typer.Exit(1)
+
+    if previous.exists():
+        typer.echo(
+            f"A previous key for {principal} is already retained.\n"
+            f"Finish that rotation first: "
+            f"aegis realm rekey-principal {realm} {principal} --prune",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    affected = [
+        m.hostname for m in realm_mod.memberships(repo)
+        if principal.endswith(f"/{m.fqdn}")
+    ]
+    entry = realm_config.principals.get(principal)
+    if entry and entry.host and entry.host not in affected:
+        affected.append(entry.host)
+
+    if not yes:
+        typer.echo(f"Rotating {principal} in {realm}.")
+        if affected:
+            typer.echo(f"  Affects keytabs for: {', '.join(sorted(affected))}")
+        typer.echo(
+            "  The previous key is retained, so keytabs will carry both kvnos\n"
+            "  until you --prune. Services keep working in the meantime.")
+        if not typer.confirm("Rotate?"):
+            raise typer.Abort()
+
+    # Archive the current key before touching the database: the whole point is
+    # that the old key survives the rotation.
+    previous.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(crypto.decrypt_age_bytes(current), admin_keys, previous)
+    typer.echo(f"  Retained previous key: {previous}")
+
+    try:
+        with _InstantiatedRealm(repo, realm) as inst:
+            krb.rekey_principal(
+                principal, inst.kdc_conf, inst.principals_dir,
+                password=password, verbose=True,
+            )
+            inst.store_principal(principal, admin_keys)
+    except Exception:
+        # Leave no half-rotated state: the archive is only meaningful next to
+        # a rotated current key.
+        previous.unlink(missing_ok=True)
+        raise
+
+    typer.secho(f"\nRotated {principal}", fg=typer.colors.GREEN)
+    typer.echo(f"  New key:      {current}")
+    typer.echo(f"  Previous key: {previous} (retained)")
+    typer.echo("")
+    typer.echo("Next:")
+    typer.echo(f"  1. aegis build-keytabs --force --realm {realm}")
+    typer.echo("  2. deploy the affected hosts")
+    typer.echo(f"  3. aegis realm rekey-principal {realm} {principal} --prune")
+
+
 @realm_app.command("remove-principal")
 def realm_remove_principal(
     realm: str = typer.Argument(..., help="Realm name"),

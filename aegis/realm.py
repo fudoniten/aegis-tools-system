@@ -179,6 +179,22 @@ def stored_principals(repo: SecretsRepo, realm: str) -> list[str]:
     )
 
 
+def previous_principals(repo: SecretsRepo, realm: str) -> list[str]:
+    """Principals with a retained pre-rekey key, i.e. rotations in progress.
+
+    Each one means some host may still be authenticating with the old key.
+    They stay until `aegis realm rekey-principal --prune` drops them.
+    """
+    previous_dir = repo.realm_previous_principals_path(realm)
+    if not previous_dir.is_dir():
+        return []
+    config = load(repo, realm)
+    return sorted(
+        principal_from_filename(f.stem, config.principals)
+        for f in previous_dir.glob("*.age")
+    )
+
+
 def classify(principal: str, realm: str) -> PrincipalEntry:
     """Guess the kind of a principal from its name."""
     # Strip any realm suffix too: single-component principals look like

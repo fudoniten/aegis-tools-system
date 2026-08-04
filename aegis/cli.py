@@ -670,6 +670,22 @@ def build_keytabs(
                     typer.echo(f"    Error extracting keytab: {e}", err=True)
                     continue
 
+                # A keytab can hold several kvnos for the same principal, so a
+                # rotation in progress emits both: the service keeps working
+                # with the key it already has until it receives this keytab.
+                try:
+                    carried = _append_retained_keys(
+                        repo, realm_name, realm_config, realm_key_plain,
+                        member, services, keytab_tmp, tmpdir,
+                    )
+                except Exception as e:
+                    typer.echo(
+                        f"    Error adding retained keys: {e}", err=True)
+                    continue
+                if carried:
+                    typer.echo(
+                        f"    Carrying pre-rekey keys for: {', '.join(carried)}")
+
                 recipients = [host_age_key, *admin_keys]
                 if kdc_role_pubkey:
                     recipients.append(kdc_role_pubkey)
@@ -728,6 +744,65 @@ def build_keytabs(
                 typer.echo(f"  Skipped KDC principals file (no KDC role public key)")
 
     typer.secho("\nKeytab build complete!", fg=typer.colors.GREEN)
+
+
+def _append_retained_keys(
+    repo: config.SecretsRepo,
+    realm_name: str,
+    realm_config,
+    realm_key_plain: Path,
+    member,
+    services: list[str],
+    keytab_path: Path,
+    tmpdir: Path,
+) -> list[str]:
+    """Append any retained pre-rekey keys for this host to its keytab.
+
+    `kadmin ext_keytab` appends rather than truncating, so extracting the old
+    principals from a second throwaway database into the same file leaves the
+    keytab holding both kvnos. That is what makes `realm rekey-principal` a
+    graceful rotation instead of a hard cutover.
+
+    Returns the principals whose old key was carried.
+    """
+    from . import kerberos as krb, realm as realm_mod
+
+    previous_dir = repo.realm_previous_principals_path(realm_name)
+    if not previous_dir.is_dir():
+        return []
+
+    # Only the services this host actually has: ext_keytab fails on a
+    # principal the database does not contain.
+    wanted = {}
+    for service in services:
+        principal = f"{service}/{member.fqdn}"
+        stem = realm_mod.principal_filename(principal)
+        source = previous_dir / f"{stem}.age"
+        if source.exists():
+            wanted[service] = (stem, source)
+
+    if not wanted:
+        return []
+
+    prev_root = tmpdir / f"previous-{member.hostname}"
+    prev_realm = prev_root / realm_name
+    prev_principals = prev_realm / "principals"
+    prev_principals.mkdir(parents=True, exist_ok=True)
+
+    # The old database needs the realm key too, or it cannot be built.
+    (prev_realm / "realm.key").write_bytes(realm_key_plain.read_bytes())
+    for stem, source in wanted.values():
+        (prev_principals / f"{stem}.key").write_bytes(
+            crypto.decrypt_age_bytes(source))
+
+    prev_conf = krb.instantiate_realm(
+        realm_name, prev_realm, etypes=realm_config.etypes)
+
+    krb.extract_host_keytab(
+        member.fqdn, prev_conf, keytab_path, services=sorted(wanted),
+    )
+
+    return [f"{service}/{member.fqdn}" for service in sorted(wanted)]
 
 
 def _sync_keytab_manifest(repo: config.SecretsRepo, hostname: str) -> None:

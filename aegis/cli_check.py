@@ -316,6 +316,22 @@ def _check_realms(repo: config.SecretsRepo, report: Report) -> None:
                 f"aegis realm set {realm_name} --add-domain <domain>",
             )
 
+        # A retained pre-rekey key means a rotation was started and never
+        # finished. Keytabs still carry the old key, so anything holding an
+        # un-redeployed keytab keeps working -- but the old key stays valid
+        # until it is pruned, which is not what a rotation is for.
+        pending = realm_mod.previous_principals(repo, realm_name)
+        if pending:
+            shown = ", ".join(pending[:4]) + (
+                f" (+{len(pending) - 4} more)" if len(pending) > 4 else "")
+            report.warn(
+                scope,
+                f"{len(pending)} principal(s) mid-rotation, still carrying a "
+                f"pre-rekey key: {shown}",
+                f"redeploy the affected hosts, then: aegis realm "
+                f"rekey-principal {realm_name} <principal> --prune",
+            )
+
         if not realm_config.domains:
             report.error(
                 scope,

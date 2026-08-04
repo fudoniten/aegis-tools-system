@@ -97,6 +97,7 @@ aegis realm init EXAMPLE.ORG --domain example.org
 aegis realm list
 aegis realm show EXAMPLE.ORG
 aegis realm add-principal EXAMPLE.ORG postgres/db.example.org --host db
+aegis realm rekey-principal EXAMPLE.ORG postgres/db.example.org
 aegis realm trust EXAMPLE.ORG OTHER.ORG
 aegis realm export EXAMPLE.ORG
 
@@ -195,9 +196,28 @@ files are still out of its reach.
 | `aegis realm set <REALM>` | Update domains, KDC role, etypes, lifetimes |
 | `aegis realm add-principal` | Add a principal (random key or password) |
 | `aegis realm remove-principal` | Remove a principal |
+| `aegis realm rekey-principal` | Rotate a key, retaining the old one for a grace period |
 | `aegis realm trust <A> <B>` | Establish cross-realm trust (bidirectional by default) |
 | `aegis realm untrust <A> <B>` | Remove cross-realm trust |
 | `aegis realm export <REALM>` | Write the KDC principal bundle |
+
+### Rotating a principal
+
+A Kerberos keytab can hold several kvnos for the same principal, so rotation
+does not have to be a hard cutover:
+
+```bash
+aegis realm rekey-principal REALM host/rama.sea.fudo.org   # rotate, keep the old key
+aegis build-keytabs --force --realm REALM                  # keytabs carry both kvnos
+# ...deploy the affected hosts...
+aegis realm rekey-principal REALM host/rama.sea.fudo.org --prune
+```
+
+The pre-rotation key is retained under `principals/previous/` and
+`build-keytabs` appends it to the emitted keytab, so services keep
+authenticating with the key they already have until they receive the new one.
+`aegis check` reports principals mid-rotation, so an unfinished one does not go
+unnoticed — the old key stays valid until you prune it.
 
 A host reaches a realm through the roles already in the repo:
 

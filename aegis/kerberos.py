@@ -178,6 +178,48 @@ def add_principal(
     return principals_path / f"{principal.replace('/', '_', 1)}.key"
 
 
+def rekey_principal(
+    principal: str,
+    kdc_conf_path: Path,
+    principals_path: Path,
+    password: str | None = None,
+    verbose: bool = False,
+) -> Path:
+    """Rotate an existing principal's key, bumping its kvno.
+
+    Overwrites the principal's key file with the new dump line.  Archive the
+    previous line first if you want a graceful rotation: a keytab can hold
+    several kvnos for the same principal, so keeping the old key lets services
+    keep authenticating until every one of them has the new keytab.
+
+    Returns:
+        Path to the rewritten principal key file
+    """
+    scripts = get_scripts_path()
+    script = scripts / "kdc-rekey-principal.rb"
+
+    if not script.exists():
+        raise FileNotFoundError(f"Script not found: {script}")
+
+    cmd = [
+        "ruby", str(script),
+        "--conf", str(kdc_conf_path),
+        "--principal-dir", str(principals_path),
+    ]
+
+    if password is not None:
+        cmd.extend(["--password", password])
+
+    if verbose:
+        cmd.append("--verbose")
+
+    cmd.append(principal)
+
+    subprocess.run(cmd, check=True)
+
+    return principals_path / f"{principal.replace('/', '_', 1)}.key"
+
+
 def merge_principals(
     realm: str,
     database_path: Path,
