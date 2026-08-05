@@ -37,3 +37,12 @@ class AdminKeyError(AegisError):
 
 class RealmError(AegisError):
     """A Kerberos realm operation failed."""
+
+
+class ConfigError(AegisError):
+    """A file under src/ does not say what it appears to say.
+
+    Raised rather than defaulted around: a host whose status is misspelled
+    would otherwise read as "active" and quietly start receiving secrets
+    again.
+    """
