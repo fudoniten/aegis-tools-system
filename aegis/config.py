@@ -23,6 +23,8 @@ except ImportError:
 
 import tomli_w  # type: ignore
 
+from .errors import ConfigError
+
 
 #: Manifest sections that a host may set placement for.  ``secret:<name>``
 #: keys are also accepted, for entries under ``[secrets]``.
@@ -70,6 +72,31 @@ class Placement:
         return not self.to_dict()
 
 
+#: A host Aegis fully manages.  The default, and the only status for which a
+#: missing master key or missing deployed secrets is a problem.
+STATUS_ACTIVE = "active"
+
+#: Declared, but not yet initialised -- no master key, nothing deployed.  A
+#: placeholder for a host that is coming, so that roles and realms can name it
+#: before it exists.
+STATUS_PENDING = "pending"
+
+#: Decommissioned.  Kept so the record of what it once held is not lost, but
+#: it must no longer be a recipient of anything: whatever it could read should
+#: be treated as disclosed and rotated.
+STATUS_RETIRED = "retired"
+
+#: A real host that Aegis does not deliver secrets to -- a container whose
+#: secrets come from its host, or a machine managed by someone else.  It may
+#: still legitimately appear in a realm or a role.
+STATUS_EXTERNAL = "external"
+
+HOST_STATUSES = (STATUS_ACTIVE, STATUS_PENDING, STATUS_RETIRED, STATUS_EXTERNAL)
+
+#: Statuses for which Aegis builds and deploys host secrets.
+DEPLOYING_STATUSES = (STATUS_ACTIVE,)
+
+
 @dataclass
 class HostConfig:
     """Configuration for a host.
@@ -91,6 +118,13 @@ class HostConfig:
     filesystem_keys: list[str] = field(default_factory=list)
     placement: dict[str, Placement] = field(default_factory=dict)
     extra_secrets: dict[str, Any] = field(default_factory=dict)
+    status: str = STATUS_ACTIVE
+    note: str = ""
+
+    @property
+    def deploys(self) -> bool:
+        """Whether Aegis should build and deploy secrets for this host."""
+        return self.status in DEPLOYING_STATUSES
 
     @classmethod
     def from_dict(cls, hostname: str, data: dict) -> "HostConfig":
@@ -99,6 +133,14 @@ class HostConfig:
             for key, value in data.get("placement", {}).items()
             if isinstance(value, dict)
         }
+        # An unrecognised status must not silently read as "active": that would
+        # turn a typo into a host that quietly starts receiving secrets again.
+        status = data.get("status", STATUS_ACTIVE)
+        if status not in HOST_STATUSES:
+            raise ConfigError(
+                f"host {hostname}: unknown status {status!r}. "
+                f"Expected one of: {', '.join(HOST_STATUSES)}"
+            )
         return cls(
             hostname=hostname,
             age_pubkey=data.get("age_pubkey"),
@@ -106,6 +148,8 @@ class HostConfig:
             filesystem_keys=data.get("filesystem_keys", []),
             placement=placement,
             extra_secrets=data.get("extra_secrets", {}),
+            status=status,
+            note=data.get("note", ""),
         )
 
     def to_dict(self) -> dict:
@@ -114,6 +158,12 @@ class HostConfig:
             "filesystem_keys": self.filesystem_keys,
             "extra_secrets": self.extra_secrets,
         }
+        # Written only when it is not the default, so existing host files stay
+        # byte-identical until somebody actually changes a host's status.
+        if self.status != STATUS_ACTIVE:
+            d["status"] = self.status
+        if self.note:
+            d["note"] = self.note
         if self.age_pubkey:
             d["age_pubkey"] = self.age_pubkey
         placement = {
@@ -288,11 +338,26 @@ class SecretsRepo:
             tomli_w.dump(config.to_dict(), f)
 
     def list_hosts(self) -> list[str]:
-        """List all configured hosts."""
+        """List all configured hosts, whatever their status."""
         hosts_dir = self.src_path / "hosts"
         if not hosts_dir.exists():
             return []
         return sorted(p.stem for p in hosts_dir.glob("*.toml"))
+
+    def host_status(self, hostname: str) -> str:
+        """A host's lifecycle status; ``active`` for anything unrecorded."""
+        host_config = self.get_host_config(hostname)
+        return host_config.status if host_config else STATUS_ACTIVE
+
+    def list_deploying_hosts(self) -> list[str]:
+        """Hosts Aegis should build and deploy secrets for.
+
+        Use this, not :meth:`list_hosts`, anywhere the answer feeds encryption
+        or deployment.  A retired host left in a recipient set is a key that
+        can still read new secrets after the machine is gone.
+        """
+        return [h for h in self.list_hosts()
+                if self.host_status(h) in DEPLOYING_STATUSES]
 
     # User configuration
 

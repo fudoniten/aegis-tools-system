@@ -244,6 +244,7 @@ def build_role_keys(
 
     repo = get_secrets_repo(secrets_path)
     admin_keys = admin_recipients(repo)
+    deploying = set(repo.list_deploying_hosts())
 
     for role_name in repo.list_roles():
         role_config = repo.get_role_config(role_name)
@@ -258,6 +259,11 @@ def build_role_keys(
         role_privkey: str | None = None  # decrypt lazily
 
         for hostname in role_config.hosts:
+            if hostname not in deploying:
+                typer.echo(
+                    f"  Skipping {hostname}: status is "
+                    f"{repo.host_status(hostname)}")
+                continue
             out_path = repo.host_role_key_path(hostname, role_name)
             if out_path.exists():
                 continue
@@ -331,7 +337,7 @@ def build_ssh_host_keys(
 
     repo = get_secrets_repo(secrets_path)
 
-    hosts = repo.list_hosts()
+    hosts = repo.list_deploying_hosts()
     if not hosts:
         typer.echo("No hosts configured. Use 'aegis init-host' first.")
         return
@@ -429,7 +435,7 @@ def build_nexus_keys(
 
     repo = get_secrets_repo(secrets_path)
 
-    hosts = repo.list_hosts()
+    hosts = repo.list_deploying_hosts()
     if not hosts:
         typer.echo("No hosts configured. Use 'aegis init-host' first.")
         return
@@ -1816,6 +1822,90 @@ def set_master_key(
     typer.echo("")
     typer.echo("Now you can encrypt secrets for this host with 'aegis build'")
 
+    if not host_config.deploys:
+        typer.secho(
+            f"Note: {hostname} has status '{host_config.status}', so nothing "
+            f"will be built for it until that changes.",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo(f"  aegis set-host-status {hostname} active")
+
+
+@app.command("set-host-status")
+def set_host_status(
+    hostname: str = typer.Argument(..., help="Hostname"),
+    status: str = typer.Argument(
+        ...,
+        help="One of: " + ", ".join(config.HOST_STATUSES),
+    ),
+    note: Optional[str] = typer.Option(
+        None, "--note", "-n", help="Why, recorded alongside the status"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+):
+    """Record whether Aegis manages a host, and why not if it doesn't.
+
+    Not every host in the repo is a machine waiting for secrets.  Without a
+    way to say so, "no master key" can only be read as "broken", and the
+    permanent errors that produces are what teaches you to stop reading
+    'aegis check' output.
+
+    \b
+    active    fully managed; the default
+    pending   declared but not yet initialised -- reserves the name so roles
+              and realms can refer to it before it exists
+    retired   decommissioned; must hold nothing, and whatever it once held
+              should be treated as disclosed
+    external  a real host Aegis does not deliver to -- a container served by
+              its parent, or a machine someone else manages
+
+    Only 'active' hosts are built for or encrypted to.
+
+    Example:
+        aegis set-host-status pselby-work retired --note "laptop returned"
+    """
+    repo = get_secrets_repo(secrets_path)
+
+    if status not in config.HOST_STATUSES:
+        typer.echo(
+            f"Error: unknown status {status!r}. Expected one of: "
+            f"{', '.join(config.HOST_STATUSES)}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    host_config = repo.get_host_config(hostname)
+    if not host_config:
+        host_config = config.HostConfig(hostname=hostname)
+        typer.echo(f"Creating new host config for {hostname}...")
+
+    previous = host_config.status
+    host_config.status = status
+    if note is not None:
+        host_config.note = note
+    repo.set_host_config(host_config)
+
+    typer.secho(f"{hostname}: {previous} -> {status}", fg=typer.colors.GREEN)
+    if host_config.note:
+        typer.echo(f"  {host_config.note}")
+
+    # Changing the status does not itself remove anything; say so rather than
+    # letting the green line imply the host has been cleaned up.
+    deploy = repo.host_deploy_path(hostname)
+    stale = sorted(deploy.rglob("*.age")) if deploy.is_dir() else []
+    if stale and not host_config.deploys:
+        typer.secho(
+            f"\n{len(stale)} encrypted file(s) are still deployed to {hostname}. "
+            f"Nothing was removed.",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo(f"  rm -r {deploy}")
+        if status == config.STATUS_RETIRED and host_config.age_pubkey:
+            typer.secho(
+                "  Its key can still decrypt every copy it already has; treat "
+                "those secrets as disclosed and rotate them.",
+                fg=typer.colors.YELLOW,
+            )
+
 
 @app.command("add-user")
 def add_user(
@@ -1982,6 +2072,24 @@ def add_host_to_role(
     if hostname in role_config.hosts:
         typer.echo(f"Host {hostname} is already a member of role {role}")
         raise typer.Exit(1)
+
+    # Membership is a declaration and can precede the machine, but the key
+    # must not: handing a role key to a host that is retired, or that Aegis
+    # does not deliver to, is exactly the leak the status field exists to
+    # prevent.  Record the membership; build-role-keys writes the key once
+    # the host goes active.
+    host_config = repo.get_host_config(hostname)
+    if host_config and not host_config.deploys:
+        role_config.hosts.append(hostname)
+        repo.set_role_config(role_config)
+        typer.secho(
+            f"Added {hostname} to role {role} (no key written: status is "
+            f"{host_config.status})",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo(
+            f"  It will get one from 'aegis build-role-keys' once it is active.")
+        return
 
     role_key_path = repo.role_key_path(role)
     if not role_key_path.exists():

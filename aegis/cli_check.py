@@ -23,6 +23,11 @@ from .errors import AegisError
 
 SEVERITY_ERROR = "error"
 SEVERITY_WARN = "warn"
+#: Neither wrong nor suspicious -- state worth stating.  A host that is
+#: deliberately not managed should appear in the output, or its absence reads
+#: as an oversight; but it must not count towards the exit status, or the
+#: check becomes something you learn to ignore.
+SEVERITY_INFO = "info"
 
 
 @dataclass
@@ -43,6 +48,9 @@ class Report:
     def warn(self, scope: str, message: str, hint: str | None = None) -> None:
         self.findings.append(Finding(SEVERITY_WARN, scope, message, hint))
 
+    def info(self, scope: str, message: str, hint: str | None = None) -> None:
+        self.findings.append(Finding(SEVERITY_INFO, scope, message, hint))
+
     @property
     def errors(self) -> list[Finding]:
         return [f for f in self.findings if f.severity == SEVERITY_ERROR]
@@ -50,6 +58,10 @@ class Report:
     @property
     def warnings(self) -> list[Finding]:
         return [f for f in self.findings if f.severity == SEVERITY_WARN]
+
+    @property
+    def notes(self) -> list[Finding]:
+        return [f for f in self.findings if f.severity == SEVERITY_INFO]
 
 
 def _check_admin(repo: config.SecretsRepo, report: Report) -> list[str]:
@@ -107,11 +119,35 @@ def _check_hosts(
         host_config = repo.get_host_config(hostname)
         scope = f"host/{hostname}"
 
-        if not (host_config and host_config.age_pubkey):
+        status = host_config.status if host_config else config.STATUS_ACTIVE
+        if status != config.STATUS_ACTIVE:
+            # Not a host Aegis delivers to, so it is not missing anything.
+            # What *would* be wrong is leftover deployed material: a host that
+            # is gone or never arrived should hold nothing.
+            deploy = repo.host_deploy_path(hostname)
+            stale = sorted(deploy.rglob("*.age")) if deploy.is_dir() else []
+            if stale:
+                report.error(
+                    scope,
+                    f"status is {status} but {len(stale)} encrypted file(s) are "
+                    f"still deployed to it"
+                    + (", and its key can still read them"
+                       if status == config.STATUS_RETIRED else ""),
+                    f"rm -r {deploy}"
+                    + (" && rotate whatever it held"
+                       if status == config.STATUS_RETIRED else ""),
+                )
+            else:
+                note = f" ({host_config.note})" if host_config and host_config.note else ""
+                report.info(scope, f"{status}, skipped{note}")
+            continue
+
+        if not host_config or not host_config.age_pubkey:
             report.error(
                 scope,
                 "no master key set",
-                f"aegis set-master-key {hostname} --public-key 'age1...'",
+                f"aegis set-master-key {hostname} --public-key 'age1...', or "
+                f"record why it has none: aegis set-host-status {hostname} pending",
             )
             continue
 
@@ -545,20 +581,28 @@ def register(app: typer.Typer) -> None:
             typer.secho("No problems found.", fg=typer.colors.GREEN)
             return
 
+        marks = {
+            SEVERITY_ERROR: ("✗", typer.colors.RED),
+            SEVERITY_WARN: ("!", typer.colors.YELLOW),
+            SEVERITY_INFO: ("·", typer.colors.BLUE),
+        }
         for finding in report.findings:
-            colour = (
-                typer.colors.RED if finding.severity == SEVERITY_ERROR
-                else typer.colors.YELLOW
-            )
-            marker = "✗" if finding.severity == SEVERITY_ERROR else "!"
+            if finding.severity == SEVERITY_INFO and quiet:
+                continue
+            marker, colour = marks[finding.severity]
             typer.secho(f"{marker} {finding.scope}: {finding.message}", fg=colour)
             if finding.hint and not quiet:
                 typer.echo(f"    → {finding.hint}")
 
         typer.echo("")
+        summary = f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)"
+        if report.notes:
+            summary += f", {len(report.notes)} host(s) not managed"
         typer.secho(
-            f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)",
-            fg=typer.colors.RED if report.errors else typer.colors.YELLOW,
+            summary,
+            fg=typer.colors.RED if report.errors
+            else typer.colors.YELLOW if report.warnings
+            else typer.colors.GREEN,
         )
 
         if report.errors:
