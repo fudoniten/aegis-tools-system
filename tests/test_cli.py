@@ -307,3 +307,112 @@ def test_new_secret_role_with_no_members_refuses(temp_secrets_repo: Path):
     assert result.exit_code == 1
     assert "no recipients" in _out(result) or "empty" in _out(result).lower()
 
+
+# Wildcard user-host membership -----------------------------------------------
+#
+# `aegis add-user --hosts='*'` should make the user reachable on every active
+# host. Hosts added after the user is configured should be picked up on
+# the next build-user-secrets without an explicit `add-user`-equivalent edit.
+
+
+def test_add_user_wildcard_creates_user_config_with_star(temp_secrets_repo: Path):
+    """--hosts='*' produces hosts=['*'] in the user config, no error."""
+    result = runner.invoke(app, [
+        "add-user", "niten",
+        "--hosts", "*",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    assert result.exit_code == 0, _out([result])
+
+    repo = config.SecretsRepo(temp_secrets_repo)
+    user_config = repo.get_user_config("niten")
+    assert user_config is not None
+    assert user_config.hosts == ["*"]
+
+
+def test_resolve_user_allowed_hosts_expands_star(temp_secrets_repo: Path):
+    """The '*' sentinel expands to every active host at call time."""
+    from tests.conftest import add_host
+    repo = config.SecretsRepo(temp_secrets_repo)
+    add_host(repo, "alpha")
+    add_host(repo, "beta")
+
+    result = runner.invoke(app, [
+        "add-user", "niten",
+        "--hosts", "*",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    assert result.exit_code == 0, _out([result])
+
+    user_config = repo.get_user_config("niten")
+    allowed = repo.resolve_user_allowed_hosts(user_config)
+    # Reserve the right to add more hosts later, but alpha and beta
+    # must both be present.
+    assert "alpha" in allowed
+    assert "beta" in allowed
+    assert "*" not in allowed  # the sentinel never leaks into the resolved set
+
+
+def test_resolve_user_allowed_hosts_mixed_explicit_and_star(temp_secrets_repo: Path):
+    """Mixed 'alpha,*' resolves to the union of all active hosts."""
+    from tests.conftest import add_host
+    repo = config.SecretsRepo(temp_secrets_repo)
+    add_host(repo, "alpha")
+    add_host(repo, "beta")
+
+    runner.invoke(app, [
+        "add-user", "niten",
+        "--hosts", "alpha,*",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    user_config = repo.get_user_config("niten")
+    assert user_config.hosts == ["alpha", "*"]
+
+    allowed = repo.resolve_user_allowed_hosts(user_config)
+    assert "alpha" in allowed
+    assert "beta" in allowed
+
+
+def test_resolve_user_allowed_hosts_excludes_retired(temp_secrets_repo: Path):
+    """Wildcard does NOT grant access to retired hosts."""
+    from tests.conftest import add_host
+    repo = config.SecretsRepo(temp_secrets_repo)
+    add_host(repo, "active-host")
+    add_host(repo, "retired-host")
+
+    # Mark retired-host as retired
+    retired_config = repo.get_host_config("retired-host")
+    retired_config.status = config.STATUS_RETIRED
+    repo.set_host_config(retired_config)
+
+    runner.invoke(app, [
+        "add-user", "niten",
+        "--hosts", "*",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    user_config = repo.get_user_config("niten")
+    allowed = repo.resolve_user_allowed_hosts(user_config)
+
+    assert "active-host" in allowed
+    assert "retired-host" not in allowed
+
+
+def test_resolve_user_no_wildcard_is_passthrough(temp_secrets_repo: Path):
+    """A user without '*' keeps exactly the hosts they were configured with."""
+    from tests.conftest import add_host
+    repo = config.SecretsRepo(temp_secrets_repo)
+    add_host(repo, "alpha")
+    add_host(repo, "beta")
+    add_host(repo, "gamma")
+
+    runner.invoke(app, [
+        "add-user", "niten",
+        "--hosts", "alpha,beta",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    user_config = repo.get_user_config("niten")
+    allowed = repo.resolve_user_allowed_hosts(user_config)
+
+    assert allowed == {"alpha", "beta"}
+
+
