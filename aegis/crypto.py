@@ -15,12 +15,97 @@ keeps working without a migration.
 
 import base64
 import os
+import secrets as _py_secrets
+import string
 import subprocess
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 
 from .errors import AdminKeyError
+
+
+#: Default alphabet for ``generate_secret(format="alphanumeric")``: a-z, A-Z, 0-9.
+DEFAULT_ALPHANUMERIC = string.ascii_letters + string.digits
+
+#: Named alphabets usable as ``--charset`` arguments.
+ALPHABET_PRESETS: dict[str, str] = {
+    "alpha-lower":    string.ascii_lowercase,
+    "alpha-upper":    string.ascii_uppercase,
+    "alpha":          string.ascii_letters,
+    "numeric":        string.digits,
+    "alphanumeric":   DEFAULT_ALPHANUMERIC,
+    # 0x21-0x7E, omitting space and DEL — safe for unquoted shell contexts.
+    "printable-ascii": "".join(chr(c) for c in range(33, 127)),
+}
+
+
+def generate_secret(
+    *,
+    format: str = "hex",
+    length: int = 32,
+    charset: str | None = None,
+) -> bytes:
+    """Generate a high-entropy credential for service use.
+
+    Backed by :mod:`secrets`, which on Linux reads from ``getrandom`` via
+    ``os.urandom``.  Use :func:`generate_age_keypair` for age X25519 key pairs.
+
+    Args:
+        format: One of:
+
+            - ``hex``: ``length`` characters of lowercase hex. 32 hex chars
+              = 128 bits of entropy (16 random bytes).
+            - ``base64``: standard base64 of ``length`` random bytes, no padding.
+            - ``base64url``: URL-safe base64 of ``length`` random bytes, no
+              padding (``A-Za-z0-9-_`` — safe for URLs and filenames).
+            - ``alphanumeric``: ``length`` characters drawn from ``charset``
+              (or the default 62-char alphanum if unset).
+            - ``raw``: ``length`` random bytes (e.g. for an HMAC key).
+        length: Number of characters for the encoded formats, number of
+            bytes for ``raw``. Must be > 0.
+        charset: Explicit alphabet for ``alphanumeric``. May also be a key
+            from :data:`ALPHABET_PRESETS`. Must be non-empty.
+
+    Returns:
+        The plaintext secret as bytes.
+
+    Raises:
+        ValueError: on an unknown ``format``, empty ``charset``, or
+            non-positive ``length``.
+    """
+    if length <= 0:
+        raise ValueError("length must be positive")
+
+    if format == "hex":
+        # 32 hex chars = 128 bits = 16 random bytes. Round down so the
+        # caller-supplied length always means "characters on disk".
+        byte_len = max(length // 2, 1)
+        return _py_secrets.token_hex(byte_len)[:length].encode("ascii")
+
+    if format == "base64":
+        return base64.b64encode(_py_secrets.token_bytes(length)).rstrip(b"=")
+
+    if format == "base64url":
+        return base64.urlsafe_b64encode(_py_secrets.token_bytes(length)).rstrip(b"=")
+
+    if format == "alphanumeric":
+        if charset is None:
+            alpha = DEFAULT_ALPHANUMERIC
+        elif charset in ALPHABET_PRESETS:
+            alpha = ALPHABET_PRESETS[charset]
+        else:
+            alpha = charset
+        if not alpha:
+            raise ValueError("alphabet/charset must be non-empty")
+        return "".join(
+            _py_secrets.choice(alpha) for _ in range(length)
+        ).encode("ascii")
+
+    if format == "raw":
+        return _py_secrets.token_bytes(length)
+
+    raise ValueError(f"unknown secret format: {format!r}")
 
 #: Sentinel written by the pre-binary-clean tooling.  Read-only compatibility.
 LEGACY_B64_PREFIX = b"base64:"

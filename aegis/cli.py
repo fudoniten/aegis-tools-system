@@ -3,7 +3,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, List, Optional
 
 import typer
 
@@ -1361,6 +1361,212 @@ def import_secret(
     typer.echo(f"  Target: {target}")
     typer.echo(f"  Owner: {user}:{group}")
     typer.echo(f"  Mode: {mode}")
+
+
+@app.command("new-secret")
+def new_secret(
+    name: str = typer.Argument(..., help="Secret name (filename and src/ hosts/roles [<h>].toml [extra_secrets.<name>] key)"),
+    host: List[str] = typer.Option([], "--host", "-H", help="Recipient host (repeatable). Each host gets its own .age file encrypted to that host's master key."),
+    role: List[str] = typer.Option([], "--role", "-R", help="Recipient role (repeatable). The secret is encrypted for every current member of the role."),
+    target: str = typer.Option(..., "--target", help="Target path on each recipient host, e.g. /run/<service>/<file>"),
+    user: str = typer.Option("root", "--user", help="Owner user on target host [default: root]"),
+    group: str = typer.Option("root", "--group", help="Owner group on target host [default: root]"),
+    mode: str = typer.Option("0400", "--mode", help="File permissions on target host [default: 0400]"),
+    length: int = typer.Option(32, "--length", help="Length in characters (encoded formats) or bytes (--format raw) [default: 32]"),
+    fmt: str = typer.Option("hex", "--format", help="hex | base64 | base64url | alphanumeric | raw [default: hex]"),
+    charset: Optional[str] = typer.Option(None, "--charset", help="Alphabet for --format=alphanumeric. A literal string, or one of: " + ", ".join(crypto.ALPHABET_PRESETS.keys())),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing encrypted outputs (DESTRUCTIVE: services reading the old value will lose access)"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+):
+    """Generate a fresh random secret and encrypt it for one or more recipients.
+
+    Equivalent to: openssl rand + aegis import-secret for each recipient, with
+    the plaintext never touching the filesystem. The same plaintext is
+    encrypted once per recipient host; each gets its own .age file whose
+    recipient set depends on whether the host was named explicitly or
+    resolved from a role.
+
+    Recipient selection:
+
+    - ``--host <h>`` names a host directly. The .age file is encrypted to
+      that host's master key plus the admin set.
+    - ``--role <r>`` resolves to every current member of ``src/roles/<r>.toml``.
+      The .age file for each member host is encrypted to the host's master
+      key, the role's public key, and the admin set, so that future members
+      added via ``aegis add-host-to-role`` decrypt on next deploy without a
+      rebuild.
+
+    At least one of ``--host`` / ``--role`` is required; they may be combined.
+
+    The plaintext is not printed. ``aegis verify <host>`` is the canonical way
+    to confirm a host can decrypt. Rotation requires re-invoking with
+    ``--force`` and a manual restart of any service reading the old secret.
+
+    Examples:
+        aegis new-secret aurelius-ingest-token \\
+            --host aedile --host nostromo --host fimbria \\
+            --target /run/aurelius/token \\
+            --user aurelius --group aurelius --mode 0400
+
+        aegis new-secret dns-key-signing-secret \\
+            --role dns-master-fudo.org \\
+            --target /run/nsd/signing.key
+    """
+    from . import host_secrets
+
+    repo = get_secrets_repo(secrets_path)
+    repo.ensure_structure()
+
+    if not host and not role:
+        typer.echo(
+            "Error: at least one --host or --role is required.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # Validate every named role exists and gather its current members. We
+    # do NOT auto-create roles here: a role that has no keypair cannot be
+    # an encryption target, and silently minting one would mean the user
+    # encrypts for an identity they did not intend to create.
+    role_members: dict[str, list[str]] = {}
+    for r in role:
+        role_cfg = repo.get_role_config(r)
+        if role_cfg is None:
+            typer.echo(
+                f"Error: role '{r}' is not configured. Run "
+                f"'aegis init-role {r}' first.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        role_pub_path = repo.role_pubkey_path(r)
+        if not role_pub_path.exists():
+            typer.echo(
+                f"Error: role '{r}' has no public key at {role_pub_path}. "
+                f"Re-run 'aegis init-role {r}'.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        role_members[r] = list(role_cfg.hosts)
+
+    # Build the resolved recipient-host set. Direct --host entries pass
+    # through; each --role entry expands to its current members. Same
+    # host named twice (direct + via role) appears once.
+    resolved_hosts: list[str] = []
+    seen: set[str] = set()
+    for h in host:
+        if h not in seen:
+            resolved_hosts.append(h)
+            seen.add(h)
+    for r in role:
+        for h in role_members[r]:
+            if h not in seen:
+                resolved_hosts.append(h)
+                seen.add(h)
+
+    if not resolved_hosts:
+        typer.echo(
+            "Error: --role resolution produced no recipients "
+            "(the listed role(s) have no members).",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # Validate every resolved host is initialised, and read role pubkeys
+    # once for the recipient-set merging below.
+    role_pubkeys: dict[str, str] = {
+        r: repo.role_pubkey_path(r).read_text().strip() for r in role
+    }
+    for h in resolved_hosts:
+        host_cfg = repo.get_host_config(h)
+        if not host_cfg:
+            typer.echo(
+                f"Error: host '{h}' is not initialised; run "
+                f"'aegis init-host {h}' first.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        # The host's per-host role-key file is created by
+        # `aegis add-host-to-role`, not here. If the named role resolved
+        # to this host but the per-host role key is missing, the host
+        # will not be able to decrypt until `aegis build-role-keys` is
+        # run. Surface that explicitly rather than silently.
+        for r in role:
+            if h in role_members[r]:
+                per_host_role_key = (
+                    repo.host_deploy_path(h) / "roles" / f"{r}.age"
+                )
+                if not per_host_role_key.exists():
+                    typer.echo(
+                        f"Error: host '{h}' is a member of role '{r}' but "
+                        f"the per-host role key "
+                        f"{per_host_role_key} is missing. Run "
+                        f"'aegis build-role-keys' for host '{h}' "
+                        f"first; the secret will be decryptable after that.",
+                        err=True,
+                    )
+                    raise typer.Exit(1)
+
+    if charset and charset in crypto.ALPHABET_PRESETS and fmt == "alphanumeric":
+        charset = crypto.ALPHABET_PRESETS[charset]
+
+    # Once, off-disk.
+    plaintext = crypto.generate_secret(format=fmt, length=length, charset=charset)
+
+    typer.echo(
+        f"Generating secret '{name}' for {len(resolved_hosts)} host(s) "
+        f"[{len(role)} role(s); format={fmt}, length={length}]..."
+    )
+
+    admin_keys = admin_recipients(repo)
+    for h in resolved_hosts:
+        host_age_key = get_host_age_pubkey(h, repo)
+        # Build recipient set: per-host master key, plus every role pubkey
+        # the host is currently a member of *and* that was named via --role,
+        # plus the admin set.
+        recipients = [host_age_key]
+        for r in role:
+            if h in role_members[r]:
+                recipients.append(role_pubkeys[r])
+        recipients.extend(admin_keys)
+
+        out = repo.host_deploy_path(h) / "secrets" / f"{name}.age"
+        if out.exists() and not force:
+            typer.echo(
+                f"Error: {out.name} already exists for host '{h}'. "
+                f"Re-run with --force to overwrite (services using the "
+                f"old value will see a different secret on next deploy).",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        crypto.encrypt_age(plaintext, recipients, out)
+
+        record_placement(
+            repo, h, f"secret:{name}",
+            config.Placement(target=target, user=user, group=group, mode=mode),
+        )
+
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, h)
+        manifest.secrets[name] = host_secrets.make_secret_entry(
+            name=name,
+            placement=host_placement(repo, h, f"secret:{name}"),
+        )
+        host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    typer.secho(
+        f"\nSecret '{name}' written for: {', '.join(resolved_hosts)}",
+        fg=typer.colors.GREEN,
+    )
+    typer.echo(f"  Format        : {fmt} ({length})")
+    typer.echo(f"  Target path   : {target}")
+    typer.echo(f"  Owner / mode  : {user}:{group} / {mode}")
+    if role:
+        typer.echo(f"  Roles         : {', '.join(role)}")
+    typer.echo(
+        "  Plaintext was not written to disk; verify decryption with "
+        "`aegis verify <host>`."
+    )
 
 
 # =============================================================================

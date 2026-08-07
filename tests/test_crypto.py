@@ -145,3 +145,98 @@ def test_recipients_of_counts_stanzas(tmp_path: Path):
         "secret", [k.public_key for k in keypairs], encrypted_path)
 
     assert crypto.recipients_of(encrypted_path) == 3
+
+
+# generate_secret ----------------------------------------------------------
+#
+# Defaults listed in the docstring of generate_secret; tests below pin each
+# one.  These run in milliseconds because secrets.token_bytes is fast.
+
+
+def test_generate_secret_hex_default_length():
+    """Default length 32 hex chars = 128 bits."""
+    out = crypto.generate_secret()
+    assert len(out) == 32
+    assert out == out.lower()
+    int(out, 16)  # raises if not valid hex
+
+
+def test_generate_secret_hex_with_length():
+    """Hex output respects caller-supplied char length."""
+    out = crypto.generate_secret(format="hex", length=64)
+    assert len(out) == 64
+    int(out, 16)
+
+
+def test_generate_secret_base64():
+    """Base64 output is unpadded standard alphabet."""
+    out = crypto.generate_secret(format="base64", length=16)
+    # 16 random bytes -> 22 base64 chars with padding, 22 unpadded (we strip)
+    assert len(out) == 22
+    assert b"=" not in out
+    for c in out:
+        assert c in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def test_generate_secret_base64url():
+    """base64url uses URL-safe alphabet."""
+    out = crypto.generate_secret(format="base64url", length=16)
+    for c in out:
+        assert c in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    assert b"=" not in out
+
+
+def test_generate_secret_alphanumeric_default_charset():
+    """alphanumeric without --charset draws from the 62-char default."""
+    out = crypto.generate_secret(format="alphanumeric", length=64)
+    for c in out.decode("ascii"):
+        assert c in crypto.DEFAULT_ALPHANUMERIC
+
+
+def test_generate_secret_alphanumeric_explicit_charset():
+    """alphanumeric with a custom charset restricts to that alphabet."""
+    out = crypto.generate_secret(
+        format="alphanumeric", length=32, charset="abc"
+    )
+    for c in out.decode("ascii"):
+        assert c in "abc"
+
+
+def test_generate_secret_alphabet_presets_resolve():
+    """Named presets match the documented alphabets."""
+    for name, alphabet in crypto.ALPHABET_PRESETS.items():
+        out = crypto.generate_secret(
+            format="alphanumeric", length=20, charset=name
+        )
+        for c in out.decode("ascii"):
+            assert c in alphabet, f"{name} produced {c!r} outside its alphabet"
+
+
+def test_generate_secret_raw_byte_count():
+    """raw output is exactly `length` bytes."""
+    out = crypto.generate_secret(format="raw", length=24)
+    assert isinstance(out, bytes)
+    assert len(out) == 24
+
+
+def test_generate_secret_rejects_zero_length():
+    with pytest.raises(ValueError):
+        crypto.generate_secret(length=0)
+
+
+def test_generate_secret_rejects_empty_charset():
+    with pytest.raises(ValueError):
+        crypto.generate_secret(format="alphanumeric", length=8, charset="")
+
+
+def test_generate_secret_rejects_unknown_format():
+    with pytest.raises(ValueError):
+        crypto.generate_secret(format="rot13", length=8)
+
+
+def test_generate_secret_outputs_differ_across_calls():
+    """Two consecutive invocations produce unrelated output."""
+    a = crypto.generate_secret(length=32)
+    b = crypto.generate_secret(length=32)
+    assert a != b
+
