@@ -430,6 +430,29 @@ class SecretsRepo:
             return []
         return sorted(p.name for p in hosts_dir.iterdir() if p.is_dir())
 
+    def resolve_user_allowed_hosts(self, user_config: "UserConfig") -> set[str]:
+        """Compute the set of hosts a user is allowed to read secrets on.
+
+        Supports the ``"*"`` sentinel in :attr:`UserConfig.hosts` as
+        "every active host aegis manages", re-evaluated on each call.
+        New hosts added after the user was configured are reachable on
+        the next :func:`build_user_secrets` run.
+
+        An explicit host alongside ``*`` is redundant (the wildcard
+        supersedes it) but harmless — explicit entries are kept so the
+        config remains self-documenting about who is supposed to read.
+
+        Retired or externally-managed hosts are not in this set: a user
+        with ``*`` should not gain access to hosts Aegis has stopped
+        managing (``list_deploying_hosts`` filters those out). Aegis's
+        ``check`` command still flags obsolete on-disk artefacts so an
+        explicit cleanup is possible.
+        """
+        explicit = {h for h in user_config.hosts if h != "*"}
+        if "*" not in user_config.hosts:
+            return explicit
+        return explicit | set(self.list_deploying_hosts())
+
     def roles_deploy_path(self) -> Path:
         """Directory holding role public keys."""
         return self.deploy_path / "roles"

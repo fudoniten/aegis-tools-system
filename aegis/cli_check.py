@@ -434,7 +434,7 @@ def _check_users(repo: config.SecretsRepo, report: Report) -> None:
             continue
 
         scope = f"user/{username}"
-        allowed = set(user_config.hosts)
+        allowed = repo.resolve_user_allowed_hosts(user_config)
 
         if not repo.user_key_path(username).exists():
             report.error(

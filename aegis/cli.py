@@ -1043,6 +1043,11 @@ def build_user_secrets(
         if not user_config.hosts:
             typer.echo(f"  No hosts configured for {username}, skipping")
             continue
+
+        # Resolve the user's allowed-host set, expanding any "*" sentinel
+        # against the current active hosts. Building per-host manifests
+        # stops the moment a wildcard user reads on this set.
+        allowed = repo.resolve_user_allowed_hosts(user_config)
         
         # Get user's public key for manifest encryption
         user_pubkey = user_config.public_key
@@ -1073,7 +1078,10 @@ def build_user_secrets(
         typer.echo(f"  Repo: {user_repo_path}")
         
         if dry_run:
-            typer.echo(f"  [dry-run] Would process secrets for hosts: {', '.join(user_config.hosts)}")
+            typer.echo(
+                f"  [dry-run] Would process secrets for hosts: "
+                f"{', '.join(sorted(allowed))}"
+            )
             continue
         
         # Decrypt user's private key
@@ -1086,7 +1094,7 @@ def build_user_secrets(
         
         # Get host public keys for re-encryption
         host_keys: dict[str, str] = {}
-        for hostname in user_config.hosts:
+        for hostname in sorted(allowed):
             try:
                 host_keys[hostname] = get_host_age_pubkey(hostname, repo)
             except AegisError as e:
@@ -2283,7 +2291,15 @@ def set_host_status(
 @user_app.command("add")
 def add_user(
     username: str = typer.Argument(..., help="Username"),
-    hosts: str = typer.Option(..., "--hosts", "-h", help="Comma-separated list of hosts user can access"),
+    hosts: str = typer.Option(
+        ...,
+        "--hosts", "-h",
+        help=(
+            "Comma-separated list of hosts user can access. Pass '*' to grant "
+            "access to every active host aegis manages now and in the future. "
+            "An explicit host alongside '*' is redundant but harmless."
+        ),
+    ),
     repo_url: Optional[str] = typer.Option(None, "--repo-url", help="URL of user's secrets repo"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
