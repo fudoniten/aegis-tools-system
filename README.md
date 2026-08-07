@@ -45,7 +45,62 @@ nix develop
 ## Usage
 
 ```bash
-aegis --help
+aegis --help                # the groups
+aegis host --help           # what a group can do
+aegis host add --help       # what one command can do
+```
+
+Commands are grouped by what they act on. The top level is small on purpose:
+
+| Group | Holds |
+|-------|-------|
+| `aegis build` | every generator; bare `aegis build` runs all of them |
+| `aegis status` / `check` / `verify` / `reencrypt` | inspection and repair |
+| `aegis host` / `user` / `role` / `secret` | what the repo declares |
+| `aegis ssh` / `nexus` / `dnssec` / `realm` / `admin` | one kind of key material each |
+
+Every pre-grouping command name (`aegis init-host`, `aegis build-keytabs`, …)
+still works and prints where it moved to, so existing scripts keep running.
+Those aliases go away when beta does.
+
+### Quick Start
+
+A new host, end to end. Nothing is generated for a host until it has a master
+key, because there would be no one to encrypt it for:
+
+```bash
+aegis host add rama --domain sea.fudo.org      # declare it
+aegis host set-key rama --public-key age1...   # so it can decrypt
+aegis build                                    # generate what it is missing
+aegis check                                    # confirm nothing is adrift
+aegis verify rama                              # confirm the host can read it
+```
+
+Bringing in material that already exists, instead of generating it:
+
+```bash
+aegis ssh import rama --key /secure/rama.ed25519.key
+aegis nexus import rama --file /secure/rama.nexus.hmac
+
+# A service secret you were handed: encrypt it, and say where it lands.
+aegis secret import rama grafana-token \
+    --file /secure/grafana.token \
+    --target /run/grafana/token --user grafana --mode 0400
+
+# One you want invented rather than handed over.
+aegis secret new ingest-token --host rama --host lambda \
+    --target /run/aurelius/token --user aurelius
+```
+
+Two rules worth knowing before you need them:
+
+```bash
+# Changing WHO can read a secret never regenerates it.
+aegis admin add-key --name backup --public-key age1...
+aegis reencrypt                     # until this, the new key reads nothing
+
+# Changing WHAT the secret is does, and breaks everything holding the old one.
+aegis build ssh-keys --rotate       # new SSH identity; breaks known_hosts
 ```
 
 ### Finding the Secrets Repository
@@ -66,25 +121,25 @@ If none of these work, you'll see an error with instructions.
 aegis status
 
 # Initialize a new host
-aegis init-host myhost --services=host,ssh
+aegis host add myhost --services=host,ssh
 
 # Import existing secrets
-aegis import-ssh-host-keys lambda --key /secure/lambda.ed25519.key --key /secure/lambda.ecdsa.key
-aegis import-nexus-key lambda --file /secure/lambda.nexus.hmac
+aegis ssh import lambda --key /secure/lambda.ed25519.key --key /secure/lambda.ecdsa.key
+aegis nexus import lambda --file /secure/lambda.nexus.hmac
 aegis realm import SEA.FUDO.ORG --realm-key /secure/realm.key --principals-dir /secure/principals/ --domain sea.fudo.org
 
 # Add a user with access to specific hosts
-aegis add-user alice --hosts=host1,host2
+aegis user add alice --hosts=host1,host2
 
 # Build all secrets (SSH keys, Nexus keys, keytabs, user secrets)
 aegis build
 
-# Build specific types
-aegis build-role-keys
-aegis build-ssh-host-keys
-aegis build-nexus-keys
-aegis build-keytabs
-aegis build-user-secrets
+# Build one kind
+aegis build role-keys
+aegis build ssh-keys
+aegis build nexus-keys
+aegis build keytabs
+aegis build user-secrets
 
 # Report drift between src/ and deploy/ (changes nothing, exits 1 on errors)
 aegis check
@@ -102,14 +157,14 @@ aegis realm trust EXAMPLE.ORG OTHER.ORG
 aegis realm export EXAMPLE.ORG
 
 # Create a role (e.g., KDC)
-aegis init-role kdc
-aegis add-host-to-role kdc kdchost
+aegis role init kdc
+aegis role add-host kdc kdchost
 
 # Declare where a decrypted secret belongs
-aegis set-placement myhost keytab --target /etc/krb5.keytab --mode 0600
+aegis host set-placement myhost keytab --target /etc/krb5.keytab --mode 0600
 
 # List secrets for a host
-aegis list myhost
+aegis secret list myhost
 
 # Verify secrets are properly formatted
 aegis verify myhost
@@ -129,12 +184,13 @@ aegis verify myhost
 
 | Command | Description |
 |---------|-------------|
-| `aegis build` | Run full build (role keys, SSH keys, Nexus keys, keytabs, user secrets) |
-| `aegis build-role-keys` | Give each role member its copy of the role key |
-| `aegis build-ssh-host-keys` | Generate SSH host keys |
-| `aegis build-nexus-keys` | Generate Nexus DDNS authentication keys |
-| `aegis build-keytabs` | Generate Kerberos keytabs and the KDC principal bundle |
-| `aegis build-user-secrets` | Process user secrets from user repos |
+| `aegis build` | Run every step below, in order (same as `aegis build all`) |
+| `aegis build role-keys` | Give each role member its copy of the role key |
+| `aegis build ssh-keys` | Generate SSH host keys |
+| `aegis build nexus-keys` | Generate Nexus DDNS authentication keys |
+| `aegis build keytabs` | Generate Kerberos keytabs and the KDC principal bundle |
+| `aegis build user-secrets` | Process user secrets from user repos |
+| `aegis build bundles` | Package secrets into host bundles |
 
 Generators create only what is missing. `--rotate` (formerly `--force`) on the
 SSH and Nexus builders mints **new key material**, breaking `known_hosts`,
@@ -208,13 +264,13 @@ does not have to be a hard cutover:
 
 ```bash
 aegis realm rekey-principal REALM host/rama.sea.fudo.org   # rotate, keep the old key
-aegis build-keytabs --force --realm REALM                  # keytabs carry both kvnos
+aegis build keytabs --force --realm REALM                  # keytabs carry both kvnos
 # ...deploy the affected hosts...
 aegis realm rekey-principal REALM host/rama.sea.fudo.org --prune
 ```
 
 The pre-rotation key is retained under `principals/previous/` and
-`build-keytabs` appends it to the emitted keytab, so services keep
+`aegis build keytabs` appends it to the emitted keytab, so services keep
 authenticating with the key they already have until they receive the new one.
 `aegis check` reports principals mid-rotation, so an unfinished one does not go
 unnoticed — the old key stays valid until you prune it.
@@ -230,41 +286,49 @@ declares that domain. `aegis check` reports either half being missing.
 
 ### Import Commands
 
+Importing brings key material that already exists under Aegis management;
+generating it is the `aegis build` family above.
+
 | Command | Description |
 |---------|-------------|
-| `aegis import-ssh-host-keys <host>` | Import SSH private keys (derives public keys) |
-| `aegis import-nexus-key <host>` | Import Nexus DDNS authentication key |
+| `aegis ssh import <host>` | Import SSH private keys (derives public keys) |
+| `aegis nexus import <host>` | Import Nexus DDNS authentication key |
+| `aegis dnssec import <domain>` | Import an existing DNSSEC KSK |
 | `aegis realm import <REALM>` | Import Kerberos realm with principals |
-| `aegis import-secret <host> <name>` | Import generic secret with metadata |
+| `aegis secret import <host> <name>` | Import generic secret with metadata |
 
-### Configuration Commands
-
-| Command | Description |
-|---------|-------------|
-| `aegis init-host <hostname>` | Add a new host to configuration |
-| `aegis add-user <username>` | Add a user and generate their keypair |
-| `aegis add-secret <host> <name> <file>` | Add a custom secret for a host |
-| `aegis init-role <role>` | Create a role keypair with no members |
-| `aegis add-host-to-role <role> <host>` | Give a host the role's key |
-| `aegis set-placement <host> <kind>` | Declare where a decrypted secret belongs |
-
-### Domain Role Commands
+### Host, User and Secret Commands
 
 | Command | Description |
 |---------|-------------|
-| `aegis add-host-to-role <role> <host>` | Add a host to a domain role |
-| `aegis remove-host-from-role <role> <host>` | Remove a host from a domain role |
+| `aegis host add <hostname>` | Add a new host to configuration |
+| `aegis host set-key <host>` | Set the host's age public key |
+| `aegis host set-status <host> <status>` | Record whether Aegis manages the host |
+| `aegis host set-placement <host> <kind>` | Declare where a decrypted secret belongs |
+| `aegis user add <username>` | Add a user and generate their keypair |
+| `aegis secret new <name>` | Generate a random secret for hosts and/or roles |
+| `aegis secret add <host> <name> <file>` | Encrypt a file for a host (no placement) |
+| `aegis secret list [host]` | List secrets for host(s) |
 
-See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for the concept, and the Role Commands
-section above for the commands and on-disk layout in use.
+### Role Commands
+
+| Command | Description |
+|---------|-------------|
+| `aegis role init <role>` | Create a role keypair with no members |
+| `aegis role add-host <role> <host>` | Give a host the role's key |
+| `aegis role remove-host <role> <host>` | Revoke a host's copy of the role key |
+
+Domain membership is role membership: a host in `domain-fudo.org` is a host in
+that domain. See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for the concept and the
+on-disk layout.
 
 ### Utility Commands
 
 | Command | Description |
 |---------|-------------|
 | `aegis status` | Show what needs building |
-| `aegis list [host]` | List secrets for host(s) |
 | `aegis verify <host>` | Verify secrets are valid |
+| `aegis nexus keygen <file>` | Write a standalone Nexus HMAC key |
 
 ## Architecture
 
@@ -294,7 +358,7 @@ rebuilding mints new identities rather than restoring the old ones.
 
 Deployment metadata (target path, owner, mode) lives in `src/hosts/<host>.toml`
 under `[placement]`, so `deploy/hosts/<host>/secrets.toml` is a derived
-artifact. Change it with `aegis set-placement`, then `aegis reencrypt`.
+artifact. Change it with `aegis host set-placement`, then `aegis reencrypt`.
 
 ## See Also
 

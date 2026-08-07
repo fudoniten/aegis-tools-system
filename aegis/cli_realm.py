@@ -91,7 +91,7 @@ class _InstantiatedRealm:
 @realm_app.command("init")
 def realm_init(
     realm: str = typer.Argument(..., help="Realm name (e.g., FUDO.ORG)"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain this realm serves"),
     kdc_role: str = typer.Option("kdc", "--kdc-role", help="Role whose members run the KDC"),
     etypes: Optional[str] = typer.Option(None, "--etypes", help="Comma-separated encryption types"),
@@ -101,6 +101,12 @@ def realm_init(
     Creates the realm master key and initial database, then stores both --
     plus a realm.toml recording the etypes and lifetimes actually used -- in
     src/kerberos/realms/<REALM>/.
+    \b
+    Examples:
+        aegis realm init SEA.FUDO.ORG --domain sea.fudo.org
+        aegis role init kdc                    then give some host the KDC role
+        aegis role add-host kdc rama
+        aegis build keytabs
     """
     repo = _repo(secrets_path)
     repo.ensure_structure()
@@ -160,11 +166,11 @@ def realm_init(
     if domain:
         typer.echo(f"  Domain:   {domain}")
     typer.echo(f"\nNext steps:")
-    typer.echo(f"  1. aegis init-role {kdc_role}                    # create the KDC role")
-    typer.echo(f"  2. aegis add-host-to-role {kdc_role} <hostname>  # add the KDC host")
+    typer.echo(f"  1. aegis role init {kdc_role}                    # create the KDC role")
+    typer.echo(f"  2. aegis role add-host {kdc_role} <hostname>  # add the KDC host")
     if not domain:
         typer.echo(f"  3. aegis realm set {realm} --add-domain <domain>")
-    typer.echo(f"  4. aegis build-keytabs")
+    typer.echo(f"  4. aegis build keytabs")
 
 
 @realm_app.command("import")
@@ -172,10 +178,18 @@ def realm_import(
     realm: str = typer.Argument(..., help="Realm name (e.g., SEA.FUDO.ORG)"),
     realm_key: Path = typer.Option(..., "--realm-key", help="Path to realm master key file"),
     principals_dir: Path = typer.Option(..., "--principals-dir", help="Directory containing principal key files"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain this realm serves"),
 ):
-    """Import an existing Kerberos realm and its principals."""
+    """Import an existing Kerberos realm and its principals.
+
+    \b
+    Example:
+        aegis realm import SEA.FUDO.ORG \\
+            --realm-key /secure/realm.key \\
+            --principals-dir /secure/principals/ \\
+            --domain sea.fudo.org
+    """
     repo = _repo(secrets_path)
     repo.ensure_structure()
 
@@ -234,7 +248,7 @@ def realm_import(
 
 @realm_app.command("list")
 def realm_list(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """List realms with their domains, trusts and member hosts."""
     repo = _repo(secrets_path)
@@ -269,7 +283,7 @@ def realm_list(
 @realm_app.command("show")
 def realm_show(
     realm: str = typer.Argument(..., help="Realm name"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Show a realm's principals, grouped by kind."""
     repo = _repo(secrets_path)
@@ -309,7 +323,7 @@ def realm_show(
 @realm_app.command("set")
 def realm_set(
     realm: str = typer.Argument(..., help="Realm name"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     add_domain: list[str] = typer.Option([], "--add-domain", help="Declare a domain this realm serves"),
     remove_domain: list[str] = typer.Option([], "--remove-domain", help="Stop serving a domain"),
     kdc_role: Optional[str] = typer.Option(None, "--kdc-role", help="Role whose members run the KDC"),
@@ -321,6 +335,9 @@ def realm_set(
 
     Declaring a domain is what makes hosts resolve to this realm: a host in
     the 'domain-<domain>' role belongs to whichever realm claims <domain>.
+    \b
+    Example:
+        aegis realm set SEA.FUDO.ORG --add-domain sea.fudo.org
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -366,14 +383,18 @@ def realm_set(
 def realm_add_principal(
     realm: str = typer.Argument(..., help="Realm name"),
     principal: str = typer.Argument(..., help="Principal, e.g. 'postgres/rama.sea.fudo.org'"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     password: Optional[str] = typer.Option(None, "--password", help="Set this password instead of a random key"),
     host: Optional[str] = typer.Option(None, "--host", help="Host whose keytab should include this principal"),
 ):
     """Add a principal to a realm.
 
-    Use --host to record which host's keytab it belongs in; 'aegis
-    build-keytabs' includes it when extracting that host's keytab.
+    Use --host to record which host's keytab it belongs in; 'aegis build
+    keytabs' includes it when extracting that host's keytab.
+    \b
+    Examples:
+        aegis realm add-principal SEA.FUDO.ORG postgres/rama.sea.fudo.org --host rama
+        aegis realm add-principal SEA.FUDO.ORG alice --password
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -407,14 +428,14 @@ def realm_add_principal(
     typer.echo(f"  Stored: {out}")
     if host:
         typer.echo(f"  Will be included in {host}'s keytab")
-        typer.echo(f"  Run: aegis build-keytabs --force --realm {realm}")
+        typer.echo(f"  Run: aegis build keytabs --force --realm {realm}")
 
 
 @realm_app.command("rekey-principal")
 def realm_rekey_principal(
     realm: str = typer.Argument(..., help="Realm name"),
     principal: str = typer.Argument(..., help="Principal to rotate"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     password: Optional[str] = typer.Option(None, "--password", help="Set this password instead of a random key"),
     prune: bool = typer.Option(False, "--prune", help="Drop the retained previous key instead of rotating"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
@@ -423,17 +444,18 @@ def realm_rekey_principal(
 
     A Kerberos keytab can hold several kvnos for the same principal, so a
     rotation does not have to be a hard cutover. This retains the pre-rotation
-    key under principals/previous/, and 'aegis build-keytabs' emits keytabs
+    key under principals/previous/, and 'aegis build keytabs' emits keytabs
     carrying both. Services keep authenticating with the old key until they
     receive the new keytab.
 
-    The rotation is finished by dropping the old key once every affected host
-    has been redeployed:
-
-        aegis realm rekey-principal REALM principal --prune
-
     'aegis check' reports principals with a retained key, so an unfinished
     rotation does not go unnoticed.
+    \b
+    Examples:
+        aegis realm rekey-principal SEA.FUDO.ORG host/rama.sea.fudo.org
+        aegis build keytabs --force --realm SEA.FUDO.ORG
+        ...redeploy the affected hosts, then finish the rotation:
+        aegis realm rekey-principal SEA.FUDO.ORG host/rama.sea.fudo.org --prune
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -457,7 +479,7 @@ def realm_rekey_principal(
                 raise typer.Abort()
         previous.unlink()
         typer.secho(f"Dropped previous key for {principal}", fg=typer.colors.GREEN)
-        typer.echo(f"  Rebuild keytabs: aegis build-keytabs --force --realm {realm}")
+        typer.echo(f"  Rebuild keytabs: aegis build keytabs --force --realm {realm}")
         return
 
     if not current.exists():
@@ -515,7 +537,7 @@ def realm_rekey_principal(
     typer.echo(f"  Previous key: {previous} (retained)")
     typer.echo("")
     typer.echo("Next:")
-    typer.echo(f"  1. aegis build-keytabs --force --realm {realm}")
+    typer.echo(f"  1. aegis build keytabs --force --realm {realm}")
     typer.echo("  2. deploy the affected hosts")
     typer.echo(f"  3. aegis realm rekey-principal {realm} {principal} --prune")
 
@@ -524,13 +546,17 @@ def realm_rekey_principal(
 def realm_remove_principal(
     realm: str = typer.Argument(..., help="Realm name"),
     principal: str = typer.Argument(..., help="Principal to remove"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
     """Remove a principal from a realm.
 
     Deleting the stored key does not invalidate keytabs already deployed to
     hosts; anything holding the old key keeps working until it is redeployed.
+    \b
+    Example:
+        aegis realm remove-principal SEA.FUDO.ORG postgres/old.sea.fudo.org
+        aegis build keytabs --force --realm SEA.FUDO.ORG
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -559,7 +585,7 @@ def realm_remove_principal(
     realm_mod.save(repo, realm_config)
 
     typer.secho(f"Removed {principal} from {realm}", fg=typer.colors.GREEN)
-    typer.echo(f"  Rebuild affected keytabs: aegis build-keytabs --force --realm {realm}")
+    typer.echo(f"  Rebuild affected keytabs: aegis build keytabs --force --realm {realm}")
 
 
 # =============================================================================
@@ -615,13 +641,17 @@ def _establish_one_way(
 def realm_trust(
     realm_a: str = typer.Argument(..., help="First realm"),
     realm_b: str = typer.Argument(..., help="Second realm"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     one_way: bool = typer.Option(False, "--one-way", help="Only let REALM_A's principals reach REALM_B"),
 ):
     """Establish cross-realm trust between two realms.
 
     Bidirectional by default: creates krbtgt/B@A and krbtgt/A@B, storing each
     in both realms so the two KDCs share the key.
+    \b
+    Examples:
+        aegis realm trust SEA.FUDO.ORG FUDO.ORG
+        aegis realm trust SEA.FUDO.ORG FUDO.ORG --one-way
     """
     repo = _repo(secrets_path)
     realm_mod.require_realm(repo, realm_a)
@@ -642,14 +672,14 @@ def realm_trust(
     )
     for principal in created:
         typer.echo(f"  {principal} (stored in both realms)")
-    typer.echo(f"\nRebuild the KDC bundles: aegis build-keytabs")
+    typer.echo(f"\nRebuild the KDC bundles: aegis build keytabs")
 
 
 @realm_app.command("untrust")
 def realm_untrust(
     realm_a: str = typer.Argument(..., help="First realm"),
     realm_b: str = typer.Argument(..., help="Second realm"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
     """Remove cross-realm trust between two realms."""
@@ -693,7 +723,7 @@ def realm_untrust(
         f"Removed trust between {realm_a} and {realm_b} ({removed} files)",
         fg=typer.colors.GREEN,
     )
-    typer.echo("Rebuild the KDC bundles: aegis build-keytabs")
+    typer.echo("Rebuild the KDC bundles: aegis build keytabs")
 
 
 # =============================================================================
@@ -703,13 +733,16 @@ def realm_untrust(
 @realm_app.command("export")
 def realm_export(
     realm: str = typer.Argument(..., help="Realm name"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Write the KDC principal bundle for a realm.
 
     Produces deploy/kdc/<REALM>-principals.age, encrypted for the realm's KDC
     role.  The aegis.kdc NixOS module decrypts it in phase 2 and merges it
     into the live database, preserving principals that exist only there.
+    \b
+    Example:
+        aegis realm export SEA.FUDO.ORG
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -721,7 +754,7 @@ def realm_export(
             f"Error: role '{realm_config.kdc_role}' has no public key at {kdc_pub_path}",
             err=True,
         )
-        typer.echo(f"Create it with: aegis init-role {realm_config.kdc_role}", err=True)
+        typer.echo(f"Create it with: aegis role init {realm_config.kdc_role}", err=True)
         raise typer.Exit(1)
 
     kdc_pubkey = kdc_pub_path.read_text().strip()

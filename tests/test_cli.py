@@ -33,7 +33,7 @@ def test_status_empty_repo(temp_secrets_repo: Path):
 def test_init_host(temp_secrets_repo: Path):
     """Initialize a host."""
     result = runner.invoke(app, [
-        "init-host", "testhost",
+        "host", "add", "testhost",
         "--secrets-path", str(temp_secrets_repo),
         "--services", "host,ssh,nfs"
     ])
@@ -50,8 +50,8 @@ def test_init_host(temp_secrets_repo: Path):
 
 def test_init_host_duplicate(temp_secrets_repo: Path):
     """Cannot initialize same host twice."""
-    runner.invoke(app, ["init-host", "testhost", "--secrets-path", str(temp_secrets_repo)])
-    result = runner.invoke(app, ["init-host", "testhost", "--secrets-path", str(temp_secrets_repo)])
+    runner.invoke(app, ["host", "add", "testhost", "--secrets-path", str(temp_secrets_repo)])
+    result = runner.invoke(app, ["host", "add", "testhost", "--secrets-path", str(temp_secrets_repo)])
 
     assert result.exit_code == 1
     assert "already configured" in result.stdout
@@ -60,7 +60,7 @@ def test_init_host_duplicate(temp_secrets_repo: Path):
 def test_add_user(temp_secrets_repo: Path):
     """Add a user with keypair generation."""
     result = runner.invoke(app, [
-        "add-user", "alice",
+        "user", "add", "alice",
         "--hosts", "server1,server2",
         "--secrets-path", str(temp_secrets_repo),
     ])
@@ -81,7 +81,7 @@ def test_add_user(temp_secrets_repo: Path):
 
 def test_list_empty(temp_secrets_repo: Path):
     """List command on empty repo."""
-    result = runner.invoke(app, ["list", "--secrets-path", str(temp_secrets_repo)])
+    result = runner.invoke(app, ["secret", "list", "--secrets-path", str(temp_secrets_repo)])
 
     assert result.exit_code == 0
 
@@ -89,15 +89,15 @@ def test_list_empty(temp_secrets_repo: Path):
 def test_list_with_host(temp_secrets_repo: Path):
     """List command with a host."""
     # Initialize a host first
-    runner.invoke(app, ["init-host", "testhost", "--secrets-path", str(temp_secrets_repo)])
+    runner.invoke(app, ["host", "add", "testhost", "--secrets-path", str(temp_secrets_repo)])
 
-    result = runner.invoke(app, ["list", "testhost", "--secrets-path", str(temp_secrets_repo)])
+    result = runner.invoke(app, ["secret", "list", "testhost", "--secrets-path", str(temp_secrets_repo)])
 
     assert result.exit_code == 0
     assert "testhost" in result.stdout
 
 
-# aegis new-secret ----------------------------------------------------------
+# aegis secret new ----------------------------------------------------------
 #
 # These tests use the conftest fixtures: `repo` (initialized secrets repo with
 # an admin key registered), `admin_key` (the matching age keypair), and the
@@ -107,7 +107,7 @@ def test_list_with_host(temp_secrets_repo: Path):
 def test_new_secret_requires_recipient(temp_secrets_repo: Path):
     """Refuses when neither --host nor --role is given."""
     result = runner.invoke(app, [
-        "new-secret", "demo",
+        "secret", "new", "demo",
         "--target", "/run/x",
         "--secrets-path", str(temp_secrets_repo),
     ])
@@ -119,7 +119,7 @@ def test_new_secret_requires_recipient(temp_secrets_repo: Path):
 def test_new_secret_refuses_unknown_host(temp_secrets_repo: Path):
     """Refuses --host that has no src/hosts/<h>.toml."""
     result = runner.invoke(app, [
-        "new-secret", "demo",
+        "secret", "new", "demo",
         "--host", "ghost",
         "--target", "/run/x",
         "--secrets-path", str(temp_secrets_repo),
@@ -127,7 +127,7 @@ def test_new_secret_refuses_unknown_host(temp_secrets_repo: Path):
 
     assert result.exit_code == 1
     assert "ghost" in _out(result)
-    assert "init-host" in _out(result)
+    assert "host add" in _out(result)
 
 
 def test_new_secret_writes_per_host_age(temp_secrets_repo: Path):
@@ -142,7 +142,7 @@ def test_new_secret_writes_per_host_age(temp_secrets_repo: Path):
     add_host(repo, "h3")
 
     result = runner.invoke(app, [
-        "new-secret", "demo-token",
+        "secret", "new", "demo-token",
         "--host", "h1", "--host", "h2", "--host", "h3",
         "--target", "/run/demo/token",
         "--secrets-path", str(temp_secrets_repo),
@@ -170,7 +170,7 @@ def test_new_secret_host_overwrite_requires_force(temp_secrets_repo: Path):
     add_host(repo, "h1")
 
     args = [
-        "new-secret", "demo",
+        "secret", "new", "demo",
         "--host", "h1",
         "--target", "/run/x",
         "--force",  # First run gets --force to bypass nothing; verifying
@@ -181,7 +181,7 @@ def test_new_secret_host_overwrite_requires_force(temp_secrets_repo: Path):
 
     # Second run without --force
     args2 = [
-        "new-secret", "demo",
+        "secret", "new", "demo",
         "--host", "h1",
         "--target", "/run/x",
         "--secrets-path", str(temp_secrets_repo),
@@ -198,14 +198,14 @@ def test_new_secret_host_overwrite_requires_force(temp_secrets_repo: Path):
 def test_new_secret_refuses_unconfigured_role(temp_secrets_repo: Path):
     """Refuses --role when no src/roles/<r>.toml exists."""
     result = runner.invoke(app, [
-        "new-secret", "demo",
+        "secret", "new", "demo",
         "--role", "no-such-role",
         "--target", "/run/x",
         "--secrets-path", str(temp_secrets_repo),
     ])
     assert result.exit_code == 1
     assert "no-such-role" in _out(result)
-    assert "init-role" in _out(result)
+    assert "role init" in _out(result)
 
 
 def test_new_secret_role_expands_to_members(
@@ -222,24 +222,24 @@ def test_new_secret_role_expands_to_members(
 
     # Init the role with empty member set, then add m1 and m2.
     r_init = runner.invoke(app, [
-        "init-role", "shared-role",
+        "role", "init", "shared-role",
         "--secrets-path", str(temp_secrets_repo)])
     assert r_init.exit_code == 0, _out([r_init])
 
     for h in ("m1", "m2"):
         r = runner.invoke(app, [
-            "add-host-to-role", "shared-role", h,
+            "role", "add-host", "shared-role", h,
             "--secrets-path", str(temp_secrets_repo)])
         assert r.exit_code == 0, _out([r])
 
     # Per-host role-key files for decrypt at boot.
     r_build = runner.invoke(app, [
-        "build-role-keys", "--secrets-path", str(temp_secrets_repo)])
+        "build", "role-keys", "--secrets-path", str(temp_secrets_repo)])
     assert r_build.exit_code == 0, _out([r_build])
 
     # Now create the secret.
     result = runner.invoke(app, [
-        "new-secret", "shared-token",
+        "secret", "new", "shared-token",
         "--role", "shared-role",
         "--target", "/run/shared/token",
         "--secrets-path", str(temp_secrets_repo),
@@ -263,19 +263,19 @@ def test_new_secret_host_and_role_are_unioned(
     add_host(repo, "extra")  # direct --host only
 
     runner.invoke(app, [
-        "init-role", "shared-role",
+        "role", "init", "shared-role",
         "--secrets-path", str(temp_secrets_repo)])
     r1 = runner.invoke(app, [
-        "add-host-to-role", "shared-role", "m1",
+        "role", "add-host", "shared-role", "m1",
         "--secrets-path", str(temp_secrets_repo)])
     assert r1.exit_code == 0, _out([r1])
     runner.invoke(app, [
-        "build-role-keys", "--secrets-path", str(temp_secrets_repo)])
+        "build", "role-keys", "--secrets-path", str(temp_secrets_repo)])
 
     # Run with --host m1 (already in role) AND --role shared-role. Duplicate
     # m1 must be deduped; extra must still be included.
     result = runner.invoke(app, [
-        "new-secret", "demo",
+        "secret", "new", "demo",
         "--host", "m1", "--host", "extra",
         "--role", "shared-role",
         "--target", "/run/x",
@@ -294,10 +294,10 @@ def test_new_secret_host_and_role_are_unioned(
 def test_new_secret_role_with_no_members_refuses(temp_secrets_repo: Path):
     """A role with no hosts produces no recipients; the command refuses."""
     runner.invoke(app, [
-        "init-role", "empty-role",
+        "role", "init", "empty-role",
         "--secrets-path", str(temp_secrets_repo)])
     result = runner.invoke(app, [
-        "new-secret", "demo",
+        "secret", "new", "demo",
         "--role", "empty-role",
         # Also pass a non-existent host to ensure the empty-role path is hit
         # before the per-host init check.

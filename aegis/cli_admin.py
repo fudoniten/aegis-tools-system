@@ -22,7 +22,7 @@ def _repo(secrets_path: Optional[Path]) -> config.SecretsRepo:
 
 @admin_app.command("list-keys")
 def list_keys(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Show the admin keys this repo encrypts for."""
     repo = _repo(secrets_path)
@@ -64,7 +64,7 @@ def list_keys(
 
 @admin_app.command("add-key")
 def add_key(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     name: str = typer.Option(..., "--name", "-n", help="Short label, e.g. 'laptop' or 'backup'"),
     public_key: Optional[str] = typer.Option(None, "--public-key", "-k", help="age public key (default: this machine's)"),
 ):
@@ -73,6 +73,10 @@ def add_key(
     New secrets are encrypted for every registered key.  Existing secrets are
     unchanged until you run 'aegis reencrypt', which extends the new key's
     reach without touching key material.
+    \b
+    Examples:
+        aegis admin add-key --name backup --public-key age1...
+        aegis reencrypt                    without this the new key reads nothing
     """
     repo = _repo(secrets_path)
     repo.ensure_structure()
@@ -128,11 +132,18 @@ def add_key(
 
 @admin_app.command("remove-key")
 def remove_key(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     name: str = typer.Option(..., "--name", "-n", help="Label of the key to remove"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
-    """Unregister an admin public key."""
+    """Unregister an admin public key.
+
+    Files stay encrypted for it until 'aegis reencrypt' runs, and whoever
+    holds it can read anything they already have a copy of.
+    \b
+    Example:
+        aegis admin remove-key --name old-laptop
+    """
     repo = _repo(secrets_path)
 
     path = repo.admin_keys_path() / f"{name}.pub"
@@ -165,7 +176,7 @@ def remove_key(
 
 @admin_app.command("migrate")
 def migrate(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Convert a legacy keys/admin.pub into the keys/admin/ directory form."""
     repo = _repo(secrets_path)
@@ -181,10 +192,15 @@ def migrate(
 
 @admin_app.command("init")
 def init(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     name: str = typer.Option("primary", "--name", "-n"),
 ):
-    """Generate an admin key for this machine if absent, and register it."""
+    """Generate an admin key for this machine if absent, and register it.
+
+    \b
+    Example:
+        aegis admin init
+    """
     repo = _repo(secrets_path)
     repo.ensure_structure()
 
