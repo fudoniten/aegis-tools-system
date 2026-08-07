@@ -16,10 +16,10 @@
 > README, which operate on that layout:
 >
 > ```bash
-> aegis init-role <role>                     # create the keypair
-> aegis add-host-to-role <role> <host>       # grant a host the key
-> aegis remove-host-from-role <role> <host>  # revoke the copy
-> aegis build-role-keys                      # reconcile every member
+> aegis role init <role>                     # create the keypair
+> aegis role add-host <role> <host>       # grant a host the key
+> aegis role remove-host <role> <host>  # revoke the copy
+> aegis build role-keys                      # reconcile every member
 > aegis check                                # report members missing a key
 > ```
 >
@@ -166,7 +166,7 @@ identity = "/run/aegis/roles/domain-fudo.org.key"
 Use the `add-host-to-role` command:
 
 ```bash
-aegis add-host-to-role domain-fudo.org newhost
+aegis role add-host domain-fudo.org newhost
 ```
 
 This:
@@ -182,7 +182,7 @@ This:
 Use the `remove-host-from-role` command:
 
 ```bash
-aegis remove-host-from-role domain-fudo.org oldhost \
+aegis role remove-host domain-fudo.org oldhost \
     --hosts=host1,host2,host3,remaining,hosts
 ```
 
@@ -262,7 +262,7 @@ rm /tmp/newapp-oidc.secret /tmp/role.key
 aegis sync-hosts  # Or manually create src/hosts/newhost.toml
 
 # 2. Add to domain role
-aegis add-host-to-role domain-fudo.org newhost
+aegis role add-host domain-fudo.org newhost
 
 # 3. Create host manifest with domain role reference
 cat > aegis-secrets/build/hosts/newhost/secrets.toml <<EOF
@@ -294,7 +294,7 @@ EOF
 REMAINING="host1,host2,host3"  # All except the one being removed
 
 # 2. Remove from domain
-aegis remove-host-from-role domain-fudo.org oldhost --hosts="$REMAINING"
+aegis role remove-host domain-fudo.org oldhost --hosts="$REMAINING"
 
 # 3. Remove host config
 rm aegis-secrets/src/hosts/oldhost.toml

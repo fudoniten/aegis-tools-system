@@ -6,18 +6,140 @@ from pathlib import Path
 from typing import Annotated, List, Optional
 
 import typer
+from typer.core import TyperGroup
 
 from . import admin, crypto, ssh, config
 from .errors import AegisError, MissingHostKeyError
 
+# Top-level help is a menu, not a manual: every entry is either a verb you run
+# daily or a noun you manage, and the panels say which.  Detail belongs in
+# 'aegis <group> --help', where it is asked for.
+PANEL_DAILY = "Daily use"
+PANEL_INVENTORY = "Inventory"
+PANEL_MATERIAL = "Key material"
+
+# Where each pre-grouping command name moved to.  The old spelling still
+# works -- with a note on stderr -- so scripts and muscle memory survive the
+# reshuffle.  Drop this table (and AegisGroup) once beta is over.
+LEGACY_COMMANDS: dict[str, list[str]] = {
+    "build-role-keys": ["build", "role-keys"],
+    "build-ssh-host-keys": ["build", "ssh-keys"],
+    "build-nexus-keys": ["build", "nexus-keys"],
+    "build-keytabs": ["build", "keytabs"],
+    "build-user-secrets": ["build", "user-secrets"],
+    "build-bundles": ["build", "bundles"],
+    "init-host": ["host", "add"],
+    "set-master-key": ["host", "set-key"],
+    "set-host-status": ["host", "set-status"],
+    "set-placement": ["host", "set-placement"],
+    "add-user": ["user", "add"],
+    "init-role": ["role", "init"],
+    "add-host-to-role": ["role", "add-host"],
+    "remove-host-from-role": ["role", "remove-host"],
+    "new-secret": ["secret", "new"],
+    "import-secret": ["secret", "import"],
+    "add-secret": ["secret", "add"],
+    "list": ["secret", "list"],
+    "import-ssh-host-keys": ["ssh", "import"],
+    "import-nexus-key": ["nexus", "import"],
+    "nexus-keygen": ["nexus", "keygen"],
+    "generate-dnssec-keys": ["dnssec", "generate"],
+    "import-dnssec-keys": ["dnssec", "import"],
+    "init-realm": ["realm", "init"],
+    "import-kerberos-realm": ["realm", "import"],
+}
+
+
+class OrderedGroup(TyperGroup):
+    """Group whose help follows a curated order.
+
+    Otherwise commands are listed in registration order, which is an artifact
+    of which module imported what.  Anything not named sorts last.
+    """
+
+    command_order: tuple[str, ...] = ()
+
+    def list_commands(self, ctx):
+        order = self.command_order
+        return sorted(
+            super().list_commands(ctx),
+            key=lambda name: (
+                order.index(name) if name in order else len(order), name),
+        )
+
+
+class AegisGroup(OrderedGroup):
+    """Top-level group that still answers to the pre-grouping command names."""
+
+    command_order = (
+        "build", "status", "check", "verify", "reencrypt",
+        "host", "user", "role", "secret",
+        "ssh", "nexus", "dnssec", "realm", "admin",
+    )
+
+    def resolve_command(self, ctx, args):
+        if args and args[0] in LEGACY_COMMANDS and args[0] not in self.commands:
+            old = args[0]
+            replacement = LEGACY_COMMANDS[old]
+            typer.secho(
+                f"note: 'aegis {old}' is now 'aegis {' '.join(replacement)}'",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            args = replacement + list(args[1:])
+        return super().resolve_command(ctx, args)
+
+
+class SecretGroup(OrderedGroup):
+    """'secret' reads best as create, then bring in, then look at."""
+
+    command_order = ("new", "import", "add", "list")
+
+
 app = typer.Typer(
     name="aegis",
+    cls=AegisGroup,
     help="Aegis System Administration Tools for secrets management.",
+    epilog="Run 'aegis COMMAND --help' to see what a group can do, e.g. 'aegis host --help'.",
     no_args_is_help=True,
     # Typer's rich traceback handler runs inside click's invocation, so an
     # AegisError reaching the top would be rendered as a full traceback before
     # main() ever saw it. Operator-facing failures deserve one line.
     pretty_exceptions_enable=False,
+)
+
+# The build group's own help comes from its callback's docstring, below.
+# A bare 'aegis build' runs that callback (the full build), so it must not be
+# turned into a help screen.
+build_app = typer.Typer(no_args_is_help=False)
+host_app = typer.Typer(
+    help="Declare hosts, their master keys, status and secret placement.",
+    no_args_is_help=True,
+)
+user_app = typer.Typer(
+    help="Declare users and the hosts they can reach.",
+    no_args_is_help=True,
+)
+role_app = typer.Typer(
+    help="Roles: shared keys held by a set of hosts.",
+    no_args_is_help=True,
+)
+secret_app = typer.Typer(
+    cls=SecretGroup,
+    help="Individual secrets: create, import, inspect.",
+    no_args_is_help=True,
+)
+ssh_app = typer.Typer(
+    help="SSH host keys (the identity sshd presents).",
+    no_args_is_help=True,
+)
+nexus_app = typer.Typer(
+    help="Nexus DDNS authentication keys.",
+    no_args_is_help=True,
+)
+dnssec_app = typer.Typer(
+    help="DNSSEC key signing keys.",
+    no_args_is_help=True,
 )
 
 
@@ -31,8 +153,16 @@ def _register_subcommands() -> None:
     from .cli_realm import realm_app
     from . import cli_check
 
-    app.add_typer(admin_app, name="admin")
-    app.add_typer(realm_app, name="realm")
+    app.add_typer(build_app, name="build", rich_help_panel=PANEL_DAILY)
+    app.add_typer(host_app, name="host", rich_help_panel=PANEL_INVENTORY)
+    app.add_typer(user_app, name="user", rich_help_panel=PANEL_INVENTORY)
+    app.add_typer(role_app, name="role", rich_help_panel=PANEL_INVENTORY)
+    app.add_typer(secret_app, name="secret", rich_help_panel=PANEL_INVENTORY)
+    app.add_typer(ssh_app, name="ssh", rich_help_panel=PANEL_MATERIAL)
+    app.add_typer(nexus_app, name="nexus", rich_help_panel=PANEL_MATERIAL)
+    app.add_typer(dnssec_app, name="dnssec", rich_help_panel=PANEL_MATERIAL)
+    app.add_typer(admin_app, name="admin", rich_help_panel=PANEL_MATERIAL)
+    app.add_typer(realm_app, name="realm", rich_help_panel=PANEL_MATERIAL)
     cli_check.register(app)
 
 
@@ -179,32 +309,42 @@ def ensure_host_config(repo: config.SecretsRepo, hostname: str) -> config.HostCo
 
 
 # =============================================================================
-# Build Commands
+# aegis build ...
 # =============================================================================
 
-@app.command()
+@build_app.callback(invoke_without_command=True)
 def build(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to aegis-secrets repo"),
+    ctx: typer.Context,
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be done"),
 ):
-    """Run full build: generate missing secrets for all configured hosts.
+    """Generate missing secrets for all configured hosts.
 
-    This will:
-    1. Generate SSH host keys for OpenSSH
-    2. Generate Nexus DDNS keys
-    3. Generate Kerberos keytabs
-    4. Build user secrets
+    With no subcommand this runs every step, in order:
+    role keys, SSH host keys, Nexus keys, keytabs, user secrets.
+    Name a subcommand to run one of them on its own.
+
+    Nothing here replaces key material that already exists; see
+    'aegis build ssh-keys --rotate' for that, and 'aegis reencrypt'
+    to change who a secret is encrypted for.
     """
-    repo = get_secrets_repo(secrets_path)
+    if ctx.invoked_subcommand is not None:
+        return
+    _build_everything(secrets_path, dry_run)
+
+
+def _build_everything(secrets_path: Optional[Path], dry_run: bool) -> None:
+    """Run every build step in dependency order."""
+    get_secrets_repo(secrets_path)  # fail early if the repo cannot be found
 
     typer.echo("Running full build...")
 
     if dry_run:
-        typer.echo("  [dry-run] Would run: build-role-keys")
-        typer.echo("  [dry-run] Would run: build-ssh-host-keys")
-        typer.echo("  [dry-run] Would run: build-nexus-keys")
-        typer.echo("  [dry-run] Would run: build-keytabs")
-        typer.echo("  [dry-run] Would run: build-user-secrets")
+        typer.echo("  [dry-run] Would run: build role-keys")
+        typer.echo("  [dry-run] Would run: build ssh-keys")
+        typer.echo("  [dry-run] Would run: build nexus-keys")
+        typer.echo("  [dry-run] Would run: build keytabs")
+        typer.echo("  [dry-run] Would run: build user-secrets")
         return
 
     # Run each build step
@@ -226,9 +366,20 @@ def build(
     typer.secho("\nBuild complete!", fg=typer.colors.GREEN)
 
 
-@app.command("build-role-keys")
+@build_app.command("all")
+def build_all(
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be done"),
+):
+    """Run every build step (the same as bare 'aegis build')."""
+    # Spelled out so the full build is listed in 'aegis build --help' rather
+    # than only mentioned in the group's description.
+    _build_everything(secrets_path, dry_run)
+
+
+@build_app.command("role-keys")
 def build_role_keys(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
 ):
     """Ensure every role member host has its per-host role key file.
@@ -306,9 +457,9 @@ def build_role_keys(
                 typer.echo(f"  {hostname}: roles={', '.join(roles)}")
 
 
-@app.command("build-ssh-host-keys")
+@build_app.command("ssh-keys")
 def build_ssh_host_keys(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     rotate: Annotated[bool, typer.Option("--rotate", "--force", "-f", help="DESTRUCTIVE: generate NEW key material, replacing the host's SSH identity")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt for --rotate")] = False,
@@ -325,7 +476,7 @@ def build_ssh_host_keys(
     as plaintext .pub files alongside for use in DNS or known_hosts files.
 
     Deployment metadata comes from src/hosts/<hostname>.toml (see
-    'aegis set-placement') and is written to deploy/hosts/<hostname>/secrets.toml
+    'aegis host set-placement') and is written to deploy/hosts/<hostname>/secrets.toml
     for NixOS to import.
 
     Also generates SSHFP DNS records for trust establishment.
@@ -339,7 +490,7 @@ def build_ssh_host_keys(
 
     hosts = repo.list_deploying_hosts()
     if not hosts:
-        typer.echo("No hosts configured. Use 'aegis init-host' first.")
+        typer.echo("No hosts configured. Use 'aegis host add' first.")
         return
 
     admin_keys = admin_recipients(repo)
@@ -411,9 +562,9 @@ def build_ssh_host_keys(
             typer.echo(f"      {record}")
 
 
-@app.command("build-nexus-keys")
+@build_app.command("nexus-keys")
 def build_nexus_keys(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     rotate: Annotated[bool, typer.Option("--rotate", "--force", "-f", help="DESTRUCTIVE: generate a NEW key, invalidating the host's DDNS registration")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt for --rotate")] = False,
@@ -426,7 +577,7 @@ def build_nexus_keys(
 
     Each host gets a unique key stored in deploy/hosts/<hostname>/nexus-key.age.
     Deployment metadata comes from src/hosts/<hostname>.toml (see
-    'aegis set-placement') and is written to secrets.toml for NixOS to import.
+    'aegis host set-placement') and is written to secrets.toml for NixOS to import.
 
     To re-encrypt an existing key for a changed recipient set, use
     'aegis reencrypt' -- NOT --rotate, which mints a new key.
@@ -437,7 +588,7 @@ def build_nexus_keys(
 
     hosts = repo.list_deploying_hosts()
     if not hosts:
-        typer.echo("No hosts configured. Use 'aegis init-host' first.")
+        typer.echo("No hosts configured. Use 'aegis host add' first.")
         return
 
     admin_keys = admin_recipients(repo)
@@ -508,9 +659,9 @@ def build_nexus_keys(
         typer.echo(f"    Algorithm: {algo}")
 
 
-@app.command("build-keytabs")
+@build_app.command("keytabs")
 def build_keytabs(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     force: Annotated[bool, typer.Option("--force", "-f", help="Re-extract keytabs that already exist (does not change principal keys)")] = False,
     realm_filter: Annotated[Optional[str], typer.Option("--realm", help="Only process this realm")] = None,
@@ -583,7 +734,7 @@ def build_keytabs(
                 f"{kdc_pub_path}.\n"
                 f"  Keytabs built now will NOT be readable by the KDC, and "
                 f"re-running will not fix them.\n"
-                f"  Create it first: aegis init-role {realm_config.kdc_role}",
+                f"  Create it first: aegis role init {realm_config.kdc_role}",
                 fg=typer.colors.YELLOW,
             )
 
@@ -822,9 +973,9 @@ def _sync_keytab_manifest(repo: config.SecretsRepo, hostname: str) -> None:
     host_secrets.save_host_manifest(repo.deploy_path, manifest)
 
 
-@app.command("build-user-secrets")
+@build_app.command("user-secrets")
 def build_user_secrets(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     user: Optional[str] = typer.Option(None, "--user", "-u", help="Process only this user"),
 ):
@@ -849,7 +1000,7 @@ def build_user_secrets(
         users = repo.list_users()
     
     if not users:
-        typer.echo("No users configured. Use 'aegis add-user' first.")
+        typer.echo("No users configured. Use 'aegis user add' first.")
         return
     
     for username in users:
@@ -1059,9 +1210,9 @@ def _process_user_secrets_dir_with_manifest(
     return count
 
 
-@app.command("build-bundles")
+@build_app.command("bundles")
 def build_bundles(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
 ):
     """Package all secrets into host bundles."""
@@ -1070,14 +1221,14 @@ def build_bundles(
 
 
 # =============================================================================
-# Import Commands
+# aegis ssh import / nexus import / secret import / secret new
 # =============================================================================
 
-@app.command("import-ssh-host-keys")
+@ssh_app.command("import")
 def import_ssh_host_keys(
     hostname: str = typer.Argument(..., help="Hostname to import keys for"),
     key_files: list[Path] = typer.Option([], "--key", help="Path to SSH private key file (type auto-detected, can specify multiple)"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     target_dir: str = typer.Option("/run/aegis/ssh", "--target-dir", help="Target directory for SSH keys"),
     user: str = typer.Option("root", "--user", help="Owner user for key files"),
     group: str = typer.Option("root", "--group", help="Owner group for key files"),
@@ -1099,7 +1250,7 @@ def import_ssh_host_keys(
     - Writes deployment metadata to secrets.toml for NixOS
 
     Example:
-        aegis import-ssh-host-keys lambda \\
+        aegis ssh import lambda \\
             --key /secure/lambda.ed25519.key \\
             --key /secure/lambda.ecdsa.key
     """
@@ -1191,11 +1342,11 @@ def import_ssh_host_keys(
     typer.echo(f"  These keys are for OpenSSH server identity.")
 
 
-@app.command("import-nexus-key")
+@nexus_app.command("import")
 def import_nexus_key(
     hostname: str = typer.Argument(..., help="Hostname to import key for"),
     key_file: Path = typer.Option(..., "--file", help="Path to nexus HMAC key file"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     target: str = typer.Option("/run/aegis/nexus-key", "--target", help="Target path for nexus key"),
     user: str = typer.Option("root", "--user", help="Owner user"),
     group: str = typer.Option("root", "--group", help="Owner group"),
@@ -1209,7 +1360,7 @@ def import_nexus_key(
     Deployment metadata is written to secrets.toml for NixOS to import.
     
     Example:
-        aegis import-nexus-key lambda --file /secure/lambda.nexus.hmac
+        aegis nexus import lambda --file /secure/lambda.nexus.hmac
     """
     from . import nexus
 
@@ -1271,23 +1422,7 @@ def import_nexus_key(
     typer.echo(f"  Encrypted for: {hostname} (host) + admin")
 
 
-@app.command("import-kerberos-realm", deprecated=True)
-def import_kerberos_realm(
-    realm: str = typer.Argument(..., help="Realm name (e.g., SEA.FUDO.ORG)"),
-    realm_key: Path = typer.Option(..., "--realm-key", help="Path to realm master key file"),
-    principals_dir: Path = typer.Option(..., "--principals-dir", help="Path to directory containing principal key files"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain this realm serves"),
-):
-    """Deprecated alias for 'aegis realm import'."""
-    from .cli_realm import realm_import
-
-    realm_import(realm=realm, realm_key=realm_key, principals_dir=principals_dir,
-                 secrets_path=secrets_path, domain=domain)
-
-
-
-@app.command("import-secret")
+@secret_app.command("import")
 def import_secret(
     hostname: str = typer.Argument(..., help="Hostname this secret belongs to"),
     secret_name: str = typer.Argument(..., help="Name of the secret"),
@@ -1296,7 +1431,7 @@ def import_secret(
     user: str = typer.Option("root", "--user", help="Owner user on target host"),
     group: str = typer.Option("root", "--group", help="Owner group on target host"),
     mode: str = typer.Option("0400", "--mode", help="File permissions (e.g., 0600)"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Import a generic secret for a host.
     
@@ -1305,7 +1440,7 @@ def import_secret(
     about target path, ownership, and permissions will be stored in secrets.toml.
     
     Example:
-        aegis import-secret lambda my-service-token \\
+        aegis secret import lambda my-service-token \\
             --file /secure/lambda-service.token \\
             --target /run/myservice/token \\
             --user myservice --group myservice --mode 0600
@@ -1363,9 +1498,11 @@ def import_secret(
     typer.echo(f"  Mode: {mode}")
 
 
-@app.command("new-secret")
+@secret_app.command("new")
 def new_secret(
-    name: str = typer.Argument(..., help="Secret name (filename and src/ hosts/roles [<h>].toml [extra_secrets.<name>] key)"),
+    # Rich reads square brackets as markup, so the extra_secrets key is
+    # spelled out in the docstring instead of here.
+    name: str = typer.Argument(..., help="Secret name; also its key under extra_secrets in src/"),
     host: List[str] = typer.Option([], "--host", "-H", help="Recipient host (repeatable). Each host gets its own .age file encrypted to that host's master key."),
     role: List[str] = typer.Option([], "--role", "-R", help="Recipient role (repeatable). The secret is encrypted for every current member of the role."),
     target: str = typer.Option(..., "--target", help="Target path on each recipient host, e.g. /run/<service>/<file>"),
@@ -1376,39 +1513,34 @@ def new_secret(
     fmt: str = typer.Option("hex", "--format", help="hex | base64 | base64url | alphanumeric | raw [default: hex]"),
     charset: Optional[str] = typer.Option(None, "--charset", help="Alphabet for --format=alphanumeric. A literal string, or one of: " + ", ".join(crypto.ALPHABET_PRESETS.keys())),
     force: bool = typer.Option(False, "--force", help="Overwrite existing encrypted outputs (DESTRUCTIVE: services reading the old value will lose access)"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Generate a fresh random secret and encrypt it for one or more recipients.
 
-    Equivalent to: openssl rand + aegis import-secret for each recipient, with
-    the plaintext never touching the filesystem. The same plaintext is
-    encrypted once per recipient host; each gets its own .age file whose
-    recipient set depends on whether the host was named explicitly or
-    resolved from a role.
+    Equivalent to: openssl rand + 'aegis secret import' for each recipient,
+    with the plaintext never touching the filesystem. The same plaintext is
+    encrypted once per recipient host; each gets its own .age file. NAME is
+    also the key it takes under 'extra_secrets' in src/.
 
-    Recipient selection:
+    \b
+    Recipient selection (at least one is required; they may be combined):
+      --host <h>  encrypts to that host's master key plus the admin set.
+      --role <r>  encrypts, for every current member of src/roles/<r>.toml,
+                  to the member's master key, the role's public key and the
+                  admin set -- so a host added later by 'aegis role add-host'
+                  decrypts on next deploy without a rebuild.
 
-    - ``--host <h>`` names a host directly. The .age file is encrypted to
-      that host's master key plus the admin set.
-    - ``--role <r>`` resolves to every current member of ``src/roles/<r>.toml``.
-      The .age file for each member host is encrypted to the host's master
-      key, the role's public key, and the admin set, so that future members
-      added via ``aegis add-host-to-role`` decrypt on next deploy without a
-      rebuild.
-
-    At least one of ``--host`` / ``--role`` is required; they may be combined.
-
-    The plaintext is not printed. ``aegis verify <host>`` is the canonical way
-    to confirm a host can decrypt. Rotation requires re-invoking with
-    ``--force`` and a manual restart of any service reading the old secret.
+    The plaintext is not printed; 'aegis verify <host>' is how you confirm a
+    host can decrypt. Rotation means re-invoking with --force, then restarting
+    whatever service still holds the old value.
 
     Examples:
-        aegis new-secret aurelius-ingest-token \\
+        aegis secret new aurelius-ingest-token \\
             --host aedile --host nostromo --host fimbria \\
             --target /run/aurelius/token \\
             --user aurelius --group aurelius --mode 0400
 
-        aegis new-secret dns-key-signing-secret \\
+        aegis secret new dns-key-signing-secret \\
             --role dns-master-fudo.org \\
             --target /run/nsd/signing.key
     """
@@ -1434,7 +1566,7 @@ def new_secret(
         if role_cfg is None:
             typer.echo(
                 f"Error: role '{r}' is not configured. Run "
-                f"'aegis init-role {r}' first.",
+                f"'aegis role init {r}' first.",
                 err=True,
             )
             raise typer.Exit(1)
@@ -1442,7 +1574,7 @@ def new_secret(
         if not role_pub_path.exists():
             typer.echo(
                 f"Error: role '{r}' has no public key at {role_pub_path}. "
-                f"Re-run 'aegis init-role {r}'.",
+                f"Re-run 'aegis role init {r}'.",
                 err=True,
             )
             raise typer.Exit(1)
@@ -1481,14 +1613,14 @@ def new_secret(
         if not host_cfg:
             typer.echo(
                 f"Error: host '{h}' is not initialised; run "
-                f"'aegis init-host {h}' first.",
+                f"'aegis host add {h}' first.",
                 err=True,
             )
             raise typer.Exit(1)
         # The host's per-host role-key file is created by
-        # `aegis add-host-to-role`, not here. If the named role resolved
+        # `aegis role add-host`, not here. If the named role resolved
         # to this host but the per-host role key is missing, the host
-        # will not be able to decrypt until `aegis build-role-keys` is
+        # will not be able to decrypt until `aegis build role-keys` is
         # run. Surface that explicitly rather than silently.
         for r in role:
             if h in role_members[r]:
@@ -1500,7 +1632,7 @@ def new_secret(
                         f"Error: host '{h}' is a member of role '{r}' but "
                         f"the per-host role key "
                         f"{per_host_role_key} is missing. Run "
-                        f"'aegis build-role-keys' for host '{h}' "
+                        f"'aegis build role-keys' for host '{h}' "
                         f"first; the secret will be decryptable after that.",
                         err=True,
                     )
@@ -1570,7 +1702,7 @@ def new_secret(
 
 
 # =============================================================================
-# DNSSEC Commands
+# aegis dnssec ...
 # =============================================================================
 
 def _ensure_dns_role(
@@ -1652,12 +1784,12 @@ def _add_host_to_role_impl(
         repo.set_role_config(role_config)
 
 
-@app.command("generate-dnssec-keys")
+@dnssec_app.command("generate")
 def generate_dnssec_keys(
     domain: str = typer.Argument(..., help="Domain name (e.g., fudo.org)"),
     hostname: str = typer.Option(..., "--host", "-h", help="DNS master server hostname"),
     algorithm: str = typer.Option("ECDSAP256SHA256", "--algorithm", "-a", help="DNSSEC algorithm"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
     target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Target directory for keys (default: /var/lib/dnssec/<domain>)"),
     user: str = typer.Option("root", "--user", help="Owner user for key files"),
@@ -1673,8 +1805,8 @@ def generate_dnssec_keys(
     Requires ldns-keygen to be available in PATH.
     
     Example:
-        aegis generate-dnssec-keys fudo.org --host polaris
-        aegis generate-dnssec-keys fudo.org --host polaris --algorithm ED25519
+        aegis dnssec generate fudo.org --host polaris
+        aegis dnssec generate fudo.org --host polaris --algorithm ED25519
     """
     from . import dnssec
     import tempfile
@@ -1781,12 +1913,12 @@ def generate_dnssec_keys(
         typer.echo(f"  {ds_record}")
 
 
-@app.command("import-dnssec-keys")
+@dnssec_app.command("import")
 def import_dnssec_keys(
     domain: str = typer.Argument(..., help="Domain name (e.g., fudo.org)"),
     keys_dir: Path = typer.Option(..., "--keys-dir", "-k", help="Directory containing DNSSEC key files"),
     hostname: str = typer.Option(..., "--host", "-h", help="DNS master server hostname"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing keys"),
     target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Target directory for keys (default: /var/lib/dnssec/<domain>)"),
     user: str = typer.Option("root", "--user", help="Owner user for key files"),
@@ -1805,7 +1937,7 @@ def import_dnssec_keys(
     Deployment metadata is written to secrets.toml for NixOS to import.
     
     Example:
-        aegis import-dnssec-keys fudo.org --keys-dir /secrets/dnssec/fudo.org/ --host polaris
+        aegis dnssec import fudo.org --keys-dir /secrets/dnssec/fudo.org/ --host polaris
     """
     from . import dnssec
     
@@ -1911,14 +2043,14 @@ def import_dnssec_keys(
 
 
 # =============================================================================
-# Configuration Commands
+# aegis host ... / aegis user add
 # =============================================================================
 
 
-@app.command("init-host")
+@host_app.command("add")
 def init_host(
     hostname: str = typer.Argument(..., help="Hostname to initialize"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain (e.g. sea.fudo.org); adds the host to the domain-<domain> role"),
     services: str = typer.Option("host,ssh", "--services", help="Comma-separated Kerberos services"),
 ):
@@ -1961,25 +2093,25 @@ def init_host(
         role_config = repo.get_role_config(role_name)
         if role_config is None:
             typer.echo(f"  Domain: {domain} (role {role_name} does not exist yet)")
-            typer.echo(f"    Create it with: aegis init-role {role_name}")
+            typer.echo(f"    Create it with: aegis role init {role_name}")
         else:
             if hostname not in role_config.hosts:
                 role_config.hosts = sorted(role_config.hosts + [hostname])
                 repo.set_role_config(role_config)
             typer.echo(f"  Domain: {domain} (added to role {role_name})")
-            typer.echo(f"    Grant the key with: aegis add-host-to-role {role_name} {hostname}")
+            typer.echo(f"    Grant the key with: aegis role add-host {role_name} {hostname}")
 
     typer.echo("")
     typer.echo("Next:")
-    typer.echo(f"  1. Set master key: aegis set-master-key {hostname} --public-key 'age1...'")
+    typer.echo(f"  1. Set master key: aegis host set-key {hostname} --public-key 'age1...'")
     typer.echo("  2. Build secrets:  aegis build")
 
 
-@app.command("set-master-key")
+@host_app.command("set-key")
 def set_master_key(
     hostname: str = typer.Argument(..., help="Hostname to set master key for"),
     public_key: str = typer.Option(..., "--public-key", "-k", help="age public key (e.g., 'age1...')"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Set the age public key for a host.
 
@@ -1994,10 +2126,10 @@ def set_master_key(
     Typical setup:
     1. Host has age private key at /state/master-key/key (persistent storage)
     2. Extract the public key: age-keygen -y /state/master-key/key
-    3. Set it here: aegis set-master-key lambda --public-key "age1..."
+    3. Set it here: aegis host set-key lambda --public-key "age1..."
 
     Example:
-        aegis set-master-key lambda --public-key "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+        aegis host set-key lambda --public-key "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
     """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
@@ -2034,10 +2166,10 @@ def set_master_key(
             f"will be built for it until that changes.",
             fg=typer.colors.YELLOW,
         )
-        typer.echo(f"  aegis set-host-status {hostname} active")
+        typer.echo(f"  aegis host set-status {hostname} active")
 
 
-@app.command("set-host-status")
+@host_app.command("set-status")
 def set_host_status(
     hostname: str = typer.Argument(..., help="Hostname"),
     status: str = typer.Argument(
@@ -2046,7 +2178,7 @@ def set_host_status(
     ),
     note: Optional[str] = typer.Option(
         None, "--note", "-n", help="Why, recorded alongside the status"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Record whether Aegis manages a host, and why not if it doesn't.
 
@@ -2067,7 +2199,7 @@ def set_host_status(
     Only 'active' hosts are built for or encrypted to.
 
     Example:
-        aegis set-host-status pselby-work retired --note "laptop returned"
+        aegis host set-status pselby-work retired --note "laptop returned"
     """
     repo = get_secrets_repo(secrets_path)
 
@@ -2113,12 +2245,12 @@ def set_host_status(
             )
 
 
-@app.command("add-user")
+@user_app.command("add")
 def add_user(
     username: str = typer.Argument(..., help="Username"),
     hosts: str = typer.Option(..., "--hosts", "-h", help="Comma-separated list of hosts user can access"),
     repo_url: Optional[str] = typer.Option(None, "--repo-url", help="URL of user's secrets repo"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Add a user and generate their keypair."""
     repo = get_secrets_repo(secrets_path)
@@ -2163,14 +2295,20 @@ def add_user(
     typer.echo(keypair.public_key)
 
 
-@app.command("add-secret")
+@secret_app.command("add")
 def add_secret(
     hostname: str = typer.Argument(..., help="Target hostname"),
     name: str = typer.Argument(..., help="Secret name"),
     file: Path = typer.Argument(..., help="File containing the secret"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
-    """Add a user-provided secret for a host."""
+    """Encrypt a file for a host, without placement metadata.
+
+    The result lands in deploy/hosts/<host>/<name>.age but nothing records
+    where it should be written on the host, so NixOS will not deploy it.
+    Use 'aegis secret import' unless you are going to declare placement
+    separately with 'aegis host set-placement'.
+    """
     repo = get_secrets_repo(secrets_path)
     if not file.exists():
         typer.echo(f"Error: File not found: {file}", err=True)
@@ -2195,32 +2333,18 @@ def add_secret(
 
 
 # =============================================================================
-# Role Commands
+# aegis role ...
 # =============================================================================
 
-@app.command("init-realm", deprecated=True)
-def init_realm(
-    realm: str = typer.Argument(..., help="Realm name (e.g., FUDO.ORG)"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
-    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain this realm serves"),
-):
-    """Deprecated alias for 'aegis realm init'."""
-    from .cli_realm import realm_init
-
-    realm_init(realm=realm, secrets_path=secrets_path, domain=domain,
-               kdc_role="kdc", etypes=None)
-
-
-
-@app.command("init-role")
+@role_app.command("init")
 def init_role(
     role: str = typer.Argument(..., help="Role name (e.g., kdc, dns)"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Create a role keypair with no initial host members.
 
     The role private key is encrypted for the admin and stored in
-    keys/roles/<role>.age.  Use 'aegis add-host-to-role' to grant hosts
+    keys/roles/<role>.age.  Use 'aegis role add-host' to grant hosts
     access to this role.
     """
     repo = get_secrets_repo(secrets_path)
@@ -2253,14 +2377,14 @@ def init_role(
     typer.secho(f"Created role: {role}", fg=typer.colors.GREEN)
     typer.echo(f"  Public key: {keypair.public_key}")
     typer.echo(f"  Role key:   {role_key_path}")
-    typer.echo(f"\nNext: aegis add-host-to-role {role} <hostname>")
+    typer.echo(f"\nNext: aegis role add-host {role} <hostname>")
 
 
-@app.command("add-host-to-role")
+@role_app.command("add-host")
 def add_host_to_role(
     role: str = typer.Argument(..., help="Role name"),
     hostname: str = typer.Argument(..., help="Hostname to add to the role"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Add a host to a role, giving it access to the role's secrets.
 
@@ -2272,7 +2396,7 @@ def add_host_to_role(
 
     role_config = repo.get_role_config(role)
     if not role_config:
-        typer.echo(f"Error: Role {role} not found. Use 'aegis init-role {role}' first.", err=True)
+        typer.echo(f"Error: Role {role} not found. Use 'aegis role init {role}' first.", err=True)
         raise typer.Exit(1)
 
     if hostname in role_config.hosts:
@@ -2294,13 +2418,13 @@ def add_host_to_role(
             fg=typer.colors.YELLOW,
         )
         typer.echo(
-            f"  It will get one from 'aegis build-role-keys' once it is active.")
+            f"  It will get one from 'aegis build role-keys' once it is active.")
         return
 
     role_key_path = repo.role_key_path(role)
     if not role_key_path.exists():
         typer.echo(f"Error: Role key not found: {role_key_path}", err=True)
-        typer.echo(f"Re-initialize the role with: aegis init-role {role}", err=True)
+        typer.echo(f"Re-initialize the role with: aegis role init {role}", err=True)
         raise typer.Exit(1)
 
     typer.echo(f"Adding {hostname} to role {role}...")
@@ -2326,11 +2450,11 @@ def add_host_to_role(
     typer.echo(f"  Members:  {', '.join(role_config.hosts)}")
 
 
-@app.command("remove-host-from-role")
+@role_app.command("remove-host")
 def remove_host_from_role(
     role: str = typer.Argument(..., help="Role name"),
     hostname: str = typer.Argument(..., help="Hostname to remove from the role"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Remove a host from a role and delete its per-host role key file."""
     repo = get_secrets_repo(secrets_path)
@@ -2358,10 +2482,10 @@ def remove_host_from_role(
 
 
 # =============================================================================
-# Nexus DDNS Commands
+# aegis nexus keygen
 # =============================================================================
 
-@app.command("nexus-keygen")
+@nexus_app.command("keygen")
 def nexus_keygen(
     output: Path = typer.Argument(..., help="Output file path for the key"),
     algorithm: str = typer.Option("HmacSHA512", "--algorithm", "-a", help="HMAC algorithm (e.g., HmacSHA256, HmacSHA512)"),
@@ -2374,8 +2498,8 @@ def nexus_keygen(
     The key is written in the format: ALGORITHM:BASE64_ENCODED_KEY
     
     Example:
-        aegis nexus-keygen server.key
-        aegis nexus-keygen client.key --algorithm HmacSHA256
+        aegis nexus keygen server.key
+        aegis nexus keygen client.key --algorithm HmacSHA256
     """
     from . import nexus
     
@@ -2402,14 +2526,18 @@ def nexus_keygen(
 
 
 # =============================================================================
-# Utility Commands
+# aegis status / verify / secret list / host set-placement
 # =============================================================================
 
-@app.command("status")
+@app.command("status", rich_help_panel=PANEL_DAILY)
 def status(
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
-    """Show configuration and build status for all hosts, users, and roles."""
+    """Show what is configured, and what still needs building.
+
+    Covers every host, user and role in the repo.  For drift between what
+    src/ declares and what deploy/ actually holds, use 'aegis check'.
+    """
     from . import host_secrets
 
     repo = get_secrets_repo(secrets_path)
@@ -2470,10 +2598,10 @@ def status(
             )
 
 
-@app.command("list")
+@secret_app.command("list")
 def list_secrets(
     hostname: Optional[str] = typer.Argument(None, help="Hostname (optional, list all if omitted)"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """List secrets for a host or all hosts."""
     repo = get_secrets_repo(secrets_path)
@@ -2504,10 +2632,10 @@ def list_secrets(
             typer.echo(f"  {rel} ({size} bytes)")
 
 
-@app.command("verify")
+@app.command("verify", rich_help_panel=PANEL_DAILY)
 def verify(
     hostname: str = typer.Argument(..., help="Hostname to verify"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Verify a host can decrypt its secrets."""
     repo = get_secrets_repo(secrets_path)
@@ -2554,11 +2682,11 @@ def verify(
                     fg=typer.colors.YELLOW)
 
 
-@app.command("set-placement")
+@host_app.command("set-placement")
 def set_placement(
     hostname: str = typer.Argument(..., help="Hostname"),
     kind: str = typer.Argument(..., help="'ssh-host-keys', 'keytab', 'nexus-key', or 'secret:<name>'"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     target: Optional[str] = typer.Option(None, "--target", help="Destination path on the host"),
     target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Destination directory (SSH keys)"),
     user: Optional[str] = typer.Option(None, "--user", help="Owner user"),
@@ -2577,7 +2705,7 @@ def set_placement(
     Run 'aegis reencrypt --host <host>' afterwards to refresh the manifest.
 
     Example:
-        aegis set-placement rama secret:db-password \\
+        aegis host set-placement rama secret:db-password \\
             --target /run/postgresql/password --user postgres --mode 0400
     """
     repo = get_secrets_repo(secrets_path)
@@ -2594,7 +2722,7 @@ def set_placement(
     host_config = repo.get_host_config(hostname)
     if host_config is None:
         typer.echo(f"Error: host {hostname} is not configured", err=True)
-        typer.echo(f"Add it with: aegis init-host {hostname}", err=True)
+        typer.echo(f"Add it with: aegis host add {hostname}", err=True)
         raise typer.Exit(1)
 
     if clear:

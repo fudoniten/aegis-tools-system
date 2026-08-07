@@ -146,8 +146,8 @@ def _check_hosts(
             report.error(
                 scope,
                 "no master key set",
-                f"aegis set-master-key {hostname} --public-key 'age1...', or "
-                f"record why it has none: aegis set-host-status {hostname} pending",
+                f"aegis host set-key {hostname} --public-key 'age1...', or "
+                f"record why it has none: aegis host set-status {hostname} pending",
             )
             continue
 
@@ -195,7 +195,7 @@ def _check_hosts(
                 scope,
                 f"manifest roles {manifest.roles or '[]'} do not match role key "
                 f"files {sorted(role_files) or '[]'}",
-                "aegis build-role-keys",
+                "aegis build role-keys",
             )
 
     for hostname in repo.list_deployed_hosts():
@@ -206,7 +206,7 @@ def _check_hosts(
                 f"host/{hostname}",
                 f"has output in {repo.deploy_path.name}/ but no config in src/hosts/ "
                 f"({count} files)",
-                f"remove it, or re-add with: aegis init-host {hostname}",
+                f"remove it, or re-add with: aegis host add {hostname}",
             )
 
 
@@ -266,13 +266,13 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
             report.error(
                 scope,
                 "no master key in keys/roles/, so no host can be added to it",
-                f"aegis init-role {role_name}",
+                f"aegis role init {role_name}",
             )
         if not repo.role_pubkey_path(role_name).exists():
             report.error(
                 scope,
                 "no public key, so nothing can be encrypted to this role",
-                f"aegis init-role {role_name}",
+                f"aegis role init {role_name}",
             )
 
         missing = [
@@ -284,7 +284,7 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
                 scope,
                 f"{len(role_config.hosts)} members, {len(missing)} without a key "
                 f"file: {', '.join(sorted(missing))}",
-                "aegis build-role-keys",
+                "aegis build role-keys",
             )
 
         unknown = [h for h in role_config.hosts if h not in configured_hosts]
@@ -308,7 +308,7 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
                     "roles",
                     f"{path.name} has no matching config in src/roles/ "
                     f"(orphaned by a rename?)",
-                    f"remove it, or recreate the role: aegis init-role {path.stem}",
+                    f"remove it, or recreate the role: aegis role init {path.stem}",
                 )
 
     # Role key files for hosts that are no longer members: removal deletes the
@@ -329,7 +329,7 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
                 report.error(
                     f"host/{hostname}",
                     f"holds a key for role '{key_file.stem}' but is not a member",
-                    f"aegis remove-host-from-role {key_file.stem} {hostname}",
+                    f"aegis role remove-host {key_file.stem} {hostname}",
                 )
 
 
@@ -392,7 +392,7 @@ def _check_realms(repo: config.SecretsRepo, report: Report) -> None:
                 scope,
                 f"KDC role '{realm_config.kdc_role}' has no public key; keytabs "
                 f"built now will not be readable by the KDC",
-                f"aegis init-role {realm_config.kdc_role}",
+                f"aegis role init {realm_config.kdc_role}",
             )
 
         without_keytab = [
@@ -405,7 +405,7 @@ def _check_realms(repo: config.SecretsRepo, report: Report) -> None:
                 f"{len(members)} hosts in realm, {len(without_keytab)} without a "
                 f"keytab: {', '.join(sorted(without_keytab)[:5])}"
                 + (" ..." if len(without_keytab) > 5 else ""),
-                "aegis build-keytabs",
+                "aegis build keytabs",
             )
 
         bundle = repo.kdc_deploy_path() / f"{realm_name}-principals.age"
@@ -440,7 +440,7 @@ def _check_users(repo: config.SecretsRepo, report: Report) -> None:
             report.error(
                 scope,
                 "no private key in keys/users/, so their repo cannot be decrypted",
-                f"aegis add-user {username} --hosts=...",
+                f"aegis user add {username} --hosts=...",
             )
 
         for hostname in repo.list_deployed_hosts():
@@ -562,9 +562,11 @@ def run_check(repo: config.SecretsRepo) -> Report:
 def register(app: typer.Typer) -> None:
     """Attach the check/reencrypt commands to the main app."""
 
-    @app.command("check")
+    from .cli import PANEL_DAILY
+
+    @app.command("check", rich_help_panel=PANEL_DAILY)
     def check(
-        secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+        secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
         quiet: bool = typer.Option(False, "--quiet", "-q", help="Only report problems"),
     ):
         """Report drift between src/ and the deploy output.
@@ -608,9 +610,9 @@ def register(app: typer.Typer) -> None:
         if report.errors:
             raise typer.Exit(1)
 
-    @app.command("reencrypt")
+    @app.command("reencrypt", rich_help_panel=PANEL_DAILY)
     def reencrypt(
-        secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s"),
+        secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
         host: Optional[str] = typer.Option(None, "--host", "-H", help="Only this host's files"),
         category: Optional[str] = typer.Option(None, "--category", "-c", help="Only this category (admin-only, host, role, user, kdc, dnssec)"),
         dry_run: bool = typer.Option(False, "--dry-run", "-n"),

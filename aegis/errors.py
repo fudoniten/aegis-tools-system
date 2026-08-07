@@ -27,7 +27,7 @@ class MissingHostKeyError(AegisError):
         self.hostname = hostname
         super().__init__(
             f"No age key configured for {hostname}. "
-            f"Set it with: aegis set-master-key {hostname} --public-key 'age1...'"
+            f"Set it with: aegis host set-key {hostname} --public-key 'age1...'"
         )
 
 

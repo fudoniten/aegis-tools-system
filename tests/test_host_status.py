@@ -149,7 +149,7 @@ def test_info_findings_do_not_fail_the_check(repo):
 def test_set_host_status_records_status_and_note(repo):
     add_host(repo, "pselby-work")
     result = runner.invoke(app, [
-        "set-host-status", "pselby-work", "retired",
+        "host", "set-status", "pselby-work", "retired",
         "--note", "laptop returned",
         "--secrets-path", str(repo.path),
     ])
@@ -163,7 +163,7 @@ def test_set_host_status_records_status_and_note(repo):
 def test_set_host_status_rejects_an_unknown_status(repo):
     add_host(repo, "rama")
     result = runner.invoke(app, [
-        "set-host-status", "rama", "decommissioned",
+        "host", "set-status", "rama", "decommissioned",
         "--secrets-path", str(repo.path),
     ])
     assert result.exit_code == 1
@@ -177,7 +177,7 @@ def test_set_host_status_warns_about_material_it_did_not_remove(repo):
     (deploy / "nexus-key.age").write_text("x")
 
     result = runner.invoke(app, [
-        "set-host-status", "pselby-work", "retired",
+        "host", "set-status", "pselby-work", "retired",
         "--secrets-path", str(repo.path),
     ])
     assert result.exit_code == 0, out(result)
@@ -194,15 +194,15 @@ def test_build_role_keys_skips_unmanaged_hosts(repo):
     repo.set_host_config(host)
 
     runner.invoke(app, [
-        "init-role", "domain-sea.fudo.org", "--secrets-path", str(repo.path)])
+        "role", "init", "domain-sea.fudo.org", "--secrets-path", str(repo.path)])
     for h in ("rama", "clunk"):
         result = runner.invoke(app, [
-            "add-host-to-role", "domain-sea.fudo.org", h,
+            "role", "add-host", "domain-sea.fudo.org", h,
             "--secrets-path", str(repo.path)])
         assert result.exit_code == 0, out(result)
 
     result = runner.invoke(app, [
-        "build-role-keys", "--secrets-path", str(repo.path)])
+        "build", "role-keys", "--secrets-path", str(repo.path)])
     assert result.exit_code == 0, out(result)
 
     assert repo.host_role_key_path("rama", "domain-sea.fudo.org").exists()
