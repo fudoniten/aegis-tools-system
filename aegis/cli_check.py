@@ -573,6 +573,10 @@ def register(app: typer.Typer) -> None:
 
         Changes nothing.  Exits non-zero if any error-level finding is present,
         so it can gate a build in CI.
+        \b
+        Examples:
+            aegis check
+            aegis check --quiet    errors and warnings only
         """
         from .cli import get_secrets_repo
 
@@ -633,6 +637,11 @@ def register(app: typer.Typer) -> None:
 
         Per-host manifests are regenerated from src/ placement at the same
         time, so a target path changed in src/hosts/<host>.toml takes effect.
+        \b
+        Examples:
+            aegis reencrypt --dry-run           what would change
+            aegis reencrypt --host rama         one host's files
+            aegis reencrypt --category admin-only
         """
         from .cli import get_secrets_repo, admin_recipients
 

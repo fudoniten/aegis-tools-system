@@ -103,6 +103,35 @@ def test_build_subcommand_runs_one_step(repo_path: Path):
     assert "Running full build" not in _out(result)
 
 
+def _every_command():
+    """(path, command) for every command in the tree, groups included."""
+    found = []
+
+    def walk(cmd, path):
+        if path:
+            found.append((" ".join(path), cmd))
+        for name, sub in getattr(cmd, "commands", {}).items():
+            walk(sub, path + [name])
+
+    walk(get_command(app), [])
+    return found
+
+
+@pytest.mark.parametrize("path,command", _every_command(), ids=lambda x: x if isinstance(x, str) else "")
+def test_short_help_is_one_scannable_line(path: str, command):
+    """Help listings are one line per command, so summaries must stay short.
+
+    A docstring that runs its summary into the next paragraph -- an example
+    block with no blank line before it, say -- silently drags that whole
+    block into the parent's menu, which is what this grouping was for.
+    """
+    short = command.get_short_help_str(limit=200)
+
+    assert short, f"{path} has no summary"
+    assert "Example" not in short, f"{path} leaks its examples into the menu"
+    assert len(short) <= 80, f"{path} summary is {len(short)} chars: {short}"
+
+
 def test_unknown_command_still_fails(repo_path: Path):
     result = runner.invoke(app, ["definitely-not-a-command"])
 

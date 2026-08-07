@@ -63,6 +63,46 @@ Every pre-grouping command name (`aegis init-host`, `aegis build-keytabs`, …)
 still works and prints where it moved to, so existing scripts keep running.
 Those aliases go away when beta does.
 
+### Quick Start
+
+A new host, end to end. Nothing is generated for a host until it has a master
+key, because there would be no one to encrypt it for:
+
+```bash
+aegis host add rama --domain sea.fudo.org      # declare it
+aegis host set-key rama --public-key age1...   # so it can decrypt
+aegis build                                    # generate what it is missing
+aegis check                                    # confirm nothing is adrift
+aegis verify rama                              # confirm the host can read it
+```
+
+Bringing in material that already exists, instead of generating it:
+
+```bash
+aegis ssh import rama --key /secure/rama.ed25519.key
+aegis nexus import rama --file /secure/rama.nexus.hmac
+
+# A service secret you were handed: encrypt it, and say where it lands.
+aegis secret import rama grafana-token \
+    --file /secure/grafana.token \
+    --target /run/grafana/token --user grafana --mode 0400
+
+# One you want invented rather than handed over.
+aegis secret new ingest-token --host rama --host lambda \
+    --target /run/aurelius/token --user aurelius
+```
+
+Two rules worth knowing before you need them:
+
+```bash
+# Changing WHO can read a secret never regenerates it.
+aegis admin add-key --name backup --public-key age1...
+aegis reencrypt                     # until this, the new key reads nothing
+
+# Changing WHAT the secret is does, and breaks everything holding the old one.
+aegis build ssh-keys --rotate       # new SSH identity; breaks known_hosts
+```
+
 ### Finding the Secrets Repository
 
 The `aegis` command needs to know where your `aegis-secrets` repository is. It searches in this order:

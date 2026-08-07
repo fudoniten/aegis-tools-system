@@ -100,7 +100,16 @@ app = typer.Typer(
     name="aegis",
     cls=AegisGroup,
     help="Aegis System Administration Tools for secrets management.",
-    epilog="Run 'aegis COMMAND --help' to see what a group can do, e.g. 'aegis host --help'.",
+    # \b marks the block as pre-formatted; without it help text is rewrapped
+    # into a paragraph and the quick start stops being a column of commands.
+    epilog="""A new host, end to end:
+\b
+  aegis host add rama --domain sea.fudo.org      declare it
+  aegis host set-key rama --public-key age1...   so it can decrypt
+  aegis build                                    generate what it is missing
+  aegis check                                    confirm nothing is adrift
+
+Run 'aegis COMMAND --help' to see what a group can do, e.g. 'aegis host --help'.""",
     no_args_is_help=True,
     # Typer's rich traceback handler runs inside click's invocation, so an
     # AegisError reaching the top would be rendered as a full traceback before
@@ -327,6 +336,11 @@ def build(
     Nothing here replaces key material that already exists; see
     'aegis build ssh-keys --rotate' for that, and 'aegis reencrypt'
     to change who a secret is encrypted for.
+    \b
+    Examples:
+        aegis build                       everything that is missing
+        aegis build --dry-run             say what that would be
+        aegis build keytabs --realm SEA.FUDO.ORG
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -483,6 +497,10 @@ def build_ssh_host_keys(
 
     To re-encrypt existing keys for a changed recipient set, use
     'aegis reencrypt' -- NOT --rotate, which mints new keys.
+    \b
+    Examples:
+        aegis build ssh-keys                    fill in whatever is missing
+        aegis build ssh-keys --rotate --yes     NEW keys; breaks known_hosts
     """
     from . import host_secrets
 
@@ -581,6 +599,10 @@ def build_nexus_keys(
 
     To re-encrypt an existing key for a changed recipient set, use
     'aegis reencrypt' -- NOT --rotate, which mints a new key.
+    \b
+    Examples:
+        aegis build nexus-keys
+        aegis build nexus-keys --rotate --yes   NEW key; breaks DDNS until deploy
     """
     from . import nexus
 
@@ -679,6 +701,10 @@ def build_keytabs(
     Unlike --rotate on the SSH and Nexus builders, --force here is safe: it
     re-extracts a keytab from the principals already stored in the repo,
     leaving key material untouched.
+    \b
+    Examples:
+        aegis build keytabs
+        aegis build keytabs --force --realm SEA.FUDO.ORG    after a rekey
     """
     from . import host_secrets, realm as realm_mod
     from . import kerberos as krb
@@ -985,6 +1011,9 @@ def build_user_secrets(
     A manifest file (manifest.age) is created for each user on each host,
     encrypted for both the host and the user, mapping hashed names to
     actual secret names and metadata.
+    \b
+    Example:
+        aegis build user-secrets --user alice
     """
     import tempfile
     from . import manifest as mf
@@ -1248,7 +1277,7 @@ def import_ssh_host_keys(
     - Encrypts each private key separately as its own age file
     - Writes each public key as a plaintext .pub file alongside
     - Writes deployment metadata to secrets.toml for NixOS
-
+    \b
     Example:
         aegis ssh import lambda \\
             --key /secure/lambda.ed25519.key \\
@@ -1358,7 +1387,7 @@ def import_nexus_key(
     HmacSHA512:base64encodedkey
     
     Deployment metadata is written to secrets.toml for NixOS to import.
-    
+    \b
     Example:
         aegis nexus import lambda --file /secure/lambda.nexus.hmac
     """
@@ -1438,7 +1467,7 @@ def import_secret(
     This is for service-specific or custom secrets that don't fit the standard
     categories (SSH, Nexus, Kerberos). The secret will be encrypted and metadata
     about target path, ownership, and permissions will be stored in secrets.toml.
-    
+    \b
     Example:
         aegis secret import lambda my-service-token \\
             --file /secure/lambda-service.token \\
@@ -1521,7 +1550,6 @@ def new_secret(
     with the plaintext never touching the filesystem. The same plaintext is
     encrypted once per recipient host; each gets its own .age file. NAME is
     also the key it takes under 'extra_secrets' in src/.
-
     \b
     Recipient selection (at least one is required; they may be combined):
       --host <h>  encrypts to that host's master key plus the admin set.
@@ -1533,7 +1561,7 @@ def new_secret(
     The plaintext is not printed; 'aegis verify <host>' is how you confirm a
     host can decrypt. Rotation means re-invoking with --force, then restarting
     whatever service still holds the old value.
-
+    \b
     Examples:
         aegis secret new aurelius-ingest-token \\
             --host aedile --host nostromo --host fimbria \\
@@ -1803,7 +1831,7 @@ def generate_dnssec_keys(
     Deployment metadata is written to secrets.toml for NixOS to import.
     
     Requires ldns-keygen to be available in PATH.
-    
+    \b
     Example:
         aegis dnssec generate fudo.org --host polaris
         aegis dnssec generate fudo.org --host polaris --algorithm ED25519
@@ -1935,7 +1963,7 @@ def import_dnssec_keys(
     if needed) and the admin.
     
     Deployment metadata is written to secrets.toml for NixOS to import.
-    
+    \b
     Example:
         aegis dnssec import fudo.org --keys-dir /secrets/dnssec/fudo.org/ --host polaris
     """
@@ -2065,6 +2093,14 @@ def init_host(
     Domain membership is recorded as membership in the 'domain-<domain>' role
     rather than as a field on the host, so there is exactly one place that
     answers "which hosts are in this domain".
+
+    A host is only usable once it is declared, has a master key, and has been
+    built for:
+    \b
+    Examples:
+        aegis host add rama --domain sea.fudo.org
+        aegis host set-key rama --public-key age1...
+        aegis build
     """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
@@ -2127,7 +2163,7 @@ def set_master_key(
     1. Host has age private key at /state/master-key/key (persistent storage)
     2. Extract the public key: age-keygen -y /state/master-key/key
     3. Set it here: aegis host set-key lambda --public-key "age1..."
-
+    \b
     Example:
         aegis host set-key lambda --public-key "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
     """
@@ -2186,7 +2222,6 @@ def set_host_status(
     way to say so, "no master key" can only be read as "broken", and the
     permanent errors that produces are what teaches you to stop reading
     'aegis check' output.
-
     \b
     active    fully managed; the default
     pending   declared but not yet initialised -- reserves the name so roles
@@ -2197,7 +2232,7 @@ def set_host_status(
               its parent, or a machine someone else manages
 
     Only 'active' hosts are built for or encrypted to.
-
+    \b
     Example:
         aegis host set-status pselby-work retired --note "laptop returned"
     """
@@ -2252,7 +2287,14 @@ def add_user(
     repo_url: Optional[str] = typer.Option(None, "--repo-url", help="URL of user's secrets repo"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
-    """Add a user and generate their keypair."""
+    """Add a user and generate their keypair.
+
+    The public key is printed for the user to put in their own secrets repo;
+    'aegis build user-secrets' then collects what they encrypt with it.
+    \b
+    Example:
+        aegis user add alice --hosts rama,lambda
+    """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
     
@@ -2308,6 +2350,9 @@ def add_secret(
     where it should be written on the host, so NixOS will not deploy it.
     Use 'aegis secret import' unless you are going to declare placement
     separately with 'aegis host set-placement'.
+    \b
+    Example:
+        aegis secret add rama db-password ./password.txt
     """
     repo = get_secrets_repo(secrets_path)
     if not file.exists():
@@ -2346,6 +2391,10 @@ def init_role(
     The role private key is encrypted for the admin and stored in
     keys/roles/<role>.age.  Use 'aegis role add-host' to grant hosts
     access to this role.
+    \b
+    Examples:
+        aegis role init kdc
+        aegis role add-host kdc rama
     """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
@@ -2391,6 +2440,9 @@ def add_host_to_role(
     Decrypts the admin-held role private key and re-encrypts it for the
     target host, writing the result to
     build/hosts/<hostname>/roles/<role>.age.
+    \b
+    Example:
+        aegis role add-host domain-sea.fudo.org rama
     """
     repo = get_secrets_repo(secrets_path)
 
@@ -2456,7 +2508,14 @@ def remove_host_from_role(
     hostname: str = typer.Argument(..., help="Hostname to remove from the role"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
-    """Remove a host from a role and delete its per-host role key file."""
+    """Remove a host from a role and delete its per-host role key file.
+
+    The host keeps whatever it already decrypted, so treat anything the role
+    protected as disclosed to it.
+    \b
+    Example:
+        aegis role remove-host kdc oldhost
+    """
     repo = get_secrets_repo(secrets_path)
 
     role_config = repo.get_role_config(role)
@@ -2496,7 +2555,7 @@ def nexus_keygen(
     
     Creates an HMAC key for authenticating Nexus DDNS clients to servers.
     The key is written in the format: ALGORITHM:BASE64_ENCODED_KEY
-    
+    \b
     Example:
         aegis nexus keygen server.key
         aegis nexus keygen client.key --algorithm HmacSHA256
@@ -2603,7 +2662,13 @@ def list_secrets(
     hostname: Optional[str] = typer.Argument(None, help="Hostname (optional, list all if omitted)"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
-    """List secrets for a host or all hosts."""
+    """List secrets for a host or all hosts.
+
+    \b
+    Examples:
+        aegis secret list
+        aegis secret list rama
+    """
     repo = get_secrets_repo(secrets_path)
     
     if hostname:
@@ -2637,7 +2702,12 @@ def verify(
     hostname: str = typer.Argument(..., help="Hostname to verify"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
-    """Verify a host can decrypt its secrets."""
+    """Verify a host can decrypt its secrets.
+
+    \b
+    Example:
+        aegis verify rama
+    """
     repo = get_secrets_repo(secrets_path)
     
     # This would require having the host's private key, which we don't
@@ -2703,7 +2773,7 @@ def set_placement(
     one required regenerating the key.
 
     Run 'aegis reencrypt --host <host>' afterwards to refresh the manifest.
-
+    \b
     Example:
         aegis host set-placement rama secret:db-password \\
             --target /run/postgresql/password --user postgres --mode 0400

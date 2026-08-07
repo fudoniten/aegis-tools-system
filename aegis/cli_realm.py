@@ -101,6 +101,12 @@ def realm_init(
     Creates the realm master key and initial database, then stores both --
     plus a realm.toml recording the etypes and lifetimes actually used -- in
     src/kerberos/realms/<REALM>/.
+    \b
+    Examples:
+        aegis realm init SEA.FUDO.ORG --domain sea.fudo.org
+        aegis role init kdc                    then give some host the KDC role
+        aegis role add-host kdc rama
+        aegis build keytabs
     """
     repo = _repo(secrets_path)
     repo.ensure_structure()
@@ -175,7 +181,15 @@ def realm_import(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     domain: Optional[str] = typer.Option(None, "--domain", "-d", help="DNS domain this realm serves"),
 ):
-    """Import an existing Kerberos realm and its principals."""
+    """Import an existing Kerberos realm and its principals.
+
+    \b
+    Example:
+        aegis realm import SEA.FUDO.ORG \\
+            --realm-key /secure/realm.key \\
+            --principals-dir /secure/principals/ \\
+            --domain sea.fudo.org
+    """
     repo = _repo(secrets_path)
     repo.ensure_structure()
 
@@ -321,6 +335,9 @@ def realm_set(
 
     Declaring a domain is what makes hosts resolve to this realm: a host in
     the 'domain-<domain>' role belongs to whichever realm claims <domain>.
+    \b
+    Example:
+        aegis realm set SEA.FUDO.ORG --add-domain sea.fudo.org
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -372,8 +389,12 @@ def realm_add_principal(
 ):
     """Add a principal to a realm.
 
-    Use --host to record which host's keytab it belongs in; 'aegis
-    build-keytabs' includes it when extracting that host's keytab.
+    Use --host to record which host's keytab it belongs in; 'aegis build
+    keytabs' includes it when extracting that host's keytab.
+    \b
+    Examples:
+        aegis realm add-principal SEA.FUDO.ORG postgres/rama.sea.fudo.org --host rama
+        aegis realm add-principal SEA.FUDO.ORG alice --password
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -427,13 +448,14 @@ def realm_rekey_principal(
     carrying both. Services keep authenticating with the old key until they
     receive the new keytab.
 
-    The rotation is finished by dropping the old key once every affected host
-    has been redeployed:
-
-        aegis realm rekey-principal REALM principal --prune
-
     'aegis check' reports principals with a retained key, so an unfinished
     rotation does not go unnoticed.
+    \b
+    Examples:
+        aegis realm rekey-principal SEA.FUDO.ORG host/rama.sea.fudo.org
+        aegis build keytabs --force --realm SEA.FUDO.ORG
+        ...redeploy the affected hosts, then finish the rotation:
+        aegis realm rekey-principal SEA.FUDO.ORG host/rama.sea.fudo.org --prune
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -531,6 +553,10 @@ def realm_remove_principal(
 
     Deleting the stored key does not invalidate keytabs already deployed to
     hosts; anything holding the old key keeps working until it is redeployed.
+    \b
+    Example:
+        aegis realm remove-principal SEA.FUDO.ORG postgres/old.sea.fudo.org
+        aegis build keytabs --force --realm SEA.FUDO.ORG
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
@@ -622,6 +648,10 @@ def realm_trust(
 
     Bidirectional by default: creates krbtgt/B@A and krbtgt/A@B, storing each
     in both realms so the two KDCs share the key.
+    \b
+    Examples:
+        aegis realm trust SEA.FUDO.ORG FUDO.ORG
+        aegis realm trust SEA.FUDO.ORG FUDO.ORG --one-way
     """
     repo = _repo(secrets_path)
     realm_mod.require_realm(repo, realm_a)
@@ -710,6 +740,9 @@ def realm_export(
     Produces deploy/kdc/<REALM>-principals.age, encrypted for the realm's KDC
     role.  The aegis.kdc NixOS module decrypts it in phase 2 and merges it
     into the live database, preserving principals that exist only there.
+    \b
+    Example:
+        aegis realm export SEA.FUDO.ORG
     """
     repo = _repo(secrets_path)
     realm_config = realm_mod.require_realm(repo, realm)
