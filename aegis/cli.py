@@ -100,31 +100,32 @@ app = typer.Typer(
     name="aegis",
     cls=AegisGroup,
     help="Aegis System Administration Tools for secrets management.",
-    # \b marks the block as pre-formatted; without it help text is rewrapped
-    # into a paragraph and the quick start stops being a column of commands.
+    # One line per paragraph, and no \b markers: typer renders the epilog
+    # through Rich, and versions before 0.27 flatten every single newline in it
+    # into a space -- turning a column of commands into a wall of prose -- while
+    # honouring \b only in the *help* text, never here.  Blank-line-separated
+    # paragraphs are the one structure both versions keep, so each line that has
+    # to stand on its own is one.  Keep them short: a paragraph that outgrows a
+    # line is reflowed, and the alignment goes with it.
     epilog="""A new host, end to end:
-\b
+
   aegis host add rama --domain sea.fudo.org      declare it
+
   aegis host set-key rama --public-key age1...   so it can decrypt
+
   aegis build                                    generate what it is missing
+
   aegis check                                    confirm nothing is adrift
-\b
-Environment:
-\b
-  AEGIS_SYSTEM              path to the aegis-secrets repo. Every command
-                            takes --secrets-path/-s instead; without either,
-                            aegis looks in the current directory, then
-                            ./aegis-secrets and ../aegis-secrets.
-  AEGIS_ADMIN_KEY           path to this machine's admin private key.
-                            Defaults to ~/.config/aegis/key.txt. Needed by
-                            anything that decrypts: build, reencrypt,
-                            role add-host, realm and dnssec commands.
-  AEGIS_SCRIPTS             path to the bundled Kerberos scripts. Set by the
-                            Nix wrapper; only set it by hand when running
-                            from a source checkout.
-  AEGIS_USER_REPO_<USER>    path to that user's secrets repo, for
-                            'aegis build user-secrets'. Consulted after
-                            ../aegis-secrets-<user> and inputs/.
+
+Environment. Each names a path; the command-line option wins where there is one:
+
+  AEGIS_SYSTEM             the aegis-secrets repo, as --secrets-path/-s does
+
+  AEGIS_ADMIN_KEY          this machine's admin key (~/.config/aegis/key.txt)
+
+  AEGIS_SCRIPTS            the bundled Kerberos scripts; set by the Nix wrapper
+
+  AEGIS_USER_REPO_<USER>   one user's secrets repo, for build user-secrets
 
 Run 'aegis COMMAND --help' to see what a group can do, e.g. 'aegis host --help'.""",
     no_args_is_help=True,

@@ -178,3 +178,31 @@ def test_documented_defaults_survive_rich_markup(path: list[str]):
     for param in command.params:
         help_text = getattr(param, "help", None) or ""
         assert "[default:" not in help_text, f"{path}/{param.name}: {help_text}"
+
+
+def test_epilog_survives_every_typer_version():
+    """The epilog's layout must not depend on single linebreaks.
+
+    Typer renders it through Rich, and versions before 0.27 collapse every
+    single newline in the epilog into a space -- unconditionally, and without
+    honouring the \\b marker that works in help text. A column of commands
+    written as one paragraph therefore renders as a wall of prose on exactly
+    the versions we do not control.
+
+    Blank-line-separated paragraphs are the one structure both versions keep,
+    so every line whose layout matters is its own paragraph, and no paragraph
+    wraps in the source.
+    """
+    epilog = get_command(app).epilog or ""
+    assert epilog, "the top-level epilog is what this guards"
+
+    assert "\b" not in epilog, (
+        "\\b is not honoured in an epilog on any typer version; it is a "
+        "literal control character there"
+    )
+
+    for paragraph in epilog.split("\n\n"):
+        assert "\n" not in paragraph.strip(), (
+            f"paragraph spans several lines, so it renders differently per "
+            f"typer version:\n{paragraph}"
+        )
