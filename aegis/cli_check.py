@@ -293,6 +293,8 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
                 scope,
                 f"members not configured in src/hosts/: {', '.join(sorted(unknown))}")
 
+        _check_role_secrets(repo, report, role_config, scope)
+
     # Files in the roles output directory that no role in src/ accounts for.
     # These accumulate when a role is renamed: the new name gets a config, the
     # old one's key material is left behind and still decrypts whatever it was
@@ -301,6 +303,17 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
     if roles_dir.is_dir():
         configured_roles = set(repo.list_roles())
         for path in sorted(roles_dir.iterdir()):
+            # A role's secrets live in a directory beside its public key; those
+            # are checked per role above, not by extension here.
+            if path.is_dir():
+                if path.name not in configured_roles:
+                    report.warn(
+                        "roles",
+                        f"{path.name}/ holds secrets for a role with no config "
+                        f"in src/roles/ (orphaned by a rename?)",
+                        f"remove it, or recreate the role: aegis role init {path.name}",
+                    )
+                continue
             if path.suffix not in (".age", ".pub"):
                 continue
             if path.stem not in configured_roles:
@@ -331,6 +344,76 @@ def _check_roles(repo: config.SecretsRepo, report: Report) -> None:
                     f"holds a key for role '{key_file.stem}' but is not a member",
                     f"aegis role remove-host {key_file.stem} {hostname}",
                 )
+
+
+def _check_role_secrets(
+    repo: config.SecretsRepo,
+    report: Report,
+    role_config: config.RoleConfig,
+    scope: str,
+) -> None:
+    """Whether a role's secrets actually reach the hosts that should have them.
+
+    A role secret is one file that every member's manifest points at, so the
+    failure mode is not a missing ciphertext but a manifest that was never
+    regenerated: the secret exists, the host is a member, and nothing deploys
+    it.  Nothing here reads plaintext -- only who declares what.
+    """
+    role_name = role_config.name
+    secret_names = repo.list_role_secrets(role_name)
+
+    if not secret_names:
+        # Placement recorded for a secret that was never imported: harmless,
+        # but it usually means a typo in the name.
+        for kind in sorted(role_config.placement):
+            report.warn(
+                scope,
+                f"placement recorded for {kind}, but the role holds no such secret",
+                f"aegis role set-placement {role_name} {kind} --clear",
+            )
+        return
+
+    if not role_config.hosts:
+        report.warn(
+            scope,
+            f"holds {len(secret_names)} secret(s) but has no members, so "
+            f"nothing deploys them: {', '.join(secret_names)}",
+            f"aegis role add-host {role_name} <host>",
+        )
+        return
+
+    deploying = set(repo.list_deploying_hosts())
+    stale: list[str] = []
+
+    for hostname in role_config.hosts:
+        if hostname not in deploying:
+            continue
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+        declared = {
+            name for name, entry in manifest.secrets.items()
+            if entry.role == role_name
+        }
+        shadowed = {
+            name for name, entry in manifest.secrets.items()
+            if not entry.role and name in secret_names
+        }
+        if shadowed:
+            report.warn(
+                f"host/{hostname}",
+                f"has its own secret(s) named {', '.join(sorted(shadowed))}, "
+                f"shadowing the same name(s) from role '{role_name}'",
+                "rename one of them, or drop the host's copy",
+            )
+        if set(secret_names) - declared - shadowed:
+            stale.append(hostname)
+
+    if stale:
+        report.error(
+            scope,
+            f"{len(stale)} member(s) whose manifest does not declare every "
+            f"role secret: {', '.join(sorted(stale))}",
+            "aegis build role-secrets",
+        )
 
 
 def _check_realms(repo: config.SecretsRepo, report: Report) -> None:
@@ -824,9 +907,10 @@ def _refresh_manifest(repo: config.SecretsRepo, hostname: str) -> None:
                 placement=host_placement(repo, hostname, f"secret:{name}"),
             )
 
-    roles_dir = deploy / "roles"
-    manifest.roles = (
-        sorted(f.stem for f in roles_dir.glob("*.age")) if roles_dir.is_dir() else []
-    )
+    # Role membership drives both the roles list and an entry per role secret,
+    # so a target changed in src/roles/<role>.toml reaches every member here.
+    for conflict in host_secrets.reconcile_roles(repo, hostname, manifest):
+        typer.secho(f"  Warning: {hostname}: {conflict}",
+                    fg=typer.colors.YELLOW, err=True)
 
     host_secrets.save_host_manifest(repo.deploy_path, manifest)

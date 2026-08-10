@@ -83,7 +83,14 @@ aegis ssh import rama --key /secure/rama.ed25519.key
 aegis nexus import rama --file /secure/rama.nexus.hmac
 
 # A service secret you were handed: encrypt it, and say where it lands.
-aegis secret import rama grafana-token \
+aegis secret import grafana-token --host rama \
+    --file /secure/grafana.token \
+    --target /run/grafana/token --user grafana --mode 0400
+
+# The same, but tied to the SERVICE rather than to rama: encrypted once, to
+# the role, so 'aegis role add-host grafana <host>' is all it takes to move
+# or extend it later.
+aegis secret import grafana-token --role grafana \
     --file /secure/grafana.token \
     --target /run/grafana/token --user grafana --mode 0400
 
@@ -124,6 +131,8 @@ aegis status
 aegis host add myhost --services=host,ssh
 
 # Import existing secrets
+aegis secret import db-password --host lambda \
+    --file /secure/db.password --target /run/myservice/db-password
 aegis ssh import lambda --key /secure/lambda.ed25519.key --key /secure/lambda.ecdsa.key
 aegis nexus import lambda --file /secure/lambda.nexus.hmac
 aegis realm import SEA.FUDO.ORG --realm-key /secure/realm.key --principals-dir /secure/principals/ --domain sea.fudo.org
@@ -136,6 +145,7 @@ aegis build
 
 # Build one kind
 aegis build role-keys
+aegis build role-secrets
 aegis build ssh-keys
 aegis build nexus-keys
 aegis build keytabs
@@ -156,9 +166,11 @@ aegis realm rekey-principal EXAMPLE.ORG postgres/db.example.org
 aegis realm trust EXAMPLE.ORG OTHER.ORG
 aegis realm export EXAMPLE.ORG
 
-# Create a role (e.g., KDC)
+# Create a role (e.g., KDC), and give it a secret that follows the service
 aegis role init kdc
 aegis role add-host kdc kdchost
+aegis secret import service-token --role kdc \
+    --file /secure/service.token --target /run/kdc/token
 
 # Declare where a decrypted secret belongs
 aegis host set-placement myhost keytab --target /etc/krb5.keytab --mode 0600
@@ -186,6 +198,7 @@ aegis verify myhost
 |---------|-------------|
 | `aegis build` | Run every step below, in order (same as `aegis build all`) |
 | `aegis build role-keys` | Give each role member its copy of the role key |
+| `aegis build role-secrets` | Point each role member's manifest at the role's secrets |
 | `aegis build ssh-keys` | Generate SSH host keys |
 | `aegis build nexus-keys` | Generate Nexus DDNS authentication keys |
 | `aegis build keytabs` | Generate Kerberos keytabs and the KDC principal bundle |
@@ -295,7 +308,7 @@ generating it is the `aegis build` family above.
 | `aegis nexus import <host>` | Import Nexus DDNS authentication key |
 | `aegis dnssec import <domain>` | Import an existing DNSSEC KSK |
 | `aegis realm import <REALM>` | Import Kerberos realm with principals |
-| `aegis secret import <host> <name>` | Import generic secret with metadata |
+| `aegis secret import <name>` | Import a generic secret for hosts and/or roles |
 
 ### Host, User and Secret Commands
 
@@ -315,12 +328,45 @@ generating it is the `aegis build` family above.
 | Command | Description |
 |---------|-------------|
 | `aegis role init <role>` | Create a role keypair with no members |
-| `aegis role add-host <role> <host>` | Give a host the role's key |
+| `aegis role add-host <role> <host>` | Give a host the role's key and its secrets |
 | `aegis role remove-host <role> <host>` | Revoke a host's copy of the role key |
+| `aegis role set-placement <role> secret:<name>` | Declare where a role secret belongs |
 
 Domain membership is role membership: a host in `domain-fudo.org` is a host in
 that domain. See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for the concept and the
 on-disk layout.
+
+#### Secrets that belong to a service, not a machine
+
+A secret targeted at a **host** is encrypted to that host's master key and
+stored under it. If the service moves, the secret does not follow.
+
+A secret targeted at a **role** is encrypted once, to the role, and stored at
+`deploy/roles/<role>/secrets/<name>.age`. Every member host's manifest points
+at that one file and decrypts it in phase 2, using the role key it unwrapped
+in phase 1. Adding a host to the role is then the whole of "give this host the
+secret" — nothing is re-encrypted, and the plaintext is never needed again:
+
+```bash
+# Once, when the service is first declared
+aegis role init authentik
+aegis secret import ldap-bind-password --role authentik \
+    --file /secure/authentik-ldap.password \
+    --target /run/authentik/ldap-password \
+    --user authentik --group authentik
+
+# Whenever the service moves or scales
+aegis role add-host authentik newhost      # gains the key AND the secrets
+aegis role remove-host authentik oldhost   # loses both
+
+# 'aegis secret new --role' does the same for a freshly generated secret
+aegis secret new authentik-session-key --role authentik \
+    --target /run/authentik/session-key
+```
+
+Revoking is not rotating: a host that has held a role key has seen everything
+the role protected. `aegis role remove-host` says so. To actually rotate,
+re-import with `--force` and restart whatever holds the old value.
 
 ### Utility Commands
 
@@ -348,6 +394,7 @@ aegis-secrets/
 └── deploy/                 # Generated, host-targeted output
     ├── hosts/<host>/       # Per-host secrets + derived secrets.toml
     ├── roles/<role>.pub    # Role public keys
+    ├── roles/<role>/secrets/  # Secrets encrypted to the role, one copy each
     └── kdc/                # Per-realm KDC principal bundles
 ```
 
@@ -359,6 +406,11 @@ rebuilding mints new identities rather than restoring the old ones.
 Deployment metadata (target path, owner, mode) lives in `src/hosts/<host>.toml`
 under `[placement]`, so `deploy/hosts/<host>/secrets.toml` is a derived
 artifact. Change it with `aegis host set-placement`, then `aegis reencrypt`.
+
+A role secret's placement lives in `src/roles/<role>.toml` instead, for the
+same reason it is encrypted to the role: there is one destination, and a host
+joining the role later has to inherit it without anybody restating it. Change
+it with `aegis role set-placement`.
 
 ## See Also
 

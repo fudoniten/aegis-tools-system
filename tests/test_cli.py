@@ -5,7 +5,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from aegis.cli import app
-from aegis import config, crypto
+from aegis import config, crypto, host_secrets
 
 
 runner = CliRunner()
@@ -208,10 +208,10 @@ def test_new_secret_refuses_unconfigured_role(temp_secrets_repo: Path):
     assert "role init" in _out(result)
 
 
-def test_new_secret_role_expands_to_members(
+def test_new_secret_role_writes_one_copy_under_the_role(
     temp_secrets_repo: Path,
 ):
-    """A named role resolves to its current members; .age written per member."""
+    """A role secret is one file; members reference it, non-members do not."""
 
     from tests.conftest import add_host
     repo = config.SecretsRepo(temp_secrets_repo)
@@ -246,16 +246,94 @@ def test_new_secret_role_expands_to_members(
     ])
     assert result.exit_code == 0, _out([result])
 
-    # m1 and m2 should have the encrypted file; m3 should not.
+    # Exactly one ciphertext, under the role -- not a copy per member.
+    assert repo.role_secret_path("shared-role", "shared-token").exists()
+    for h in ("m1", "m2", "m3"):
+        assert not (repo.host_deploy_path(h) / "secrets" / "shared-token.age").exists()
+
+    # m1 and m2 declare it, pointing at the role's copy; m3 does not.
     for h in ("m1", "m2"):
-        assert (repo.host_deploy_path(h) / "secrets" / "shared-token.age").exists()
-    assert not (repo.host_deploy_path("m3") / "secrets" / "shared-token.age").exists()
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, h)
+        entry = manifest.secrets["shared-token"]
+        assert entry.role == "shared-role"
+        assert entry.source == "../../roles/shared-role/secrets/shared-token.age"
+        assert entry.target == "/run/shared/token"
+
+    m3_manifest = host_secrets.load_host_manifest(repo.deploy_path, "m3")
+    assert "shared-token" not in m3_manifest.secrets
 
 
-def test_new_secret_host_and_role_are_unioned(
+def test_role_add_host_grants_existing_role_secrets(temp_secrets_repo: Path):
+    """The point of roles: a host joining later gets the secret, no re-import."""
+
+    from tests.conftest import add_host
+    repo = config.SecretsRepo(temp_secrets_repo)
+    add_host(repo, "first")
+    add_host(repo, "later")
+
+    runner.invoke(app, [
+        "role", "init", "svc", "--secrets-path", str(temp_secrets_repo)])
+    runner.invoke(app, [
+        "role", "add-host", "svc", "first",
+        "--secrets-path", str(temp_secrets_repo)])
+    r = runner.invoke(app, [
+        "secret", "new", "svc-token",
+        "--role", "svc",
+        "--target", "/run/svc/token",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    assert r.exit_code == 0, _out([r])
+
+    before = repo.role_secret_path("svc", "svc-token").read_bytes()
+
+    r_add = runner.invoke(app, [
+        "role", "add-host", "svc", "later",
+        "--secrets-path", str(temp_secrets_repo)])
+    assert r_add.exit_code == 0, _out([r_add])
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, "later")
+    assert manifest.secrets["svc-token"].role == "svc"
+    assert manifest.secrets["svc-token"].target == "/run/svc/token"
+
+    # The secret itself was not touched: no re-encryption, no plaintext needed.
+    assert repo.role_secret_path("svc", "svc-token").read_bytes() == before
+
+
+def test_role_remove_host_drops_the_role_secrets(temp_secrets_repo: Path):
+    """Leaving the role stops the host deploying what the role holds."""
+
+    from tests.conftest import add_host
+    repo = config.SecretsRepo(temp_secrets_repo)
+    add_host(repo, "leaver")
+
+    runner.invoke(app, [
+        "role", "init", "svc", "--secrets-path", str(temp_secrets_repo)])
+    runner.invoke(app, [
+        "role", "add-host", "svc", "leaver",
+        "--secrets-path", str(temp_secrets_repo)])
+    runner.invoke(app, [
+        "secret", "new", "svc-token", "--role", "svc",
+        "--target", "/run/svc/token",
+        "--secrets-path", str(temp_secrets_repo)])
+
+    assert "svc-token" in host_secrets.load_host_manifest(
+        repo.deploy_path, "leaver").secrets
+
+    r = runner.invoke(app, [
+        "role", "remove-host", "svc", "leaver",
+        "--secrets-path", str(temp_secrets_repo)])
+    assert r.exit_code == 0, _out([r])
+
+    assert "svc-token" not in host_secrets.load_host_manifest(
+        repo.deploy_path, "leaver").secrets
+    # The role keeps the secret for its remaining (and future) members.
+    assert repo.role_secret_path("svc", "svc-token").exists()
+
+
+def test_new_secret_host_and_role_are_both_honoured(
     temp_secrets_repo: Path,
 ):
-    """Direct --host entries union with --role-expanded members, dedup."""
+    """--host and --role are independent destinations for the same plaintext."""
 
     from tests.conftest import add_host
     repo = config.SecretsRepo(temp_secrets_repo)
@@ -272,8 +350,8 @@ def test_new_secret_host_and_role_are_unioned(
     runner.invoke(app, [
         "build", "role-keys", "--secrets-path", str(temp_secrets_repo)])
 
-    # Run with --host m1 (already in role) AND --role shared-role. Duplicate
-    # m1 must be deduped; extra must still be included.
+    # m1 is named directly AND is a member of the role: it gets its own copy
+    # from --host, and the role's copy is a separate file.
     result = runner.invoke(app, [
         "secret", "new", "demo",
         "--host", "m1", "--host", "extra",
@@ -283,29 +361,38 @@ def test_new_secret_host_and_role_are_unioned(
     ])
     assert result.exit_code == 0, _out([result])
 
-    # Both hosts should have the secret.
     assert (repo.host_deploy_path("m1") / "secrets" / "demo.age").exists()
     assert (repo.host_deploy_path("extra") / "secrets" / "demo.age").exists()
+    assert repo.role_secret_path("shared-role", "demo").exists()
 
     # And the role should appear in the success summary.
     assert "shared-role" in result.stdout
 
 
-def test_new_secret_role_with_no_members_refuses(temp_secrets_repo: Path):
-    """A role with no hosts produces no recipients; the command refuses."""
+def test_new_secret_role_with_no_members_succeeds_and_says_so(
+    temp_secrets_repo: Path,
+):
+    """A memberless role is a legitimate destination -- the secret waits there.
+
+    It used to be an error, back when --role meant "expand to today's
+    members". Now the role holds the secret and the first host to join
+    picks it up, so refusing would forbid declaring a service before the
+    machine that runs it exists.
+    """
+    repo = config.SecretsRepo(temp_secrets_repo)
     runner.invoke(app, [
         "role", "init", "empty-role",
         "--secrets-path", str(temp_secrets_repo)])
     result = runner.invoke(app, [
         "secret", "new", "demo",
         "--role", "empty-role",
-        # Also pass a non-existent host to ensure the empty-role path is hit
-        # before the per-host init check.
         "--target", "/run/x",
         "--secrets-path", str(temp_secrets_repo),
     ])
-    assert result.exit_code == 1
-    assert "no recipients" in _out(result) or "empty" in _out(result).lower()
+    assert result.exit_code == 0, _out([result])
+    assert repo.role_secret_path("empty-role", "demo").exists()
+    assert "no members" in _out(result)
+    assert "role add-host" in _out(result)
 
 
 # Wildcard user-host membership -----------------------------------------------

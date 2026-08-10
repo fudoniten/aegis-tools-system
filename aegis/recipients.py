@@ -246,6 +246,41 @@ def _admin_only_files(
     return policies
 
 
+def _role_secret_files(
+    repo: config.SecretsRepo, resolver: Resolver
+) -> list[FilePolicy]:
+    """Secrets encrypted to a role rather than to a host.
+
+    One file per secret, whatever the membership: the recipients are the role
+    and the admin set, and a host reads it by holding the role key.  That is
+    what makes membership the only thing that has to change when a service
+    moves — nothing here is per-host, so nothing here is re-encrypted when the
+    member list does.
+    """
+    policies: list[FilePolicy] = []
+
+    for role_name in repo.list_roles():
+        secrets_dir = repo.role_secrets_path(role_name)
+        if not secrets_dir.is_dir():
+            continue
+
+        role_key = resolver.role(role_name)
+        for path in sorted(secrets_dir.glob("*.age")):
+            if role_key is None:
+                policies.append(FilePolicy(
+                    path=path, category=CAT_ROLE,
+                    problem=f"role {role_name} has no public key"))
+            else:
+                policies.append(FilePolicy(
+                    path=path,
+                    category=CAT_ROLE,
+                    recipients=[role_key, *resolver.admin_keys],
+                    label=f"role({role_name}) + {_admin_label(len(resolver.admin_keys))}",
+                ))
+
+    return policies
+
+
 def _kdc_files(repo: config.SecretsRepo, resolver: Resolver) -> list[FilePolicy]:
     kdc_dir = repo.kdc_deploy_path()
     if not kdc_dir.is_dir():
@@ -343,6 +378,7 @@ def plan(repo: config.SecretsRepo, admin_keys: list[str]) -> list[FilePolicy]:
     policies = (
         _admin_only_files(repo, resolver)
         + _host_files(repo, resolver)
+        + _role_secret_files(repo, resolver)
         + _kdc_files(repo, resolver)
         + _dnssec_files(repo, resolver)
     )
