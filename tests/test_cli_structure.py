@@ -136,3 +136,45 @@ def test_unknown_command_still_fails(repo_path: Path):
     result = runner.invoke(app, ["definitely-not-a-command"])
 
     assert result.exit_code != 0
+
+
+def test_top_level_help_documents_the_environment_variables():
+    """Every variable aegis reads, in the place an operator will look.
+
+    A path resolved from the environment is invisible otherwise: the failure
+    it produces is "wrong repo", not "unset variable".
+    """
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    out = _out(result)
+    for variable in (
+        "AEGIS_SYSTEM", "AEGIS_ADMIN_KEY", "AEGIS_SCRIPTS", "AEGIS_USER_REPO_",
+    ):
+        assert variable in out, f"{variable} is not mentioned in 'aegis --help'"
+
+
+def test_role_commands_are_registered():
+    for path in (
+        ["role", "init"],
+        ["role", "add-host"],
+        ["role", "remove-host"],
+        ["role", "set-placement"],
+        ["build", "role-secrets"],
+    ):
+        assert _resolve(path) is not None, " ".join(path)
+
+
+@pytest.mark.parametrize("path", [["secret", "import"], ["secret", "new"]])
+def test_documented_defaults_survive_rich_markup(path: list[str]):
+    """Rich reads square brackets as markup and silently drops them.
+
+    A help string reading "[default: root]" renders as "" -- the one thing it
+    was there to say. Parentheses are not markup.
+    """
+    command = _resolve(path)
+    assert command is not None
+
+    for param in command.params:
+        help_text = getattr(param, "help", None) or ""
+        assert "[default:" not in help_text, f"{path}/{param.name}: {help_text}"

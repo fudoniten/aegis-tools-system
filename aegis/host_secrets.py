@@ -46,6 +46,16 @@ Example manifest:
     user = "myservice"
     group = "myservice"
     mode = "0600"
+
+    # A secret encrypted to a role rather than to this host: one ciphertext,
+    # shared by every member, decrypted in phase 2 with the role key.
+    [secrets.ldap-bind-password]
+    source = "../../roles/authentik/secrets/ldap-bind-password.age"
+    target = "/run/authentik/ldap-password"
+    user = "authentik"
+    group = "authentik"
+    mode = "0400"
+    role = "authentik"
 """
 
 from dataclasses import dataclass, field
@@ -59,7 +69,7 @@ except ImportError:
 
 import tomli_w  # type: ignore
 
-from .config import Placement
+from .config import Placement, SecretsRepo
 
 
 # Default deployment settings for different secret types
@@ -102,6 +112,10 @@ class SecretEntry:
     mode: str = "0400"
     encoding: str | None = None    # "base64" for binary secrets
     type: str | None = None        # SSH key type ("ed25519", "ecdsa", "rsa")
+    # Set when the secret is encrypted to a role rather than to this host.
+    # The NixOS module reads it as "decrypt in phase 2, with the role key this
+    # host unwrapped in phase 1" -- there is no per-host copy to point at.
+    role: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"source": self.source}
@@ -116,6 +130,8 @@ class SecretEntry:
             d["encoding"] = self.encoding
         if self.type:
             d["type"] = self.type
+        if self.role:
+            d["role"] = self.role
         return d
 
     @classmethod
@@ -129,6 +145,7 @@ class SecretEntry:
             mode=data.get("mode", "0400"),
             encoding=data.get("encoding"),
             type=data.get("type"),
+            role=data.get("role"),
         )
 
 
@@ -410,6 +427,112 @@ def make_secret_entry(
         mode=placement.mode or defaults["mode"],
         encoding=encoding,
     )
+
+
+def make_role_secret_entry(
+    role: str,
+    name: str,
+    placement: Placement | None = None,
+    encoding: str | None = None,
+) -> SecretEntry:
+    """Create a manifest entry pointing at a role's copy of a secret.
+
+    The source is relative to the host's own directory, as every other entry
+    is, and climbs out of it: there is exactly one ciphertext per role secret,
+    at ``deploy/roles/<role>/secrets/<name>.age``, and every member host's
+    manifest names that same file.  That is the point -- adding a host to the
+    role is enough to give it the secret, with no re-encryption and no need
+    for the plaintext ever again.
+    """
+    placement = placement or Placement()
+    defaults = DEFAULTS["secret"]
+    return SecretEntry(
+        source=f"../../roles/{role}/secrets/{name}.age",
+        target=placement.target or f"/run/aegis/secrets/{name}",
+        user=placement.user or defaults["user"],
+        group=placement.group or defaults["group"],
+        mode=placement.mode or defaults["mode"],
+        encoding=encoding,
+        role=role,
+    )
+
+
+def role_secret_entries(
+    repo: SecretsRepo,
+    hostname: str,
+) -> tuple[dict[str, SecretEntry], list[str]]:
+    """The role secrets a host should carry, and any name collisions found.
+
+    A host gets every secret of every role it belongs to.  Names are the
+    manifest's keys, so two roles publishing the same name -- or a role and
+    the host itself -- would overwrite each other; those are reported instead
+    of being resolved silently, since either answer loses a secret.
+    """
+    entries: dict[str, SecretEntry] = {}
+    owner: dict[str, str] = {}
+    conflicts: list[str] = []
+
+    for role_name in repo.list_roles():
+        role_config = repo.get_role_config(role_name)
+        if role_config is None or hostname not in role_config.hosts:
+            continue
+        for name in repo.list_role_secrets(role_name):
+            if name in entries:
+                conflicts.append(
+                    f"'{name}' is published by both role '{owner[name]}' and "
+                    f"role '{role_name}'")
+                continue
+            owner[name] = role_name
+            entries[name] = make_role_secret_entry(
+                role=role_name,
+                name=name,
+                placement=role_config.placement_for(f"secret:{name}"),
+            )
+
+    return entries, conflicts
+
+
+def reconcile_roles(
+    repo: SecretsRepo,
+    hostname: str,
+    manifest: "HostSecretsManifest",
+) -> list[str]:
+    """Bring a manifest's role-derived parts in line with role membership.
+
+    Two things follow from membership and neither is worth stating by hand:
+    the list of roles whose keys the host unwraps in phase 1, and an entry for
+    every secret those roles hold.  Both are recomputed here.
+
+    Entries for a role the host no longer belongs to are dropped, so that
+    ``aegis role remove-host`` actually stops the host deploying the role's
+    secrets rather than leaving it pointing at a file it can no longer read.
+    Host-local secrets are left alone; one that shadows a role secret keeps
+    its place, since it is the more specific declaration.
+    """
+    # The roles a host *holds a key for*, not the ones it is listed under:
+    # membership can be recorded before the key is written (a pending host),
+    # and a manifest naming a role whose key file is absent fails at boot.
+    roles_dir = repo.host_deploy_path(hostname) / "roles"
+    manifest.roles = (
+        sorted(f.stem for f in roles_dir.glob("*.age")) if roles_dir.is_dir() else []
+    )
+
+    wanted, conflicts = role_secret_entries(repo, hostname)
+
+    for name, entry in list(manifest.secrets.items()):
+        if entry.role and name not in wanted:
+            del manifest.secrets[name]
+
+    for name, entry in wanted.items():
+        existing = manifest.secrets.get(name)
+        if existing is not None and not existing.role:
+            conflicts.append(
+                f"'{name}' is both a role secret (role '{entry.role}') and a "
+                f"secret of host {hostname}; the host's own copy is kept")
+            continue
+        manifest.secrets[name] = entry
+
+    return conflicts
 
 
 def make_dnssec_entry(

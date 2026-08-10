@@ -216,9 +216,19 @@ class UserConfig:
 
 @dataclass
 class RoleConfig:
-    """Configuration for a role."""
+    """Configuration for a role.
+
+    Attributes:
+        name: The role's name
+        hosts: Member hosts, each of which holds a copy of the role key
+        placement: Per-secret deployment metadata for the role's own secrets,
+                   keyed ``secret:<name>``.  A role secret is encrypted once,
+                   to the role, so where it lands is a property of the role
+                   rather than of whichever host currently holds it.
+    """
     name: str
     hosts: list[str] = field(default_factory=list)
+    placement: dict[str, Placement] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "RoleConfig":
@@ -229,10 +239,33 @@ class RoleConfig:
             hosts = [data["host"]]
         else:
             hosts = []
-        return cls(name=name, hosts=hosts)
+        placement = {
+            key: Placement.from_dict(value)
+            for key, value in data.get("placement", {}).items()
+            if isinstance(value, dict)
+        }
+        return cls(name=name, hosts=hosts, placement=placement)
 
     def to_dict(self) -> dict:
-        return {"hosts": self.hosts}
+        d: dict[str, Any] = {"hosts": self.hosts}
+        placement = {
+            key: value.to_dict()
+            for key, value in sorted(self.placement.items())
+            if not value.is_empty()
+        }
+        if placement:
+            d["placement"] = placement
+        return d
+
+    def placement_for(self, kind: str) -> Placement:
+        """Placement for one of the role's secrets, or an empty one if unset."""
+        return self.placement.get(kind, Placement())
+
+    def set_placement(self, kind: str, placement: Placement) -> None:
+        if placement.is_empty():
+            self.placement.pop(kind, None)
+        else:
+            self.placement[kind] = placement
 
 
 @dataclass
@@ -475,6 +508,34 @@ class SecretsRepo:
     def host_role_key_path(self, hostname: str, role_name: str) -> Path:
         """Get the path to a host's copy of a role private key."""
         return self.host_deploy_path(hostname) / "roles" / f"{role_name}.age"
+
+    def role_deploy_path(self, role_name: str) -> Path:
+        """Directory holding a role's own output, beside its public key.
+
+        A sibling of ``deploy/roles/<role>.pub`` rather than a nesting of it:
+        the public key is a file, so the directory cannot share its name.
+        """
+        return self.roles_deploy_path() / role_name
+
+    def role_secrets_path(self, role_name: str) -> Path:
+        """Directory holding secrets encrypted to a role."""
+        return self.role_deploy_path(role_name) / "secrets"
+
+    def role_secret_path(self, role_name: str, secret_name: str) -> Path:
+        """A single secret encrypted to a role.
+
+        One file, whatever the membership: the role key is what decrypts it,
+        so adding a host means giving that host the role key, not re-encrypting
+        the secret.
+        """
+        return self.role_secrets_path(role_name) / f"{secret_name}.age"
+
+    def list_role_secrets(self, role_name: str) -> list[str]:
+        """Names of the secrets encrypted to a role."""
+        secrets_dir = self.role_secrets_path(role_name)
+        if not secrets_dir.is_dir():
+            return []
+        return sorted(p.stem for p in secrets_dir.glob("*.age"))
 
     def kdc_deploy_path(self) -> Path:
         """Directory holding per-realm KDC principal bundles."""

@@ -12,15 +12,24 @@
 > `deploy/hosts/<host>/roles/<role>.age`, which is what the NixOS module reads
 > in phase 1, and records membership in `src/roles/<role>.toml`.
 >
-> Manage membership with the commands in the Role Commands section of the
-> README, which operate on that layout:
+> The *secrets* a role protects are shared, exactly as described below: one
+> copy each, at `deploy/roles/<role>/secrets/<name>.age`, encrypted to the
+> role. Every member's manifest names that file and decrypts it in phase 2.
+>
+> The hand-rolled `age` invocations in "Manual (For New Domains)" and the
+> hand-written manifest stanzas in "Host Configuration" are no longer
+> necessary — those sections are kept as an explanation of the mechanism.
+> The commands that do it are in the Role Commands section of the README:
 >
 > ```bash
 > aegis role init <role>                     # create the keypair
-> aegis role add-host <role> <host>       # grant a host the key
-> aegis role remove-host <role> <host>  # revoke the copy
-> aegis build role-keys                      # reconcile every member
-> aegis check                                # report members missing a key
+> aegis role add-host <role> <host>          # grant a host the key and secrets
+> aegis role remove-host <role> <host>       # revoke both
+> aegis secret import <name> --role <role>   # a secret the role owns
+> aegis secret new <name> --role <role>      # ...or a freshly generated one
+> aegis build role-keys                      # reconcile every member's key
+> aegis build role-secrets                   # reconcile every member's manifest
+> aegis check                                # report what is out of step
 > ```
 >
 > Two shared-key artifacts predate this and are still in the repo:
@@ -58,20 +67,25 @@ Phase 2: Secrets → Encrypted for [role-key, admin]
 ## Directory Structure
 
 ```
-aegis-secrets/build/
-├── domains/
-│   └── fudo.org/
-│       ├── role-key.age              # Domain role key (Phase 1)
-│       └── dns/                      # Other domain infrastructure
-├── secrets/
-│   └── fudo.org/
-│       ├── authentik-ldap.token.age  # Domain secret (Phase 2)
-│       ├── mastodon-oidc.secret.age  # Domain secret (Phase 2)
-│       └── ...
-└── hosts/
-    └── germany/
-        └── secrets.toml              # References domain role key
+aegis-secrets/
+├── src/roles/
+│   └── domain-fudo.org.toml            # Members, and where each secret lands
+├── keys/roles/
+│   └── domain-fudo.org.age             # Role private key, admin-encrypted
+└── deploy/
+    ├── roles/
+    │   ├── domain-fudo.org.pub         # Role public key: what secrets encrypt to
+    │   └── domain-fudo.org/secrets/
+    │       ├── authentik-ldap.token.age  # Domain secret (Phase 2), ONE copy
+    │       └── mastodon-oidc.secret.age  # Domain secret (Phase 2), ONE copy
+    └── hosts/germany/
+        ├── roles/domain-fudo.org.age   # This host's copy of the role key (Phase 1)
+        └── secrets.toml                # Names the role, and every role secret
 ```
+
+The role *key* is per host — one file per member, so a member can be added or
+dropped without touching anyone else's. The role's *secrets* are not: there is
+one of each, encrypted to the role, and every member's manifest points at it.
 
 ## Creating a Domain Role
 
@@ -95,194 +109,127 @@ And encrypts all domain secrets with the respective role keys.
 ### Manual (For New Domains)
 
 ```bash
-# 1. Generate a role keypair
-age-keygen > /tmp/domain-fudo.org.key
+# 1. Generate the role keypair. The private key is stored encrypted for the
+#    admin set; the public key is what domain secrets encrypt to.
+aegis role init domain-fudo.org
 
-# 2. Extract the public key
-ROLE_PUBKEY=$(grep 'public key:' /tmp/domain-fudo.org.key | cut -d: -f2 | tr -d ' ')
+# 2. Give each domain host its own copy of the role key
+aegis role add-host domain-fudo.org host1
+aegis role add-host domain-fudo.org host2
 
-# 3. Get all host public keys in the domain
-ADMIN_PUBKEY=$(cat aegis-secrets/keys/admin.pub)
-HOST1_PUBKEY=$(grep age_pubkey aegis-secrets/src/hosts/host1.toml | cut -d'"' -f2)
-HOST2_PUBKEY=$(grep age_pubkey aegis-secrets/src/hosts/host2.toml | cut -d'"' -f2)
-# ... etc
-
-# 4. Encrypt the role private key for all domain hosts
-age --encrypt --armor \
-    --recipient "$HOST1_PUBKEY" \
-    --recipient "$HOST2_PUBKEY" \
-    --recipient "$ADMIN_PUBKEY" \
-    --output aegis-secrets/build/domains/fudo.org/role-key.age \
-    < /tmp/domain-fudo.org.key
-
-# 5. Encrypt domain secrets with the role public key
-age --encrypt --armor \
-    --recipient "$ROLE_PUBKEY" \
-    --recipient "$ADMIN_PUBKEY" \
-    --output aegis-secrets/build/secrets/fudo.org/my-secret.age \
-    < my-secret.txt
-
-# 6. Clean up
-rm /tmp/domain-fudo.org.key
+# 3. Encrypt a domain secret to the role -- once, not once per host
+aegis secret import my-secret --role domain-fudo.org \
+    --file /secure/my-secret --target /run/aegis/my-secret
 ```
+
+The plaintext never reaches the repo, and no temporary key file is left for
+step 6 to clean up. The `age` invocations this replaces are in "Approach 2"
+below, if you want to see what it is doing.
 
 ## Host Configuration
 
-Each host in the domain needs a manifest that references the domain role key:
+The manifest is generated, not written: `aegis role add-host` and
+`aegis build role-secrets` produce it. It looks like this, and the module
+derives the phase and the identity from the `role` field rather than being
+told them:
 
 ```toml
-# aegis-secrets/build/hosts/germany/secrets.toml
+# aegis-secrets/deploy/hosts/germany/secrets.toml
 
-# Phase 1: Decrypt domain role key with host master key
-[[secrets]]
-source = "../../domains/fudo.org/role-key.age"
-target = "/run/aegis/roles/domain-fudo.org.key"
-mode = "0400"
-phase = 1
-identity = "/state/master-key/key"  # Host's master key
+# Phase 1: the role key, decrypted with this host's master key.
+roles = ["domain-fudo.org"]
 
-# Phase 2: Decrypt domain secrets with role key
-[[secrets]]
-source = "../../secrets/fudo.org/authentik-ldap.token.age"
+# Phase 2: domain secrets, decrypted with the role key from phase 1. The
+# source climbs out of the host directory because there is only one copy.
+[secrets.authentik-ldap-token]
+source = "../../roles/domain-fudo.org/secrets/authentik-ldap-token.age"
 target = "/run/aegis/authentik/ldap-token"
 mode = "0400"
-phase = 2
-identity = "/run/aegis/roles/domain-fudo.org.key"  # Role key from Phase 1
+role = "domain-fudo.org"
 
-[[secrets]]
-source = "../../secrets/fudo.org/mastodon-oidc.secret.age"
+[secrets.mastodon-oidc-secret]
+source = "../../roles/domain-fudo.org/secrets/mastodon-oidc-secret.age"
 target = "/run/aegis/mastodon/oidc-secret"
 mode = "0400"
-phase = 2
-identity = "/run/aegis/roles/domain-fudo.org.key"
-
-# ... more domain secrets
+role = "domain-fudo.org"
 ```
 
 ## Managing Domain Membership
 
 ### Add a Host to a Domain
 
-Use the `add-host-to-role` command:
-
 ```bash
 aegis role add-host domain-fudo.org newhost
 ```
 
 This:
-1. Decrypts the current domain role key (requires admin key)
+1. Decrypts the domain role key (requires the admin key)
 2. Gets the new host's public key from `src/hosts/newhost.toml`
-3. Re-encrypts the role key for all existing hosts + new host + admin
-4. Updates `build/domains/fudo.org/role-key.age`
+3. Re-encrypts the role key *for that host alone*, at
+   `deploy/hosts/newhost/roles/domain-fudo.org.age`
+4. Records the membership in `src/roles/domain-fudo.org.toml`
+5. Adds every one of the role's secrets to `newhost`'s manifest
 
-**All domain secrets remain untouched!** Only the single role key file is re-encrypted.
+**All domain secrets remain untouched** — nothing is re-encrypted, and the
+plaintext is not needed. That is the whole point: the only thing that changes
+when a service moves is who holds the role key.
 
 ### Remove a Host from a Domain
 
-Use the `remove-host-from-role` command:
-
 ```bash
-aegis role remove-host domain-fudo.org oldhost \
-    --hosts=host1,host2,host3,remaining,hosts
+aegis role remove-host domain-fudo.org oldhost
 ```
 
-**Important:** You must specify all hosts that should remain in the domain. This is a safety feature to prevent accidentally removing all hosts.
+This deletes `deploy/hosts/oldhost/roles/domain-fudo.org.age` and drops the
+role's secrets from that host's manifest, so the next deploy stops writing
+them. Membership is recorded in `src/roles/domain-fudo.org.toml`, so there is
+no need to restate who remains.
 
-This:
-1. Decrypts the current domain role key
-2. Gets public keys for all remaining hosts
-3. Re-encrypts the role key WITHOUT the removed host
-4. Updates `build/domains/fudo.org/role-key.age`
-
-The removed host can no longer decrypt the role key, and therefore can no longer decrypt any domain secrets.
+The removed host can no longer decrypt the role key, and therefore no longer
+decrypts any domain secret. Note that this is revocation, not rotation: it
+has already read them.
 
 ### Verify Domain Members
 
-Unfortunately, `age` doesn't expose recipient information, so there's no built-in way to list which hosts can decrypt a role key. You need to track this separately.
+`age` doesn't expose recipient information, so the ciphertext cannot answer
+this — but membership is declared, not inferred. It lives in
+`src/roles/domain-fudo.org.toml`, and:
 
-**Best Practice:** Keep a comment in your secrets repository noting which hosts are in each domain:
-
-```toml
-# aegis-secrets/src/domains/fudo.org.toml
-realm = "FUDO.ORG"
-dns_zones = ["fudo.org", "fudo.ca", "fudo.im", ...]
-
-# Hosts with access to domain-fudo.org role:
-# - aedile
-# - arx  
-# - france
-# - germany
-# - legatus
-# - paris
-# - praetor
+```bash
+aegis status        # members and secrets, per role
+aegis check         # members whose key or manifest is out of step
 ```
 
 ## Workflow Examples
 
 ### Example 1: Adding a New Application Service
 
-You have a new application that needs OIDC credentials. Since it's domain-wide:
+You have a new application that needs OIDC credentials. Since it's domain-wide,
+target the role rather than any host — one command does all of the above:
 
 ```bash
-# 1. Create the secret (no host needed!)
-echo "secret-client-secret-value" > /tmp/newapp-oidc.secret
-
-# 2. Get the domain role public key
-ROLE_KEY_FILE="aegis-secrets/build/domains/fudo.org/role-key.age"
-age --decrypt --identity ~/.config/aegis/key.txt "$ROLE_KEY_FILE" > /tmp/role.key
-ROLE_PUBKEY=$(age-keygen -y /tmp/role.key)
-
-# 3. Encrypt with role key
-ADMIN_PUBKEY=$(cat aegis-secrets/keys/admin.pub)
-age --encrypt --armor \
-    --recipient "$ROLE_PUBKEY" \
-    --recipient "$ADMIN_PUBKEY" \
-    --output aegis-secrets/build/secrets/fudo.org/newapp-oidc.secret.age \
-    < /tmp/newapp-oidc.secret
-
-# 4. Add to ANY host's manifest (all domain hosts can access it)
-cat >> aegis-secrets/build/hosts/germany/secrets.toml <<EOF
-
-[[secrets]]
-source = "../../secrets/fudo.org/newapp-oidc.secret.age"
-target = "/run/aegis/newapp/oidc-secret"
-mode = "0400"
-phase = 2
-identity = "/run/aegis/roles/domain-fudo.org.key"
-EOF
-
-# 5. Clean up temp files
-rm /tmp/newapp-oidc.secret /tmp/role.key
+aegis secret import newapp-oidc.secret --role domain-fudo.org \
+    --file /secure/newapp-oidc.secret \
+    --target /run/aegis/newapp/oidc-secret --mode 0400
 ```
+
+That encrypts it once to the role and the admin set, and adds an entry to
+every current member's manifest. Hosts that join the role later pick it up
+from `aegis role add-host`, with no re-encryption and no second look at the
+plaintext.
 
 ### Example 2: Provisioning a New Domain Host
 
 ```bash
-# 1. Create host config (if not exists)
-aegis sync-hosts  # Or manually create src/hosts/newhost.toml
+# 1. Declare the host and its master key
+aegis host add newhost
+aegis host set-key newhost --public-key age1...
 
-# 2. Add to domain role
+# 2. Add to the domain role. This writes newhost's copy of the role key AND
+#    puts every one of the role's secrets into its manifest.
 aegis role add-host domain-fudo.org newhost
 
-# 3. Create host manifest with domain role reference
-cat > aegis-secrets/build/hosts/newhost/secrets.toml <<EOF
-# Domain role key (Phase 1)
-[[secrets]]
-source = "../../domains/fudo.org/role-key.age"
-target = "/run/aegis/roles/domain-fudo.org.key"
-mode = "0400"
-phase = 1
-
-# Domain secrets (Phase 2) - same as other hosts!
-[[secrets]]
-source = "../../secrets/fudo.org/authentik-ldap.token.age"
-target = "/run/aegis/authentik/ldap-token"
-mode = "0400"
-phase = 2
-identity = "/run/aegis/roles/domain-fudo.org.key"
-EOF
-
-# 4. Deploy
+# 3. Deploy
 # (copy master key to /state/master-key/key on newhost)
 # (deploy NixOS config with aegis.autoSecrets enabled)
 ```
@@ -290,11 +237,13 @@ EOF
 ### Example 3: Decommissioning a Host
 
 ```bash
-# 1. Get list of remaining hosts
-REMAINING="host1,host2,host3"  # All except the one being removed
+# 1. Remove from the domain. This deletes its copy of the role key and drops
+#    the role's secrets from its manifest.
+aegis role remove-host domain-fudo.org oldhost
 
-# 2. Remove from domain
-aegis role remove-host domain-fudo.org oldhost --hosts="$REMAINING"
+# 2. Rotate what it could read. Revoking access is not rotation: oldhost has
+#    already seen everything the role protected.
+aegis secret import <name> --role domain-fudo.org --file ... --force
 
 # 3. Remove host config
 rm aegis-secrets/src/hosts/oldhost.toml
@@ -382,14 +331,24 @@ EOF
 
 ### Phase 2 Secrets Not Decrypting
 
-Check systemd service dependencies:
+A role secret cannot decrypt before its role key exists, so start there:
 
 ```bash
-systemctl status aegis-phase1.target
-systemctl status aegis-phase2.target
+systemctl status aegis-role-domain-fudo.org.service   # phase 1: the role key
+systemctl status aegis-secret-<name>.service          # phase 2: the secret
+ls -l /run/aegis/roles/                               # what phase 1 produced
 ```
 
-Phase 2 secrets require Phase 1 to complete first. If Phase 1 fails, Phase 2 won't run.
+The phase-2 unit `Requires=` the role's phase-1 unit directly, not just
+`aegis-phase1.target` — the target is reached by weak `wantedBy` dependencies
+and would otherwise activate even when the role key failed to decrypt.
+
+If the secret is not there at all, the host's manifest may not name it:
+
+```bash
+aegis check                  # reports members whose manifest is out of step
+aegis build role-secrets     # regenerate the manifests, then redeploy
+```
 
 ### Can't Decrypt Role Key
 
@@ -404,11 +363,14 @@ ls -la ~/.config/aegis/key.txt
 
 ### Role Key Protection
 
-The domain role key is the "master key" for all domain secrets. It's encrypted for:
-- All hosts in the domain (each can decrypt with their master key)
-- Admin (for management operations)
+The domain role key is the "master key" for all domain secrets. A copy exists
+per member host, each encrypted for:
+- That host's master key (so it can use the role)
+- The admin set (so the copy can be regenerated)
 
-**If compromised:** An attacker with the role key can decrypt all domain secrets.
+**If compromised:** An attacker with the role key can decrypt all domain
+secrets. Removing a host from the role deletes its copy, but does not undo
+what it has already read — revocation is not rotation.
 
 **Mitigation:**
 - Host master keys stored on disk (e.g., `/state/master-key/key`)
@@ -428,21 +390,10 @@ The admin key can decrypt:
 
 ### Least Privilege
 
-Not all hosts need all domain secrets. Use manifest files to limit what each host decrypts:
-
-```toml
-# germany only needs these domain secrets
-[[secrets]]
-source = "../../secrets/fudo.org/mastodon-oidc.secret.age"
-# ...
-
-# france doesn't need mastodon secrets, only grafana
-[[secrets]]
-source = "../../secrets/fudo.org/grafana-oidc.secret.age"
-# ...
-```
-
-Even though both hosts can decrypt all domain secrets (they have the role key), they only decrypt what they need.
+Role membership is all-or-nothing: a member holds the role key, so it *can*
+decrypt every secret the role holds, whether or not its manifest names them.
+Narrower roles are the way to narrow access — one per service rather than one
+per domain — not a narrower manifest.
 
 ## See Also
 
