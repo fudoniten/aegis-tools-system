@@ -52,6 +52,7 @@
             pkgs.openssh
             pkgs.ruby
             pkgs.heimdal
+            pkgs.nebula
           ];
 
           shellHook = ''
@@ -82,6 +83,7 @@
               # sqlite: database backend.  None of those exist in MIT krb5.
               pkgs.heimdal
               pkgs.ldns.examples # ldns-keygen, for DNSSEC KSKs
+              pkgs.nebula # nebula-cert, for overlay CAs and host certificates
               nexus.packages.${system}.nexus-keygen
             ];
             text = ''

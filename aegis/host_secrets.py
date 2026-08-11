@@ -429,6 +429,64 @@ def make_secret_entry(
     )
 
 
+def make_nebula_entries(
+    network: str,
+    *,
+    with_key: bool,
+    placement: Placement | None = None,
+) -> dict[str, SecretEntry]:
+    """Manifest entries for one Nebula network, keyed by secret name.
+
+    Three files, and they go under ``[secrets]`` rather than getting a section
+    of their own.  That is the point: the Aegis NixOS module already handles
+    ``[secrets]`` generically and surfaces them through
+    ``aegis.secrets.manifest.targets``, so Nebula needs no host-side change.
+
+    The certificate and the CA certificate are public, and are shipped as
+    ciphertext anyway.  Encrypting public data costs nothing; giving the host a
+    second, unencrypted delivery path would cost a great deal.
+
+    ``with_key`` is false for a host that generated its own private key and
+    sent only the public half.  Aegis then has a certificate to deliver but no
+    key, and must not imply otherwise by writing an entry that points at a file
+    which does not exist.
+    """
+    placement = placement or Placement()
+    defaults = DEFAULTS["secret"]
+    # The service user the upstream NixOS module runs Nebula as.
+    owner = placement.user or f"nebula-{network}"
+    group = placement.group or owner
+    base = placement.target_dir or "/run/aegis/nebula"
+
+    entries = {
+        f"nebula-{network}-cert": SecretEntry(
+            source=f"nebula/{network}.crt.age",
+            target=f"{base}/{network}.crt",
+            user=owner,
+            group=group,
+            mode="0444",
+        ),
+        f"nebula-{network}-ca": SecretEntry(
+            source=f"nebula/{network}-ca.crt.age",
+            target=f"{base}/{network}-ca.crt",
+            user=owner,
+            group=group,
+            mode="0444",
+        ),
+    }
+
+    if with_key:
+        entries[f"nebula-{network}-key"] = SecretEntry(
+            source=f"nebula/{network}.key.age",
+            target=f"{base}/{network}.key",
+            user=owner,
+            group=group,
+            mode=placement.mode or defaults["mode"],
+        )
+
+    return entries
+
+
 def make_role_secret_entry(
     role: str,
     name: str,

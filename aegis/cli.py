@@ -178,6 +178,7 @@ def _register_subcommands() -> None:
     """
     from .cli_admin import admin_app
     from .cli_realm import realm_app
+    from .cli_nebula import nebula_app
     from . import cli_check
 
     app.add_typer(build_app, name="build", rich_help_panel=PANEL_DAILY)
@@ -190,6 +191,7 @@ def _register_subcommands() -> None:
     app.add_typer(dnssec_app, name="dnssec", rich_help_panel=PANEL_MATERIAL)
     app.add_typer(admin_app, name="admin", rich_help_panel=PANEL_MATERIAL)
     app.add_typer(realm_app, name="realm", rich_help_panel=PANEL_MATERIAL)
+    app.add_typer(nebula_app, name="nebula", rich_help_panel=PANEL_MATERIAL)
     cli_check.register(app)
 
 
@@ -459,6 +461,7 @@ def _build_everything(secrets_path: Optional[Path], dry_run: bool) -> None:
         typer.echo("  [dry-run] Would run: build ssh-keys")
         typer.echo("  [dry-run] Would run: build nexus-keys")
         typer.echo("  [dry-run] Would run: build keytabs")
+        typer.echo("  [dry-run] Would run: build nebula")
         typer.echo("  [dry-run] Would run: build user-secrets")
         return
 
@@ -478,10 +481,61 @@ def _build_everything(secrets_path: Optional[Path], dry_run: bool) -> None:
     typer.echo("\n--- Building Keytabs ---")
     build_keytabs(secrets_path=secrets_path, dry_run=False)
 
+    typer.echo("\n--- Building Nebula Certificates ---")
+    build_nebula_certs(secrets_path=secrets_path, dry_run=False)
+
     typer.echo("\n--- Building User Secrets ---")
     build_user_secrets(secrets_path=secrets_path, dry_run=False, user=None)
 
     typer.secho("\nBuild complete!", fg=typer.colors.GREEN)
+
+
+@build_app.command("nebula")
+def build_nebula_certs(
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n"),
+    network: Annotated[Optional[str], typer.Option("--network", "-N", help="Only this network")] = None,
+    renew_within: Annotated[int, typer.Option("--renew-within", help="Re-sign certificates with fewer days left than this")] = 30,
+    rotate: Annotated[bool, typer.Option("--rotate", "--force", "-f", help="DESTRUCTIVE: generate NEW key material, dropping hosts off the mesh until redeployed")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt for --rotate")] = False,
+):
+    """Sign Nebula certificates and generate the keys behind them.
+
+    Unlike the other generators, this is not purely "create if missing":
+    Nebula certificates expire. One with fewer than --renew-within days left is
+    re-signed against the host's existing key, which the mesh does not notice.
+    Only --rotate mints new key material, which drops a host until it is
+    deployed again.
+
+    Hosts marked --local-key keep their own private key; they are signed from
+    the public key imported with 'aegis nebula import-pubkey', and no key is
+    deployed to them.
+    \b
+    Examples:
+        aegis build nebula                     sign what is missing or expiring
+        aegis build nebula --renew-within 60
+        aegis build nebula --rotate --yes      NEW keys; drops hosts until deploy
+    """
+    from .cli_nebula import build_nebula
+
+    if rotate and not dry_run and not yes:
+        typer.secho(
+            "--rotate replaces Nebula key material: every affected host drops "
+            "off the mesh until it is deployed again. To re-encrypt without "
+            "changing keys, use 'aegis reencrypt'; to extend expiry, plain "
+            "'aegis build nebula' renews against the existing key.",
+            fg=typer.colors.YELLOW,
+        )
+        if not typer.confirm("Generate new Nebula keys?"):
+            raise typer.Abort()
+
+    build_nebula(
+        secrets_path=secrets_path,
+        dry_run=dry_run,
+        network=network,
+        renew_within=renew_within,
+        rotate=rotate,
+    )
 
 
 @build_app.command("all")
