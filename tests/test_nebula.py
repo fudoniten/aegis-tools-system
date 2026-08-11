@@ -157,6 +157,55 @@ def test_manifest_placement_can_be_overridden():
 
 
 @needs_nebula
+def test_capabilities_are_probed_not_assumed():
+    """The nebula-cert CLI changed in 1.10: `sign -ip` became `-networks`, and
+    `ca` gained `-version`. Whichever this machine has, the probe must agree
+    with itself -- a tool that offers -version is one that offers -networks."""
+    nebula._cert_capabilities.cache_clear()
+    caps = nebula._cert_capabilities()
+
+    assert nebula.supports_cert_v2() == ("ca:version" in caps)
+    assert nebula.default_cert_version() == (2 if nebula.supports_cert_v2() else 1)
+    expected = "-networks" if nebula.supports_cert_v2() else "-ip"
+    assert nebula._networks_flag() == expected
+
+
+@needs_nebula
+@needs_age
+def test_v2_is_refused_when_the_tool_cannot_make_it(repo, admin_key, monkeypatch):
+    """Asking for a format the tool cannot produce must fail with an
+    explanation, not a bare 'flag provided but not defined'."""
+    monkeypatch.setattr(nebula, "supports_cert_v2", lambda: False)
+    cfg = nebula.NetworkConfig(name="fudo", cidr="10.200.0.0/16", cert_version=2)
+
+    with pytest.raises(nebula.NebulaError, match="version 2 certificates"):
+        nebula.create_ca(repo, cfg, [admin_key.public_key])
+
+
+@needs_nebula
+@needs_age
+def test_cert_details_accepts_both_json_shapes(repo, admin_key, monkeypatch):
+    """`print -json` emits a bare object up to 1.9 and an array from 1.10."""
+    import json as _json
+
+    cfg = nebula.NetworkConfig(
+        name="fudo",
+        cidr="10.200.0.0/16",
+        cert_version=nebula.default_cert_version(),
+    )
+    _, ca_cert = nebula.create_ca(repo, cfg, [admin_key.public_key])
+
+    # Whatever shape this nebula-cert produced, both must parse.
+    details = nebula.cert_details(ca_cert)
+
+    monkeypatch.setattr(nebula, "_run", lambda cmd: _json.dumps([details]))
+    assert nebula.cert_details(ca_cert)["details"]["isCa"] is True
+
+    monkeypatch.setattr(nebula, "_run", lambda cmd: _json.dumps(details))
+    assert nebula.cert_details(ca_cert)["details"]["isCa"] is True
+
+
+@needs_nebula
 @needs_age
 def test_ca_key_is_never_stored_in_the_clear(repo, admin_key):
     cfg = nebula.NetworkConfig(name="fudo", cidr="10.200.0.0/16")
@@ -200,7 +249,10 @@ def test_signing_uses_the_network_prefix_not_the_site_range(repo, admin_key):
     tmp.write_bytes(signed.cert_pem)
     details = nebula.cert_details(tmp)["details"]
 
-    assert details["networks"] == ["10.200.10.1/16"]
+    # v1 calls the field "ips" and v2 "networks"; the value is the same single
+    # CIDR either way, and the /16 is the point of the test.
+    addresses = details.get("networks") or details.get("ips")
+    assert addresses == ["10.200.10.1/16"]
     assert details["name"] == "nostromo"
     assert details["groups"] == ["server"]
     assert signed.key_pem is not None
