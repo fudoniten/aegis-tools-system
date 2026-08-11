@@ -703,6 +703,7 @@ def register(app: typer.Typer) -> None:
         host: Optional[str] = typer.Option(None, "--host", "-H", help="Only this host's files"),
         category: Optional[str] = typer.Option(None, "--category", "-c", help="Only this category (admin-only, host, role, user, kdc, dnssec)"),
         dry_run: bool = typer.Option(False, "--dry-run", "-n"),
+        force: bool = typer.Option(False, "--force", "-f", help="Rewrite every selected file, even one that looks current"),
         yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
     ):
         """Re-encrypt every secret for the current recipient set.
@@ -718,12 +719,22 @@ def register(app: typer.Typer) -> None:
         makes unrecoverable, so a new admin key is not really redundant until
         this has run.
 
+        A file is normally skipped once it carries the expected *number* of
+        recipients, which keeps a re-run cheap and the git diff legible. age
+        does not reveal *which* keys a file was encrypted to, so a key that
+        was replaced rather than added -- a host's master key changing -- is
+        indistinguishable from a correct file and is skipped. Use --force
+        there: it rewrites everything the filters select, whatever the file
+        currently carries. Pair it with --host to keep the blast radius to
+        the host whose key changed.
+
         Per-host manifests are regenerated from src/ placement at the same
         time, so a target path changed in src/hosts/<host>.toml takes effect.
         \b
         Examples:
             aegis reencrypt --dry-run           what would change
             aegis reencrypt --host rama         one host's files
+            aegis reencrypt --host rama --force after rama's master key changed
             aegis reencrypt --category admin-only
         """
         from .cli import get_secrets_repo, admin_recipients
@@ -743,8 +754,11 @@ def register(app: typer.Typer) -> None:
         actionable = [p for p in policies if p.resolvable]
 
         # Only touch files whose recipient set actually differs, so a re-run is
-        # a no-op and the git diff stays legible.
-        stale = [
+        # a no-op and the git diff stays legible.  The test is by count because
+        # that is all age exposes, which is why --force exists: a key swapped
+        # for another leaves the count untouched and would otherwise be skipped
+        # forever.
+        stale = actionable if force else [
             p for p in actionable
             if crypto.recipients_of(p.path) != p.expected_count
         ]
@@ -781,7 +795,10 @@ def register(app: typer.Typer) -> None:
 
         if not stale:
             typer.secho(
-                "\nEvery file already carries the expected recipients.",
+                # Under --force nothing was skipped, so "already correct" would
+                # be a lie: there was simply nothing the filters could rewrite.
+                "\nNo re-encryptable file matched." if force
+                else "\nEvery file already carries the expected recipients.",
                 fg=typer.colors.GREEN,
             )
             if refreshed:
@@ -805,6 +822,15 @@ def register(app: typer.Typer) -> None:
             typer.echo(
                 "Each file is decrypted with your admin key and written back. "
                 "Key material is unchanged.")
+            if force:
+                typer.echo(
+                    "--force rewrites every selected file, including those "
+                    "that already look current.")
+                if not host and not category:
+                    typer.secho(
+                        "No --host or --category filter: this touches the "
+                        "whole repository.",
+                        fg=typer.colors.YELLOW)
             if not typer.confirm(f"Re-encrypt {len(stale)} file(s)?"):
                 raise typer.Abort()
 
