@@ -157,6 +157,9 @@ aegis check
 # Repair recipient drift without touching key material
 aegis reencrypt --host myhost
 
+# Rewrite regardless of what a file looks like (after replacing a key)
+aegis reencrypt --host myhost --force
+
 # Kerberos realms
 aegis realm init EXAMPLE.ORG --domain example.org
 aegis realm list
@@ -223,6 +226,29 @@ principal are encrypted for the admin set and nobody else, and they are
 exactly what a lost admin key makes unrecoverable. Filter with `--host` or
 `--category` (`admin-only`, `host`, `role`, `user`, `kdc`, `dnssec`); preview
 with `--dry-run`.
+
+#### Replacing a key needs `--force`
+
+By default a file is skipped once it carries the expected *number* of
+recipients, so a re-run is cheap and the git diff stays legible. age exposes
+only the count, never which keys — so a key that was **added** is detected,
+while a key that **replaced** another is not. Changing a host's master key
+leaves every one of its files looking correct while the host can no longer
+decrypt any of them:
+
+```bash
+aegis host set-key myhost --public-key age1...     # the new key
+aegis reencrypt --host myhost                      # "already carries the expected recipients"
+aegis reencrypt --host myhost --force              # actually rewrites them
+```
+
+`--force` rewrites everything the filters select, whatever it currently
+carries. Pair it with `--host` to keep the blast radius to the host whose key
+changed; without a filter it rewrites the whole repository. It never touches
+key material — unlike the builders' `--rotate` (which was itself once called
+`--force`), it only changes who can read the secrets that already exist.
+
+`aegis host set-key` points you here when it replaces an existing key.
 
 Files whose intended audience cannot be determined — anything under
 `deploy/` that no current policy describes — are reported and left untouched.

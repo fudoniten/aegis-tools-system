@@ -294,6 +294,144 @@ def test_reencrypt_is_idempotent(populated: config.SecretsRepo):
     assert populated.role_key_path("kdc").read_bytes() == before
 
 
+def test_replaced_host_key_is_invisible_without_force(populated: config.SecretsRepo):
+    """The blind spot --force exists for: a swapped key keeps the count.
+
+    age exposes only how many recipients a file has, so replacing rama's
+    master key leaves every file looking correct while the host can no longer
+    read any of them.
+    """
+    host_config = populated.get_host_config("rama")
+    assert host_config is not None
+    host_config.age_pubkey = crypto.generate_age_keypair().public_key
+    populated.set_host_config(host_config)
+
+    result = runner.invoke(
+        app, ["reencrypt", "--secrets-path", str(populated.path), "--yes"])
+
+    assert result.exit_code == 0
+    assert "already carries the expected recipients" in result.stdout
+
+
+def test_force_rewrites_for_a_replaced_host_key(populated: config.SecretsRepo):
+    """--force is what actually hands the new key access."""
+    replacement = crypto.generate_age_keypair()
+    host_config = populated.get_host_config("rama")
+    assert host_config is not None
+    host_config.age_pubkey = replacement.public_key
+    populated.set_host_config(host_config)
+
+    result = runner.invoke(app, [
+        "reencrypt", "--secrets-path", str(populated.path),
+        "--host", "rama", "--force", "--yes",
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert crypto.decrypt_age_bytes(
+        populated.host_deploy_path("rama") / "nexus-key.age",
+        identity_content=replacement.private_key) == b"ddns"
+
+
+def test_force_leaves_unfiltered_files_alone(populated: config.SecretsRepo):
+    """--host still bounds --force: nothing outside the host is touched."""
+    replacement = crypto.generate_age_keypair()
+    host_config = populated.get_host_config("rama")
+    assert host_config is not None
+    host_config.age_pubkey = replacement.public_key
+    populated.set_host_config(host_config)
+
+    before = populated.role_key_path("kdc").read_bytes()
+
+    runner.invoke(app, [
+        "reencrypt", "--secrets-path", str(populated.path),
+        "--host", "rama", "--force", "--yes",
+    ])
+
+    assert populated.role_key_path("kdc").read_bytes() == before
+
+
+def test_force_rewrites_even_when_nothing_changed(populated: config.SecretsRepo):
+    """No key changed at all: --force still rewrites, unlike a bare run."""
+    before = populated.role_key_path("kdc").read_bytes()
+
+    result = runner.invoke(app, [
+        "reencrypt", "--secrets-path", str(populated.path), "--force", "--yes",
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert "file(s) to re-encrypt" in result.stdout
+    # Rewritten (age output differs per run), and still readable.
+    assert populated.role_key_path("kdc").read_bytes() != before
+    assert crypto.decrypt_age_bytes(populated.role_key_path("kdc")) == b"role-priv"
+
+
+def test_force_dry_run_writes_nothing(populated: config.SecretsRepo):
+    before = populated.role_key_path("kdc").read_bytes()
+
+    result = runner.invoke(app, [
+        "reencrypt", "--secrets-path", str(populated.path),
+        "--force", "--dry-run",
+    ])
+
+    assert result.exit_code == 0
+    assert "[dry-run]" in result.stdout
+    assert populated.role_key_path("kdc").read_bytes() == before
+
+
+def test_force_reports_undecryptable_file(populated: config.SecretsRepo):
+    """--force must not turn an unreadable file into a silent skip."""
+    stranger = crypto.generate_age_keypair()
+    _write_encrypted(
+        populated.role_key_path("orphan"), b"unreachable", [stranger.public_key])
+
+    result = runner.invoke(app, [
+        "reencrypt", "--secrets-path", str(populated.path), "--force", "--yes",
+    ])
+
+    assert result.exit_code == 1
+    assert "cannot decrypt" in result.stdout + str(result.stderr or "")
+
+
+def test_set_key_warns_when_it_replaces_a_key(populated: config.SecretsRepo):
+    """The operator learns about --force at the moment they need it."""
+    replacement = crypto.generate_age_keypair()
+
+    result = runner.invoke(app, [
+        "host", "set-key", "rama", "--public-key", replacement.public_key,
+        "--secrets-path", str(populated.path),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert "still encrypted for the old key" in result.stdout
+    assert "aegis reencrypt --host rama --force" in result.stdout
+
+
+def test_set_key_is_quiet_for_a_first_key(repo: config.SecretsRepo):
+    """Nothing was encrypted for an old key, so there is nothing to warn about."""
+    keypair = crypto.generate_age_keypair()
+
+    result = runner.invoke(app, [
+        "host", "set-key", "fresh", "--public-key", keypair.public_key,
+        "--secrets-path", str(repo.path),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert "--force" not in result.stdout
+
+
+def test_set_key_is_quiet_when_the_key_is_unchanged(populated: config.SecretsRepo):
+    host_config = populated.get_host_config("rama")
+    assert host_config is not None
+
+    result = runner.invoke(app, [
+        "host", "set-key", "rama", "--public-key", host_config.age_pubkey,
+        "--secrets-path", str(populated.path),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    assert "--force" not in result.stdout
+
+
 def test_reencrypt_dry_run_writes_nothing(populated: config.SecretsRepo):
     admin.add_key(populated, crypto.generate_age_keypair().public_key, "backup")
     before = populated.role_key_path("kdc").read_bytes()

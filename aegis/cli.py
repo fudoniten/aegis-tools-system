@@ -2457,6 +2457,7 @@ def set_master_key(
 
     # Get or create host config
     host_config = repo.get_host_config(hostname)
+    replaced = host_config.age_pubkey if host_config else None
     if not host_config:
         typer.echo(f"Creating new host config for {hostname}...")
         host_config = config.HostConfig(
@@ -2472,6 +2473,21 @@ def set_master_key(
     typer.echo(f"  Age public key: {public_key}")
     typer.echo(f"  Config: {repo.src_path / 'hosts' / f'{hostname}.toml'}")
     typer.echo("")
+
+    if replaced and replaced != public_key:
+        # Existing files are still encrypted to the old key, and a plain
+        # reencrypt will not notice: the recipient count is unchanged, which is
+        # all age lets us compare.  Without --force the host silently fails to
+        # decrypt anything at next boot.
+        typer.secho(
+            f"{hostname}'s previous master key was replaced, so its existing "
+            f"secrets are still encrypted for the old key.",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo(f"  Replaced: {replaced}")
+        typer.echo(f"  Rewrite them: aegis reencrypt --host {hostname} --force")
+        typer.echo("")
+
     typer.echo("Now you can encrypt secrets for this host with 'aegis build'")
 
     if not host_config.deploys:
