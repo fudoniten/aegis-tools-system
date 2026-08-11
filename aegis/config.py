@@ -335,6 +335,7 @@ class SecretsRepo:
         (self.src_path / "roles").mkdir(parents=True, exist_ok=True)
         (self.src_path / "users").mkdir(parents=True, exist_ok=True)
         (self.src_path / "kerberos" / "realms").mkdir(parents=True, exist_ok=True)
+        (self.src_path / "nebula" / "networks").mkdir(parents=True, exist_ok=True)
         (self.keys_path / "admin").mkdir(parents=True, exist_ok=True)
         (self.keys_path / "users").mkdir(parents=True, exist_ok=True)
         (self.keys_path / "roles").mkdir(parents=True, exist_ok=True)
@@ -516,6 +517,54 @@ class SecretsRepo:
         the public key is a file, so the directory cannot share its name.
         """
         return self.roles_deploy_path() / role_name
+
+    # Nebula overlay networks
+    #
+    # A network is shaped like a Kerberos realm: shared signing material in
+    # src/, per-host output in deploy/.  The CA private key is encrypted to the
+    # admin set only and never leaves for a host; the CA certificate beside it
+    # is public and stored in the clear.
+
+    @property
+    def nebula_networks_path(self) -> Path:
+        return self.src_path / "nebula" / "networks"
+
+    def nebula_network_path(self, network: str) -> Path:
+        return self.nebula_networks_path / network
+
+    def nebula_ca_key_path(self, network: str) -> Path:
+        """The CA private key, encrypted to admins. The one critical secret."""
+        return self.nebula_network_path(network) / "ca.key.age"
+
+    def nebula_ca_cert_path(self, network: str) -> Path:
+        """The CA certificate. Public, stored in the clear."""
+        return self.nebula_network_path(network) / "ca.crt"
+
+    def nebula_hosts_path(self, network: str) -> Path:
+        return self.nebula_network_path(network) / "hosts"
+
+    def nebula_host_config_path(self, network: str, hostname: str) -> Path:
+        return self.nebula_hosts_path(network) / f"{hostname}.toml"
+
+    def nebula_pubkeys_path(self, network: str) -> Path:
+        """Public keys submitted by hosts that keep their own private key."""
+        return self.nebula_network_path(network) / "pubkeys"
+
+    def nebula_host_pubkey_path(self, network: str, hostname: str) -> Path:
+        return self.nebula_pubkeys_path(network) / f"{hostname}.pub"
+
+    def nebula_deploy_path(self, network: str) -> Path:
+        """Network-wide output, as opposed to any one host's."""
+        return self.deploy_path / "nebula" / network
+
+    def nebula_host_deploy_path(self, hostname: str, network: str) -> Path:
+        return self.host_deploy_path(hostname) / "nebula"
+
+    def list_nebula_networks(self) -> list[str]:
+        root = self.nebula_networks_path
+        if not root.exists():
+            return []
+        return sorted(d.name for d in root.iterdir() if d.is_dir())
 
     def role_secrets_path(self, role_name: str) -> Path:
         """Directory holding secrets encrypted to a role."""
