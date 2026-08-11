@@ -30,6 +30,7 @@ evaluation time to build the lighthouse list and static host map, and Nix
 cannot decrypt.  It holds only addresses and public endpoints.
 """
 
+import functools
 import ipaddress
 import json
 import re
@@ -65,16 +66,21 @@ DEFAULT_CERT_DURATION = "8760h"     # 1 year
 #: missing" is not enough on its own.
 DEFAULT_RENEW_WITHIN_DAYS = 30
 
-#: Certificate format.  ``nebula-cert`` defaults to 2, and ``sign`` inherits
-#: the CA's version, so this is decided once when the CA is minted and cannot
-#: be changed afterwards -- every certificate the CA signs carries it.
+#: Certificate format, for a network whose config predates the field.  The
+#: version is decided once when the CA is minted and cannot be changed
+#: afterwards -- ``sign`` inherits it, and every certificate the CA signs
+#: carries it.  A network created without the field was necessarily made by a
+#: nebula-cert that only knew v1.
 #:
-#: Version 2 brings IPv6 and multiple addresses per certificate, and is only
-#: understood by Nebula 1.10 and later.  Version 1 is IPv4-only but is read by
-#: everything.  It is the right choice if anything on the mesh might run an
-#: older Nebula than the fleet's nixpkgs pin -- the iOS and Android clients
-#: being the usual reason.
-DEFAULT_CERT_VERSION = 2
+#: Version 2 brings IPv6 and multiple addresses per certificate, and needs
+#: Nebula 1.10 or later at both ends.  Version 1 is IPv4-only but is read by
+#: everything -- the right choice if anything on the mesh might run an older
+#: Nebula than the fleet's nixpkgs pin, the iOS and Android clients being the
+#: usual reason.
+#:
+#: What a *new* network gets when nothing is specified comes from
+#: :func:`default_cert_version`, which asks the tool rather than assuming.
+LEGACY_CERT_VERSION = 1
 
 
 class NebulaError(AegisError):
@@ -90,8 +96,9 @@ class NetworkConfig:
     port: int = DEFAULT_PORT
     ca_duration: str = DEFAULT_CA_DURATION
     cert_duration: str = DEFAULT_CERT_DURATION
-    #: Fixed when the CA is minted; see :data:`DEFAULT_CERT_VERSION`.
-    cert_version: int = DEFAULT_CERT_VERSION
+    #: Fixed when the CA is minted; see :data:`LEGACY_CERT_VERSION` and
+    #: :func:`default_cert_version`.
+    cert_version: int = LEGACY_CERT_VERSION
     #: Allocation convenience only: site -> CIDR to draw addresses from.  It
     #: has no routing meaning; every certificate is issued with the *network*
     #: prefix (see :meth:`prefix_length`), because that prefix is what tells a
@@ -119,7 +126,7 @@ class NetworkConfig:
             port=data.get("port", DEFAULT_PORT),
             ca_duration=data.get("ca_duration", DEFAULT_CA_DURATION),
             cert_duration=data.get("cert_duration", DEFAULT_CERT_DURATION),
-            cert_version=int(data.get("cert_version", DEFAULT_CERT_VERSION)),
+            cert_version=int(data.get("cert_version", LEGACY_CERT_VERSION)),
             site_ranges=dict(data.get("site_ranges", {})),
         )
 
@@ -281,6 +288,51 @@ def assert_unique(hosts: dict[str, HostEntry]) -> None:
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=1)
+def _cert_capabilities() -> frozenset[str]:
+    """Which flags this ``nebula-cert`` understands.
+
+    The CLI changed shape in Nebula 1.10, when the v2 certificate format
+    arrived: ``sign -ip`` became ``sign -networks`` (a list, since a v2
+    certificate can carry several addresses), and ``ca`` gained ``-version``.
+
+    Probing rather than assuming keeps this working against whichever Nebula
+    the admin's machine happens to have -- which is not necessarily the one the
+    fleet runs, and not necessarily the one this flake pins.
+    """
+    caps: set[str] = set()
+    for mode, flags in (("ca", ("version", )), ("sign", ("networks", ))):
+        try:
+            result = subprocess.run(
+                ["nebula-cert", mode, "-h"], capture_output=True, text=True
+            )
+        except FileNotFoundError as exc:
+            raise NebulaError(
+                "nebula-cert not found. It comes from the 'nebula' package; the "
+                "aegis wrapper puts it on PATH."
+            ) from exc
+        # -h writes usage to stderr on some versions and stdout on others.
+        text = result.stdout + result.stderr
+        for flag in flags:
+            if f"-{flag}" in text:
+                caps.add(f"{mode}:{flag}")
+    return frozenset(caps)
+
+
+def supports_cert_v2() -> bool:
+    """Whether this nebula-cert can mint version 2 certificates (1.10+)."""
+    return "ca:version" in _cert_capabilities()
+
+
+def default_cert_version() -> int:
+    """The newest certificate format this nebula-cert can produce."""
+    return 2 if supports_cert_v2() else 1
+
+
+def _networks_flag() -> str:
+    return "-networks" if "sign:networks" in _cert_capabilities() else "-ip"
+
+
 def _run(cmd: list[str]) -> str:
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -297,13 +349,19 @@ def _run(cmd: list[str]) -> str:
 
 
 def cert_details(cert_path: Path) -> dict[str, Any]:
-    """Parsed certificate.  ``print -json`` always emits an array, even for a
-    single certificate."""
+    """Parsed certificate.
+
+    ``print -json`` emits a bare object up to Nebula 1.9 and an array from 1.10
+    onwards, where one file may hold a bundle.  Either way this wants the first
+    certificate in it.
+    """
     out = _run(["nebula-cert", "print", "-path", str(cert_path), "-json"])
-    certs = json.loads(out)
-    if not certs:
-        raise NebulaError(f"No certificate in {cert_path}")
-    return certs[0]
+    parsed = json.loads(out)
+    if isinstance(parsed, list):
+        if not parsed:
+            raise NebulaError(f"No certificate in {cert_path}")
+        return parsed[0]
+    return parsed
 
 
 #: Go marshals ``time.Time`` as RFC3339 *Nano*, which can carry nine digits of
@@ -388,20 +446,35 @@ def create_ca(
     if not admin_keys:
         raise NebulaError("No admin recipients; refusing to mint an unrecoverable CA")
 
+    if cfg.cert_version == 2 and not supports_cert_v2():
+        raise NebulaError(
+            "this nebula-cert cannot create version 2 certificates -- the "
+            "-version flag arrived in Nebula 1.10, and this one does not have "
+            "it.\n"
+            "Either upgrade Nebula, or create the network with "
+            "--cert-version 1, which is IPv4-only but understood by every "
+            "release. The choice is permanent: signing inherits the CA's "
+            "version."
+        )
+
     with tempfile.TemporaryDirectory(prefix="aegis-nebula-ca-") as tmp:
         tmp_path = Path(tmp)
         tmp_key = tmp_path / "ca.key"
         tmp_crt = tmp_path / "ca.crt"
-        _run([
+        cmd = [
             "nebula-cert", "ca",
             "-name", cfg.name,
             "-duration", cfg.ca_duration,
-            # Explicit: the CA's version is inherited by every certificate it
-            # signs and cannot be changed later.
-            "-version", str(cfg.cert_version),
             "-out-key", str(tmp_key),
             "-out-crt", str(tmp_crt),
-        ])
+        ]
+        # Explicit where the flag exists: the CA's version is inherited by
+        # every certificate it signs and cannot be changed later. Where it does
+        # not exist the tool predates v2 and only makes v1, which is what
+        # cfg.cert_version must already say.
+        if supports_cert_v2():
+            cmd.extend(["-version", str(cfg.cert_version)])
+        _run(cmd)
         key_age.parent.mkdir(parents=True, exist_ok=True)
         crypto.encrypt_age(tmp_key.read_bytes(), admin_keys, key_age)
         crt.write_bytes(tmp_crt.read_bytes())
@@ -464,7 +537,10 @@ def sign_host(
             "-name", entry.hostname,
             # The network prefix, not the site range: this is what tells the
             # host which addresses route over the tun device.
-            "-networks", f"{entry.address}/{cfg.prefix_length}",
+            #
+            # -networks on Nebula 1.10+, -ip before it. The value is the same
+            # single CIDR either way; v2 merely allows a list.
+            _networks_flag(), f"{entry.address}/{cfg.prefix_length}",
             "-duration", cfg.cert_duration,
             "-in-pub", str(pubkey_path),
             "-out-crt", str(out_crt),

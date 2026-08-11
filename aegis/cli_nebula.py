@@ -51,7 +51,7 @@ def nebula_init(
     port: Annotated[int, typer.Option("--port", help="UDP port lighthouses listen on")] = nebula_mod.DEFAULT_PORT,
     ca_duration: Annotated[str, typer.Option("--ca-duration")] = nebula_mod.DEFAULT_CA_DURATION,
     cert_duration: Annotated[str, typer.Option("--cert-duration")] = nebula_mod.DEFAULT_CERT_DURATION,
-    cert_version: Annotated[int, typer.Option("--cert-version", help="Certificate format: 2 (default) or 1 for older clients")] = nebula_mod.DEFAULT_CERT_VERSION,
+    cert_version: Annotated[Optional[int], typer.Option("--cert-version", help="Certificate format: 2, or 1 for older clients. Defaults to the newest this nebula-cert supports")] = None,
 ):
     """Create a Nebula network and mint its CA.
 
@@ -65,9 +65,10 @@ def nebula_init(
 
     --cert-version is likewise permanent: signing inherits the CA's version.
     Version 2 gives IPv6 and multiple addresses per certificate but needs
-    Nebula 1.10+ everywhere; version 1 is IPv4-only and read by everything.
-    Choose 1 if anything on the mesh might run older Nebula than the fleet's
-    nixpkgs pin — the mobile clients being the usual reason.
+    Nebula 1.10+ at both ends; version 1 is IPv4-only and read by everything.
+    It defaults to the newest this nebula-cert can produce. Choose 1 if
+    anything on the mesh might run an older Nebula than the machine minting
+    the CA — the mobile clients being the usual reason.
     \b
     Examples:
         aegis nebula init fudo --cidr 10.200.0.0/16
@@ -77,6 +78,11 @@ def nebula_init(
 
     if nebula_mod.list_networks(repo) and network in nebula_mod.list_networks(repo):
         raise AegisError(f"Network '{network}' already exists")
+
+    # Ask the tool rather than assuming: nebula-cert only learned to make v2
+    # certificates in 1.10, and this may not be that.
+    if cert_version is None:
+        cert_version = nebula_mod.default_cert_version()
 
     cfg = nebula_mod.NetworkConfig(
         name=network,
@@ -96,6 +102,9 @@ def nebula_init(
     config_path = nebula_mod.save_network(repo, cfg)
 
     typer.echo(f"Created Nebula network '{network}' ({cidr})")
+    typer.echo(f"  certificate format: version {cert_version}"
+               + ("" if cert_version == 2 else
+                  "  (IPv4 only; readable by every Nebula release)"))
     typer.echo(f"  {config_path}")
     typer.echo(f"  {key_path}   encrypted to {len(admin_keys)} admin key(s)")
     typer.echo(f"  {cert_path}  public")
