@@ -328,7 +328,15 @@ def build_nebula(
         cfg = nebula_mod.load_network(repo, net)
         hosts = nebula_mod.all_hosts(repo, net)
         if not hosts:
-            typer.echo(f"  {net}: no hosts on this network yet")
+            # Worth spelling out, because the two commands look
+            # interchangeable and are not: this one signs what src/ already
+            # holds, and something else has to put it there.
+            typer.echo(
+                f"  {net}: no hosts on this network yet. 'aegis build' only "
+                f"signs hosts that are already on the network -- add them "
+                f"with 'fudo-sync' (from the entity data) or "
+                f"'aegis nebula add-host'."
+            )
             continue
 
         nebula_mod.assert_unique(hosts)
