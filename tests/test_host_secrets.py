@@ -140,6 +140,73 @@ def test_ssh_host_key_types_field():
     assert d1["type"] == "ecdsa"
 
 
+def _ssh_entries(*pairs):
+    return host_secrets.make_ssh_host_keys_entries(
+        stems=[stem for stem, _ in pairs],
+        key_types=[key_type for _, key_type in pairs],
+    )
+
+
+def test_merge_ssh_host_keys_keeps_other_types():
+    """Importing one type at a time accumulates instead of replacing.
+
+    The shell-loop case: `for t in ed25519 ecdsa; do aegis ssh import ...; done`
+    previously left the manifest declaring only ecdsa.
+    """
+    existing = _ssh_entries(("ssh_host_ed25519_key", "ed25519"))
+    new = _ssh_entries(("ssh_host_ecdsa_key", "ecdsa"))
+
+    merged = host_secrets.merge_ssh_host_keys_entries(existing, new)
+
+    assert [e.target for e in merged] == [
+        "ssh_host_ed25519_key", "ssh_host_ecdsa_key"]
+    assert [e.type for e in merged] == ["ed25519", "ecdsa"]
+
+
+def test_merge_ssh_host_keys_replaces_same_target_in_place():
+    """Re-importing a key replaces it and keeps its position."""
+    existing = _ssh_entries(
+        ("ssh_host_ed25519_key", "ed25519"), ("ssh_host_ecdsa_key", "ecdsa"))
+    new = host_secrets.make_ssh_host_keys_entries(
+        stems=["ssh_host_ed25519_key"],
+        key_types=["ed25519"],
+        placement=Placement(mode="0400"),
+    )
+
+    merged = host_secrets.merge_ssh_host_keys_entries(existing, new)
+
+    assert len(merged) == 2
+    assert [e.target for e in merged] == [
+        "ssh_host_ed25519_key", "ssh_host_ecdsa_key"]
+    assert merged[0].mode == "0400"
+
+
+def test_merge_ssh_host_keys_rejects_duplicate_type():
+    """Two entries of one type collapse into a single unit in the NixOS module."""
+    existing = _ssh_entries(("ssh_host_ed25519_key", "ed25519"))
+    new = _ssh_entries(("deploy_ed25519_key", "ed25519"))
+
+    with pytest.raises(ValueError, match="duplicate SSH host key type"):
+        host_secrets.merge_ssh_host_keys_entries(existing, new)
+
+
+def test_merge_ssh_host_keys_into_empty_manifest():
+    """A first import on a host with no entries is unaffected."""
+    new = _ssh_entries(("ssh_host_ed25519_key", "ed25519"))
+    assert host_secrets.merge_ssh_host_keys_entries([], new) == new
+
+
+def test_merge_ssh_host_keys_tolerates_untyped_entries():
+    """Entries without a type predate the type field; they must not collide."""
+    existing = host_secrets.make_ssh_host_keys_entries(
+        stems=["ssh_host_rsa_key", "ssh_host_dsa_key"])
+    new = _ssh_entries(("ssh_host_ed25519_key", "ed25519"))
+
+    merged = host_secrets.merge_ssh_host_keys_entries(existing, new)
+
+    assert len(merged) == 3
+
+
 def test_ssh_host_key_types_field_absent_without_key_types():
     """type field is absent from TOML when key_types are not provided."""
     entries = host_secrets.make_ssh_host_keys_entries(stems=["ssh_host_ed25519_key"])
@@ -180,3 +247,30 @@ def test_load_nonexistent_dnssec_manifest(tmp_path: Path):
     """Loading a nonexistent DNSSEC manifest returns None."""
     result = host_secrets.load_dnssec_manifest(tmp_path, "nonexistent.org")
     assert result is None
+
+
+def test_sequential_imports_accumulate_on_disk(tmp_path):
+    """The reported regression, end to end through the manifest round-trip.
+
+    Two `aegis ssh import` runs against the same host -- the ed25519 pass then
+    the ecdsa pass -- must leave both declared. Previously the second run
+    replaced the first, leaving the ed25519 ciphertext on disk with nothing in
+    the manifest pointing at it.
+    """
+    deploy = tmp_path / "deploy"
+
+    for stem, key_type in (("ssh_host_ed25519_key", "ed25519"),
+                           ("ssh_host_ecdsa_key", "ecdsa")):
+        manifest = host_secrets.load_host_manifest(deploy, "testhost")
+        manifest.ssh_host_keys = host_secrets.merge_ssh_host_keys_entries(
+            manifest.ssh_host_keys,
+            host_secrets.make_ssh_host_keys_entries(
+                stems=[stem], key_types=[key_type]),
+        )
+        host_secrets.save_host_manifest(deploy, manifest)
+
+    reloaded = host_secrets.load_host_manifest(deploy, "testhost")
+
+    assert [e.target for e in reloaded.ssh_host_keys] == [
+        "ssh_host_ed25519_key", "ssh_host_ecdsa_key"]
+    assert sorted(e.type for e in reloaded.ssh_host_keys) == ["ecdsa", "ed25519"]

@@ -1579,12 +1579,26 @@ def import_ssh_host_keys(
         target_dir=target_dir, user=user, group=group, mode=mode))
 
     manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
-    manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
+    imported = host_secrets.make_ssh_host_keys_entries(
         stems=stems,
         placement=host_placement(repo, hostname, "ssh-host-keys"),
         key_types=key_types,
     )
+    # Merge rather than assign: importing one key per invocation is the obvious
+    # way to drive this from a shell loop, and replacing the list makes each
+    # run discard the previous one's declaration while leaving its ciphertext
+    # in place -- a host that silently offers one key type.
+    try:
+        manifest.ssh_host_keys = host_secrets.merge_ssh_host_keys_entries(
+            manifest.ssh_host_keys, imported)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
     manifest_path = host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    kept = len(manifest.ssh_host_keys) - len(imported)
+    if kept > 0:
+        typer.echo(f"  Kept {kept} existing key entr{'y' if kept == 1 else 'ies'}")
 
     typer.secho(f"\nSSH host keys imported successfully!", fg=typer.colors.GREEN)
     typer.echo(f"  Output dir: {ssh_dir}")
