@@ -375,6 +375,57 @@ def make_ssh_host_keys_entries(
     return entries
 
 
+def merge_ssh_host_keys_entries(
+    existing: list[SecretEntry],
+    new: list[SecretEntry],
+) -> list[SecretEntry]:
+    """Merge freshly imported SSH host key entries into a host's existing set.
+
+    Importing one key at a time is the natural way to drive ``aegis ssh
+    import`` from a shell loop, and assigning ``manifest.ssh_host_keys``
+    outright makes each invocation silently discard the previous one's work:
+    after ::
+
+        for t in ed25519 ecdsa; do aegis ssh import "$h" --key "$h.$t.key"; done
+
+    the manifest declares only ecdsa, while the ciphertext for both sits in
+    ``deploy/hosts/<host>/ssh/``.  Nothing fails, and the NixOS module builds
+    ``services.openssh.hostKeys`` from the manifest, so the host quietly comes
+    up offering a single key type.
+
+    Entries are keyed by ``target`` -- the filename sshd is handed -- so
+    re-importing the same key replaces it in place and keeps its position.
+
+    Raises:
+        ValueError: if the merged set would carry a duplicate ``type``.  The
+            NixOS module names its units ``aegis-ssh-<type>`` and collects them
+            with ``listToAttrs``, so two entries of one type collapse into a
+            single unit and the other's target is never written.  There is no
+            case where that is what the caller wanted.
+    """
+    pending = {entry.target: entry for entry in new}
+
+    merged = [pending.pop(entry.target, entry) for entry in existing]
+    merged.extend(entry for entry in new if entry.target in pending)
+
+    types = [entry.type for entry in merged if entry.type is not None]
+    duplicates = sorted({t for t in types if types.count(t) > 1})
+    if duplicates:
+        offenders = ", ".join(
+            f"{entry.target} ({entry.type})"
+            for entry in merged if entry.type in duplicates
+        )
+        raise ValueError(
+            f"duplicate SSH host key type(s) {', '.join(duplicates)}: {offenders}. "
+            f"The NixOS module names units aegis-ssh-<type>, so these would "
+            f"collapse into one unit and some keys would never be written. "
+            f"Keys that are not sshd host identities (deploy, initrd) belong "
+            f"in [secrets], not [[ssh-host-keys]]."
+        )
+
+    return merged
+
+
 def make_keytab_entry(placement: Placement | None = None) -> SecretEntry:
     """Create a keytab manifest entry.
 
