@@ -15,26 +15,46 @@ class SSHKeypair:
     comment: str
 
 
-@dataclass  
+@dataclass
 class HostSSHKeys:
-    """All SSH keys for a host."""
+    """All SSH keys for a host.
+
+    Four keypairs, but only two of them are sshd host keys.  The deploy key is
+    for deploy-rs, and the initrd key identifies the initramfs sshd, which is a
+    separate server with its own configuration -- neither is an identity the
+    running sshd should present.  The distinction is not cosmetic: manifests
+    that lost it put all four in ``[[ssh-host-keys]]``, which is exactly where
+    ``services.openssh.hostKeys`` is built from.
+    """
     host_ed25519: SSHKeypair
     host_ecdsa: SSHKeypair
     deploy_ed25519: SSHKeypair
     initrd_ed25519: SSHKeypair
-    
+
+    def host_key_items(self) -> list[tuple[str, "SSHKeypair"]]:
+        """(file_stem, keypair) for the keys sshd presents as this host."""
+        return [
+            ("ssh_host_ed25519_key", self.host_ed25519),
+            ("ssh_host_ecdsa_key", self.host_ecdsa),
+        ]
+
+    def auxiliary_items(self) -> list[tuple[str, "SSHKeypair"]]:
+        """(file_stem, keypair) for the keys sshd must *not* be handed."""
+        return [
+            ("deploy_ed25519_key", self.deploy_ed25519),
+            ("initrd_ed25519_key", self.initrd_ed25519),
+        ]
+
     def items(self) -> list[tuple[str, "SSHKeypair"]]:
         """Return (file_stem, keypair) pairs for each key.
 
         The file stem is the intended filename on the SSH server
-        (e.g. ssh_host_ed25519_key), without any extension.
+        (e.g. ssh_host_ed25519_key), without any extension.  Every key is
+        encrypted and delivered the same way, so this is the right list for
+        writing them out -- but not for building the manifest, which has to
+        keep the two categories apart.
         """
-        return [
-            ("ssh_host_ed25519_key", self.host_ed25519),
-            ("ssh_host_ecdsa_key", self.host_ecdsa),
-            ("deploy_ed25519_key", self.deploy_ed25519),
-            ("initrd_ed25519_key", self.initrd_ed25519),
-        ]
+        return self.host_key_items() + self.auxiliary_items()
 
 
 def generate_ssh_keypair(

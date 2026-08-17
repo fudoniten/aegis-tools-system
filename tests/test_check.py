@@ -312,3 +312,93 @@ def test_unfinished_rotation_is_reported(repo: config.SecretsRepo):
 
     assert "mid-rotation" in _messages(report)
     assert "--prune" in "\n".join(f.hint or "" for f in report.findings)
+
+
+# =============================================================================
+# [[ssh-host-keys]] hygiene
+# =============================================================================
+
+def _misfiled_manifest(repo: config.SecretsRepo, hostname: str) -> None:
+    """A host whose deploy and initrd keys were swept in with the host keys."""
+    ssh_dir = repo.host_deploy_path(hostname) / "ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    for stem in (
+        "ssh_host_ed25519_key",
+        "ssh_host_ecdsa_key",
+        "deploy_ed25519_key",
+        "initrd_ed25519_key",
+    ):
+        (ssh_dir / f"{stem}.age").write_text("x")
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+    manifest.ssh_host_keys = [
+        host_secrets.SecretEntry(
+            source=f"ssh/{stem}.age",
+            target=stem,
+            target_dir="/run/aegis/ssh",
+            mode="0600",
+            type=key_type,
+        )
+        for stem, key_type in [
+            ("ssh_host_ed25519_key", "ed25519"),
+            ("ssh_host_ecdsa_key", "ecdsa"),
+            ("deploy_ed25519_key", "deploy_ed25519"),
+            ("initrd_ed25519_key", "initrd_ed25519"),
+        ]
+    ]
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+
+def test_non_sshd_key_type_is_an_error(repo: config.SecretsRepo):
+    """nomenclator-0's shape: deploy and initrd keys typed as host keys."""
+    add_host(repo, "nomenclator-0")
+    _misfiled_manifest(repo, "nomenclator-0")
+
+    report = cli_check.run_check(repo)
+
+    errors = _errors(report)
+    assert "deploy_ed25519_key as type deploy_ed25519" in errors
+    assert "initrd_ed25519_key as type initrd_ed25519" in errors
+
+
+def test_duplicate_key_type_is_an_error(repo: config.SecretsRepo):
+    """forge's shape: several ed25519 keys all typed ed25519."""
+    add_host(repo, "forge")
+    ssh_dir = repo.host_deploy_path("forge") / "ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    (ssh_dir / "ssh_host_ed25519_key.age").write_text("x")
+    (ssh_dir / "deploy_ed25519_key.age").write_text("x")
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, "forge")
+    manifest.ssh_host_keys = [
+        host_secrets.SecretEntry(
+            source=f"ssh/{stem}.age", target=stem, type="ed25519")
+        for stem in ("ssh_host_ed25519_key", "deploy_ed25519_key")
+    ]
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    report = cli_check.run_check(repo)
+
+    assert "repeats type(s) ed25519" in _errors(report)
+
+
+def test_refresh_manifest_repairs_a_misfiled_host(repo: config.SecretsRepo):
+    """The non-destructive repair: rebuild from disk, regenerating no key."""
+    add_host(repo, "nomenclator-0")
+    _misfiled_manifest(repo, "nomenclator-0")
+
+    cli_check._refresh_manifest(repo, "nomenclator-0")
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, "nomenclator-0")
+
+    assert sorted(e.target for e in manifest.ssh_host_keys) == [
+        "ssh_host_ecdsa_key", "ssh_host_ed25519_key"]
+    assert sorted(e.type for e in manifest.ssh_host_keys) == ["ecdsa", "ed25519"]
+
+    # The deploy and initrd keys are still deployed -- to the same path -- but
+    # no longer as sshd identities.
+    assert manifest.secrets["deploy-ed25519-key"].target == (
+        "/run/aegis/ssh/deploy_ed25519_key")
+    assert manifest.secrets["initrd-ed25519-key"].type is None
+
+    assert cli_check.run_check(repo).errors == []
