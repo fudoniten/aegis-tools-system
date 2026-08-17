@@ -482,3 +482,57 @@ def _build_one(
 
     expiry = nebula_mod.cert_expiry(out_dir / f"{cfg.name}.crt")
     typer.echo(f"    {entry.address}/{cfg.prefix_length}, expires {expiry.date()}")
+
+
+@nebula_app.command("delete-host")
+def nebula_delete_host(
+    network: str = typer.Argument(..., help="Network the host is on"),
+    hostname: str = typer.Argument(..., help="Host to remove from the network"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Delete even though something still refers to it"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be removed and stop"),
+):
+    """Take a host off a Nebula network.
+
+    Undeploys, it does not revoke: the certificate stays valid to every peer
+    until it expires. Rebuild the network afterwards so network.json stops
+    advertising it.
+    \b
+    Example:
+        aegis nebula delete-host fudo old-box --dry-run
+    """
+    from . import removal
+    from .cli_removal import run_removal
+
+    repo = _repo(secrets_path)
+    run_removal(
+        removal.plan_nebula_host_removal(repo, network, hostname),
+        force=force, yes=yes, dry_run=dry_run,
+    )
+
+
+@nebula_app.command("delete")
+def nebula_delete(
+    network: str = typer.Argument(..., help="Network to delete"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Delete even though hosts are still on it"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be removed and stop"),
+):
+    """Delete a Nebula network, its CA and every host's certificate.
+
+    Refuses while hosts are still on it -- remove them with 'aegis nebula
+    delete-host' first, so each one is a deliberate step.
+    \b
+    Example:
+        aegis nebula delete retired-mesh --dry-run
+    """
+    from . import removal
+    from .cli_removal import run_removal
+
+    repo = _repo(secrets_path)
+    run_removal(
+        removal.plan_nebula_network_removal(repo, network),
+        force=force, yes=yes, dry_run=dry_run,
+    )
