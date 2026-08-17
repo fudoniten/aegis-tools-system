@@ -58,6 +58,7 @@ Example manifest:
     role = "authentik"
 """
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -339,6 +340,41 @@ def save_dnssec_manifest(deploy_path: Path, manifest: DnssecManifest) -> Path:
 # Helper functions for creating entries with defaults
 # =============================================================================
 
+# What ``ssh-keygen -t`` accepts, which is also what sshd will load as a host
+# key.  ``[[ssh-host-keys]]`` means the identities sshd presents, so a type
+# outside this set cannot belong there whatever else it may legitimately be:
+# the NixOS module builds services.openssh.hostKeys from every entry carrying
+# a type, and its sshd-keygen fallback regenerates a missing key by running
+# ``ssh-keygen -t <type>``.
+SSHD_HOST_KEY_TYPES = ("dsa", "ecdsa", "ecdsa-sk", "ed25519", "ed25519-sk", "rsa")
+
+
+def _reject_non_sshd_types(entries: list[SecretEntry]) -> None:
+    """Raise if any entry's ``type`` is not one sshd can present.
+
+    A deploy key and an initrd key are both SSH keypairs and neither is an
+    sshd host key.  Sweeping them into ``[[ssh-host-keys]]`` hands their
+    private halves to sshd as host identities and breaks the fallback that
+    regenerates a missing key.  They belong in ``[secrets]``, which deploys
+    them on the same terms without offering them to sshd.
+    """
+    offenders = [
+        entry for entry in entries
+        if entry.type is not None and entry.type not in SSHD_HOST_KEY_TYPES
+    ]
+    if not offenders:
+        return
+
+    listed = ", ".join(f"{entry.target} ({entry.type})" for entry in offenders)
+    raise ValueError(
+        f"not an SSH key type: {listed}. [[ssh-host-keys]] is the list of "
+        f"identities sshd presents, and ssh-keygen has no such type, so the "
+        f"NixOS module cannot deploy or regenerate these. Valid types are "
+        f"{', '.join(SSHD_HOST_KEY_TYPES)}. Keys that are not sshd host "
+        f"identities (deploy, initrd) belong in [secrets]."
+    )
+
+
 def make_ssh_host_keys_entries(
     stems: list[str],
     placement: Placement | None = None,
@@ -357,6 +393,11 @@ def make_ssh_host_keys_entries(
                    (e.g. ``["ed25519"]``).  When provided each entry will
                    include a ``type`` field that the ``fudoniten/aegis``
                    NixOS module uses to configure OpenSSH.
+
+    Raises:
+        ValueError: if a supplied type is not one sshd can present.  Catching
+            it here covers both producers -- ``aegis build ssh-keys`` and
+            ``aegis ssh import`` -- rather than each having to remember.
     """
     placement = placement or Placement()
     defaults = DEFAULTS["ssh-host-keys"]
@@ -372,7 +413,102 @@ def make_ssh_host_keys_entries(
             mode=placement.mode or defaults["mode"],
             type=key_type,
         ))
+    _reject_non_sshd_types(entries)
     return entries
+
+
+def classify_ssh_stems(
+    stems: list[str],
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Split ``ssh/`` file stems into host keys and everything else.
+
+    A stem is an sshd host key when it is named ``ssh_host_<type>_key`` for a
+    type sshd can actually present.  That is the convention every producer
+    here writes, and it is the only signal available when rebuilding a
+    manifest from what is on disk.
+
+    Deriving the type by stripping affixes instead -- ``removeprefix
+    ("ssh_host_").removesuffix("_key")`` -- is what wrote ``deploy_ed25519``
+    and ``initrd_ed25519`` into production manifests: the prefix simply is not
+    there to remove, so the whole stem became the "type".
+
+    Returns:
+        ``([(stem, type), ...], [stem, ...])`` -- host keys with their type,
+        and the stems that are not host keys.
+    """
+    host_keys: list[tuple[str, str]] = []
+    auxiliary: list[str] = []
+
+    for stem in stems:
+        match = re.fullmatch(r"ssh_host_(.+)_key", stem)
+        if match and match.group(1) in SSHD_HOST_KEY_TYPES:
+            host_keys.append((stem, match.group(1)))
+        else:
+            auxiliary.append(stem)
+
+    return host_keys, auxiliary
+
+
+def split_ssh_host_keys(
+    entries: list[SecretEntry],
+) -> tuple[list[SecretEntry], list[SecretEntry]]:
+    """Partition ``[[ssh-host-keys]]`` into sshd identities and everything else.
+
+    Manifests written before ``[[ssh-host-keys]]`` was enforced carry deploy
+    and initrd keys in the list.  Rewriting a host's SSH keys is the natural
+    moment to correct that, and the correction is mechanical: the misfiled
+    entries move to ``[secrets]`` keeping their target, so nothing on disk
+    changes and no key is regenerated.
+
+    Untyped entries stay with the host keys.  The NixOS module filters them
+    out before sshd sees them, so they are unused rather than wrong, and
+    guessing at what they were meant to be would be worse than leaving them.
+    """
+    host_keys = [
+        entry for entry in entries
+        if entry.type is None or entry.type in SSHD_HOST_KEY_TYPES
+    ]
+    misfiled = [
+        entry for entry in entries
+        if entry.type is not None and entry.type not in SSHD_HOST_KEY_TYPES
+    ]
+    return host_keys, misfiled
+
+
+def make_ssh_auxiliary_entries(
+    stems: list[str],
+    placement: Placement | None = None,
+) -> dict[str, SecretEntry]:
+    """Manifest entries for SSH keypairs that are *not* sshd host identities.
+
+    The deploy and initrd keys are generated and delivered alongside the host
+    keys and live in the same ``ssh/`` directory, but they are consumed by
+    something other than sshd -- deploy-rs and the initramfs sshd, which is a
+    separate server with its own configuration.  Declaring them under
+    ``[secrets]`` rather than ``[[ssh-host-keys]]`` is what keeps them out of
+    ``services.openssh.hostKeys``.
+
+    They keep their existing on-disk target, so this is a change of
+    declaration only: nothing moves, and no key has to be regenerated.
+
+    Returns:
+        Entries keyed by secret name -- the stem with underscores turned into
+        hyphens, since the name becomes a systemd unit suffix.
+    """
+    placement = placement or Placement()
+    defaults = DEFAULTS["ssh-host-keys"]
+    target_dir = placement.target_dir or defaults["target_dir"]
+
+    return {
+        stem.replace("_", "-"): SecretEntry(
+            source=f"ssh/{stem}.age",
+            target=f"{target_dir}/{stem}",
+            user=placement.user or defaults["user"],
+            group=placement.group or defaults["group"],
+            mode=placement.mode or defaults["mode"],
+        )
+        for stem in stems
+    }
 
 
 def merge_ssh_host_keys_entries(

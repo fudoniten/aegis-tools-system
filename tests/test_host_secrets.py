@@ -274,3 +274,105 @@ def test_sequential_imports_accumulate_on_disk(tmp_path):
     assert [e.target for e in reloaded.ssh_host_keys] == [
         "ssh_host_ed25519_key", "ssh_host_ecdsa_key"]
     assert sorted(e.type for e in reloaded.ssh_host_keys) == ["ecdsa", "ed25519"]
+
+
+# =============================================================================
+# [[ssh-host-keys]] is the list of identities sshd presents
+#
+# The deploy and initrd keypairs are generated alongside the host keys and
+# live in the same ssh/ directory, but neither is an sshd identity. Declaring
+# them here puts them in services.openssh.hostKeys.
+# =============================================================================
+
+def test_make_ssh_host_keys_rejects_non_sshd_type():
+    """`deploy_ed25519` is not a type ssh-keygen has."""
+    with pytest.raises(ValueError, match="not an SSH key type"):
+        host_secrets.make_ssh_host_keys_entries(
+            stems=["deploy_ed25519_key"],
+            key_types=["deploy_ed25519"],
+        )
+
+
+def test_make_ssh_host_keys_accepts_every_sshd_type():
+    """The check must not reject a type sshd genuinely supports."""
+    types = list(host_secrets.SSHD_HOST_KEY_TYPES)
+    entries = host_secrets.make_ssh_host_keys_entries(
+        stems=[f"ssh_host_{t}_key" for t in types],
+        key_types=types,
+    )
+    assert [e.type for e in entries] == types
+
+
+def test_classify_ssh_stems_separates_deploy_and_initrd():
+    """Rebuilding a manifest from disk must not promote every key file."""
+    host_keys, auxiliary = host_secrets.classify_ssh_stems([
+        "deploy_ed25519_key",
+        "initrd_ed25519_key",
+        "ssh_host_ecdsa_key",
+        "ssh_host_ed25519_key",
+    ])
+
+    assert host_keys == [
+        ("ssh_host_ecdsa_key", "ecdsa"),
+        ("ssh_host_ed25519_key", "ed25519"),
+    ]
+    assert auxiliary == ["deploy_ed25519_key", "initrd_ed25519_key"]
+
+
+def test_classify_ssh_stems_rejects_unknown_type_in_host_shape():
+    """A stem shaped like a host key but naming a type sshd has not."""
+    host_keys, auxiliary = host_secrets.classify_ssh_stems(
+        ["ssh_host_frobnicate_key"])
+
+    assert host_keys == []
+    assert auxiliary == ["ssh_host_frobnicate_key"]
+
+
+def test_ssh_auxiliary_entries_keep_their_target():
+    """Moving a key to [secrets] is a change of declaration, not of layout."""
+    entries = host_secrets.make_ssh_auxiliary_entries(
+        stems=["deploy_ed25519_key", "initrd_ed25519_key"])
+
+    assert set(entries) == {"deploy-ed25519-key", "initrd-ed25519-key"}
+    assert entries["deploy-ed25519-key"].source == "ssh/deploy_ed25519_key.age"
+    assert entries["deploy-ed25519-key"].target == (
+        "/run/aegis/ssh/deploy_ed25519_key")
+    assert entries["deploy-ed25519-key"].mode == "0600"
+    # No type: nothing may pick these up as an sshd identity.
+    assert entries["deploy-ed25519-key"].type is None
+
+
+def test_ssh_auxiliary_entries_follow_placement():
+    """A host that relocates its SSH keys relocates these with them."""
+    entries = host_secrets.make_ssh_auxiliary_entries(
+        stems=["deploy_ed25519_key"],
+        placement=Placement(target_dir="/etc/ssh"),
+    )
+    assert entries["deploy-ed25519-key"].target == "/etc/ssh/deploy_ed25519_key"
+
+
+def test_split_ssh_host_keys_partitions_a_misfiled_manifest():
+    """The repair path: an existing manifest carrying deploy/initrd entries."""
+    misfiled_entry = host_secrets.SecretEntry(
+        source="ssh/deploy_ed25519_key.age",
+        target="deploy_ed25519_key",
+        target_dir="/run/aegis/ssh",
+        type="deploy_ed25519",
+    )
+    entries = _ssh_entries(("ssh_host_ed25519_key", "ed25519")) + [misfiled_entry]
+
+    host_keys, misfiled = host_secrets.split_ssh_host_keys(entries)
+
+    assert [e.target for e in host_keys] == ["ssh_host_ed25519_key"]
+    assert [e.target for e in misfiled] == ["deploy_ed25519_key"]
+
+
+def test_split_ssh_host_keys_leaves_untyped_entries_alone():
+    """Untyped entries are filtered out before sshd; unused, not wrong."""
+    entries = host_secrets.make_ssh_host_keys_entries(
+        stems=["ssh_host_rsa_key"])
+
+    host_keys, misfiled = host_secrets.split_ssh_host_keys(entries)
+
+    assert len(host_keys) == 1
+    assert misfiled == []

@@ -167,6 +167,8 @@ def _check_hosts(
             report.error(
                 scope, "manifest declares SSH host keys but no key files exist")
 
+        _check_ssh_host_key_types(manifest, report, scope, hostname)
+
         keytab = deploy / "keytab.age"
         if keytab.exists() and manifest.keytab is None:
             report.error(
@@ -208,6 +210,51 @@ def _check_hosts(
                 f"({count} files)",
                 f"remove it, or re-add with: aegis host add {hostname}",
             )
+
+
+def _check_ssh_host_key_types(
+    manifest: host_secrets.HostSecretsManifest,
+    report: Report,
+    scope: str,
+    hostname: str,
+) -> None:
+    """Flag [[ssh-host-keys]] entries that cannot be sshd identities.
+
+    The list is what sshd presents as the host: the NixOS module builds
+    services.openssh.hostKeys from every entry carrying a type. Two ways that
+    goes wrong, both of them silent in this repo and loud only at boot:
+
+      - a type ssh-keygen does not have, from sweeping the deploy and initrd
+        keypairs into the same list as the host keys
+      - one type on several entries, which collapses their decrypt units and
+        leaves all but the last target unwritten
+    """
+    typed = [e for e in manifest.ssh_host_keys if e.type is not None]
+
+    misfiled = [
+        e for e in typed if e.type not in host_secrets.SSHD_HOST_KEY_TYPES
+    ]
+    if misfiled:
+        report.error(
+            scope,
+            "ssh-host-keys declares "
+            + ", ".join(f"{e.target} as type {e.type}" for e in misfiled)
+            + ", which sshd cannot present and ssh-keygen cannot generate",
+            f"aegis reencrypt --host {hostname} rewrites the manifest from what "
+            f"is on disk and moves these to [secrets] -- no key is regenerated",
+        )
+
+    types = [e.type for e in typed]
+    duplicates = sorted({t for t in types if types.count(t) > 1})
+    if duplicates:
+        report.error(
+            scope,
+            "ssh-host-keys repeats type(s) "
+            + ", ".join(duplicates)
+            + ", so their decrypt units collapse into one and all but the last "
+            "target is never written",
+            "give each entry the type it actually is",
+        )
 
 
 def _check_placement_drift(
@@ -907,14 +954,22 @@ def _refresh_manifest(repo: config.SecretsRepo, hostname: str) -> None:
     if ssh_dir.is_dir():
         stems = sorted(f.stem for f in ssh_dir.glob("*.age"))
         if stems:
-            key_types = [
-                s.removeprefix("ssh_host_").removesuffix("_key") for s in stems
-            ]
+            placement = host_placement(repo, hostname, "ssh-host-keys")
+            # Only ssh_host_<type>_key files are identities sshd presents. The
+            # deploy and initrd keys live in the same directory and are
+            # delivered the same way, but declaring them here would put them in
+            # services.openssh.hostKeys; they go under [secrets] instead,
+            # keeping their target, so nothing on disk moves.
+            host_keys, auxiliary = host_secrets.classify_ssh_stems(stems)
             manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
-                stems=stems,
-                placement=host_placement(repo, hostname, "ssh-host-keys"),
-                key_types=key_types,
+                stems=[stem for stem, _ in host_keys],
+                placement=placement,
+                key_types=[key_type for _, key_type in host_keys],
             )
+            manifest.secrets.update(host_secrets.make_ssh_auxiliary_entries(
+                stems=auxiliary,
+                placement=placement,
+            ))
 
     if (deploy / "keytab.age").exists():
         manifest.keytab = host_secrets.make_keytab_entry(

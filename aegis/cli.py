@@ -772,15 +772,28 @@ def build_ssh_host_keys(
             pub_path.write_text(keypair.public_key + "\n")
             typer.echo(f"    Wrote {age_path.name} + {pub_path.name}")
 
-        # Update manifest with one entry per private key
+        # Update the manifest, keeping the two categories of key apart.
+        #
+        # Every key above is encrypted and delivered identically, but only the
+        # ssh_host_* pair are identities sshd presents. Declaring the deploy
+        # and initrd keys under [[ssh-host-keys]] -- which this did, with all
+        # four sharing the `ed25519`/`ecdsa` types their keypairs actually have
+        # -- puts them in services.openssh.hostKeys, and collapses the three
+        # ed25519 entries into a single aegis-ssh-ed25519 unit so two of the
+        # targets are never written at all.
         manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
-        stems = [stem for stem, _ in keys.items()]
-        key_types = [keypair.key_type for _, keypair in keys.items()]
+        placement = host_placement(repo, hostname, "ssh-host-keys")
+
         manifest.ssh_host_keys = host_secrets.make_ssh_host_keys_entries(
-            stems=stems,
-            placement=host_placement(repo, hostname, "ssh-host-keys"),
-            key_types=key_types,
+            stems=[stem for stem, _ in keys.host_key_items()],
+            placement=placement,
+            key_types=[kp.key_type for _, kp in keys.host_key_items()],
         )
+        manifest.secrets.update(host_secrets.make_ssh_auxiliary_entries(
+            stems=[stem for stem, _ in keys.auxiliary_items()],
+            placement=placement,
+        ))
+
         manifest_path = host_secrets.save_host_manifest(repo.deploy_path, manifest)
         typer.echo(f"    Updated manifest: {manifest_path}")
 
@@ -1579,18 +1592,41 @@ def import_ssh_host_keys(
         target_dir=target_dir, user=user, group=group, mode=mode))
 
     manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
-    imported = host_secrets.make_ssh_host_keys_entries(
-        stems=stems,
-        placement=host_placement(repo, hostname, "ssh-host-keys"),
-        key_types=key_types,
-    )
+    placement = host_placement(repo, hostname, "ssh-host-keys")
+    try:
+        imported = host_secrets.make_ssh_host_keys_entries(
+            stems=stems,
+            placement=placement,
+            key_types=key_types,
+        )
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+    # Correct any entry an earlier import misfiled before merging into it.
+    # Deploy and initrd keys were swept into [[ssh-host-keys]] alongside the
+    # real ones, which is where services.openssh.hostKeys comes from; moving
+    # them to [secrets] keeps their target, so this is a change of declaration
+    # only -- nothing on disk moves and no key is regenerated.
+    existing, misfiled = host_secrets.split_ssh_host_keys(manifest.ssh_host_keys)
+    if misfiled:
+        manifest.secrets.update(host_secrets.make_ssh_auxiliary_entries(
+            stems=[entry.target for entry in misfiled],
+            placement=placement,
+        ))
+        typer.echo(
+            f"  Moved {len(misfiled)} non-sshd key entr"
+            f"{'y' if len(misfiled) == 1 else 'ies'} to [secrets]: "
+            + ", ".join(entry.target for entry in misfiled)
+        )
+
     # Merge rather than assign: importing one key per invocation is the obvious
     # way to drive this from a shell loop, and replacing the list makes each
     # run discard the previous one's declaration while leaving its ciphertext
     # in place -- a host that silently offers one key type.
     try:
         manifest.ssh_host_keys = host_secrets.merge_ssh_host_keys_entries(
-            manifest.ssh_host_keys, imported)
+            existing, imported)
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
