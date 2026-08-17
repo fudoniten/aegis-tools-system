@@ -361,6 +361,26 @@ generating it is the `aegis build` family above.
 | `aegis dnssec list` | Domains with a KSK, and who signs with it |
 | `aegis dnssec delete <domain>` | Delete a domain's KSK |
 
+`secret new` and `secret import` print the NixOS reference when they finish —
+the `manifest.targets` key, the target path and the decrypt unit to order
+against — because the `secret-` prefix is the module's, not yours:
+
+```
+Reference it in NixOS:
+  config.aegis.secrets.manifest.targets."secret-adguard.passwd"
+    -> /run/adguard-dns-proxy/admin.passwd
+
+  systemd.services.<yours> = {
+    after    = [ "aegis-secret-adguard.passwd.service" ];
+    requires = [ "aegis-secret-adguard.passwd.service" ];
+  };
+```
+
+A `targets` lookup without the prefix misses silently: the service is
+configured with nothing while Aegis goes on decrypting the secret perfectly
+well. Only `[keytab]` and `[nexus-key]` escape it, having their own manifest
+sections rather than living under `[secrets]`.
+
 ### Role Commands
 
 | Command | Description |

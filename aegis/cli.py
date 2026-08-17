@@ -1725,6 +1725,45 @@ def import_nexus_key(
     typer.echo(f"  Encrypted for: {hostname} (host) + admin")
 
 
+def print_secret_reference(
+    name: str,
+    target: str,
+    roles: "list[str] | None" = None,
+) -> None:
+    """Print how to reach a secret from NixOS, right after creating it.
+
+    The `secret-` prefix is the module's, not the operator's: a manifest entry
+    written as [secrets.<name>] is published as `secret-<name>`, and a lookup
+    without it misses silently -- the service is configured with nothing while
+    Aegis goes on decrypting the secret perfectly well. Printing the reference
+    at the point the secret is made is cheaper than rediscovering it.
+    """
+    from . import host_secrets
+
+    key = host_secrets.manifest_key(name)
+    unit = host_secrets.decrypt_unit(name)
+
+    typer.echo("\nReference it in NixOS:")
+    typer.echo(f'  config.aegis.secrets.manifest.targets."{key}"')
+    typer.echo(f"    -> {target}")
+    typer.echo("")
+    typer.echo("  systemd.services.<yours> = {")
+    typer.echo(f'    after    = [ "{unit}" ];')
+    typer.echo(f'    requires = [ "{unit}" ];')
+    typer.echo("  };")
+    typer.echo("")
+    typer.secho(
+        f"  The 'secret-' prefix is the module's: [secrets.\"{name}\"] is "
+        f"published as '{key}'.",
+        fg=typer.colors.YELLOW,
+    )
+    if roles:
+        typer.echo(
+            f"  Decrypted in phase 2, with the "
+            f"{' / '.join(roles)} key unwrapped in phase 1."
+        )
+
+
 @secret_app.command("import")
 def import_secret(
     name: str = typer.Argument(..., help="Name of the secret; or, in the older two-argument form, the hostname"),
@@ -1936,6 +1975,8 @@ def import_secret(
     if role:
         typer.echo(f"  Roles: {', '.join(role)}")
 
+    print_secret_reference(name, resolved.target or target, list(role))
+
 
 @secret_app.command("new")
 def new_secret(
@@ -2110,6 +2151,8 @@ def new_secret(
         "  Plaintext was not written to disk; verify decryption with "
         "`aegis verify <host>`."
     )
+
+    print_secret_reference(name, target, list(role))
 
 
 # =============================================================================
@@ -2782,6 +2825,15 @@ def add_secret(
     
     typer.secho(f"Added secret: {name} for {hostname}", fg=typer.colors.GREEN)
     typer.echo(f"  Wrote: {output_path}")
+    typer.secho(
+        "\n  No manifest entry, so there is nothing for NixOS to reference "
+        "and nothing deploys this.",
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo(
+        f"  Give it a target: aegis secret import {name} --host {hostname} "
+        f"--file {file} --target /run/<service>/<file>"
+    )
 
 
 # =============================================================================
