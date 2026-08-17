@@ -786,30 +786,3 @@ def realm_export(
     typer.echo(f"  Principals: {out}")
     typer.echo(f"  Realm key:  {realm_key_out}")
     typer.echo(f"  Readable by: role {realm_config.kdc_role} + admin")
-
-
-@realm_app.command("delete")
-def realm_delete(
-    realm: str = typer.Argument(..., help="Realm to delete"),
-    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
-    force: bool = typer.Option(False, "--force", "-f", help="Delete even though principals are still declared"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be removed and stop"),
-):
-    """Delete a Kerberos realm: its master key and every principal.
-
-    Refuses while principals are declared -- remove them with 'aegis realm
-    remove-principal' first. Keytabs already built keep working until they are
-    rebuilt, and nothing can rebuild them once the realm key is gone.
-    \b
-    Example:
-        aegis realm delete OLD.EXAMPLE.COM --dry-run
-    """
-    from . import removal
-    from .cli_removal import run_removal
-
-    repo = _repo(secrets_path)
-    run_removal(
-        removal.plan_realm_removal(repo, realm),
-        force=force, yes=yes, dry_run=dry_run,
-    )

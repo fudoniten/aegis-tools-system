@@ -295,7 +295,6 @@ files are still out of its reach.
 | `aegis realm trust <A> <B>` | Establish cross-realm trust (bidirectional by default) |
 | `aegis realm untrust <A> <B>` | Remove cross-realm trust |
 | `aegis realm export <REALM>` | Write the KDC principal bundle |
-| `aegis realm delete <REALM>` | Delete a realm, its master key and every principal |
 
 ### Rotating a principal
 
@@ -345,21 +344,10 @@ generating it is the `aegis build` family above.
 | `aegis host set-key <host>` | Set the host's age public key |
 | `aegis host set-status <host> <status>` | Record whether Aegis manages the host |
 | `aegis host set-placement <host> <kind>` | Declare where a decrypted secret belongs |
-| `aegis host list` | Declared hosts, their status, key and deployed file count |
-| `aegis host delete <host>` | Delete a host and everything deployed to it |
 | `aegis user add <username>` | Add a user and generate their keypair |
-| `aegis user list` | Users and the hosts they reach |
-| `aegis user delete <username>` | Delete a user and every host's copy of their key |
 | `aegis secret new <name>` | Generate a random secret for hosts and/or roles |
 | `aegis secret add <host> <name> <file>` | Encrypt a file for a host (no placement) |
 | `aegis secret list [host]` | List secrets for host(s) |
-| `aegis secret delete <name>` | Delete a secret's ciphertext and manifest entries |
-| `aegis ssh list [host]` | SSH host keys declared, and which reach sshd |
-| `aegis ssh delete <host>` | Delete a host's SSH keys (its identity) |
-| `aegis nexus list` | Hosts holding a Nexus HMAC key |
-| `aegis nexus delete <host>` | Delete a host's Nexus key |
-| `aegis dnssec list` | Domains with a KSK, and who signs with it |
-| `aegis dnssec delete <domain>` | Delete a domain's KSK |
 
 ### Role Commands
 
@@ -369,31 +357,6 @@ generating it is the `aegis build` family above.
 | `aegis role add-host <role> <host>` | Give a host the role's key and its secrets |
 | `aegis role remove-host <role> <host>` | Revoke a host's copy of the role key |
 | `aegis role set-placement <role> secret:<name>` | Declare where a role secret belongs |
-| `aegis role list` | Roles, their members and the secrets they carry |
-| `aegis role delete <role>` | Delete a role, its key and its shared secrets |
-
-#### Deleting
-
-Every category has `list` and `delete` alongside its create verb. Deletion
-refuses rather than cascading: it prints what would go, what still points at
-the thing, and stops.
-
-```bash
-aegis role delete legacy-app --dry-run   # the plan, and nothing else
-aegis role delete legacy-app             # refuses if a manifest still uses it
-aegis role delete legacy-app --force     # delete anyway, clean up after
-```
-
-A secrets repository is a graph — a role is held by hosts, a host holds role
-keys, a Nebula network signs for both — so cleaning up every edge
-automatically would let one mistyped name remove a great deal, with the blast
-radius visible only afterwards. Naming the references instead lets you decide
-which end is the mistake.
-
-`aegis host delete` is usually the wrong verb: a machine that is gone should be
-`aegis host set-status <host> retired`, which keeps the record of what it held
-so you know what to rotate. Deleting removes that record too, and refuses while
-the host is active with secrets on it.
 
 Domain membership is role membership: a host in `domain-fudo.org` is a host in
 that domain. See [DOMAIN-ROLES.md](DOMAIN-ROLES.md) for the concept and the
