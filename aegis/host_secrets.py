@@ -594,6 +594,27 @@ def make_nexus_key_entry(placement: Placement | None = None) -> SecretEntry:
     )
 
 
+# The NixOS module renames a [secrets.<name>] entry to `secret-<name>` when it
+# builds `aegis.secrets.manifest.targets`, and names its unit after that.  Only
+# [keytab] and [nexus-key] escape the prefix, because they have their own
+# manifest sections rather than living under [secrets].
+#
+# Callers get this wrong in a way that is quiet and expensive -- a `targets`
+# lookup without the prefix simply misses, so the service is configured with
+# nothing while Aegis goes on decrypting the secret perfectly well.  Both
+# spellings live here so that the tools can print the reference rather than
+# leaving it to be rediscovered.
+
+def manifest_key(name: str) -> str:
+    """The key `aegis.secrets.manifest.targets` holds this secret under."""
+    return f"secret-{name}"
+
+
+def decrypt_unit(name: str) -> str:
+    """The systemd unit that writes this secret, for after= and requires=."""
+    return f"aegis-{manifest_key(name)}.service"
+
+
 def make_secret_entry(
     name: str,
     placement: Placement | None = None,
