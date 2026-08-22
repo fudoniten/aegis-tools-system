@@ -1152,10 +1152,82 @@ def build_keytabs(
                     realm_key_out,
                 )
                 typer.echo(f"  Wrote KDC realm key:   {realm_key_out}")
+
+                _build_kdc_service_keytabs(
+                    repo, realm_name, kdc_conf, principals_tmp,
+                    kdc_role_pubkey, admin_keys, tmpdir,
+                )
             elif not kdc_role_pubkey:
                 typer.echo(f"  Skipped KDC principals file (no KDC role public key)")
 
     typer.secho("\nKeytab build complete!", fg=typer.colors.GREEN)
+
+
+#: Service keytabs the KDC daemons themselves need, distinct from host/service
+#: keytabs built for realm members above. Each maps the keytab's role to the
+#: principal name variants that might hold it -- the first one present in the
+#: realm's stored principals wins. ``kadmind`` is the one Heimdal always
+#: creates via ``kadmin init``; ``kpasswdd`` varies by how the realm was
+#: initialized (fudo's legacy tooling used ``kadmin/changepw``, stock Heimdal
+#: uses ``changepw/kerberos``); ``hprop`` only exists for realms doing
+#: KDC replication and is skipped silently when absent.
+_KDC_SERVICE_KEYTABS: dict[str, tuple[str, ...]] = {
+    "kadmind": ("kadmin/admin",),
+    "kpasswdd": ("kadmin/changepw", "changepw/kerberos"),
+    "hprop": ("kadmin/hprop",),
+}
+
+
+def _build_kdc_service_keytabs(
+    repo: config.SecretsRepo,
+    realm_name: str,
+    kdc_conf: Path,
+    principals_tmp: Path,
+    kdc_role_pubkey: str,
+    admin_keys: list[str],
+    tmpdir: Path,
+) -> None:
+    """Extract keytabs for the KDC's own daemons: kadmind, kpasswdd, hprop.
+
+    These are distinct from host/service keytabs: they authenticate the KDC's
+    own admin/password/propagation daemons to clients, not a host to the KDC.
+    Encrypted to the KDC role only -- no individual host holds these, so there
+    is no host key in the recipient list, matching the principals/realm-key
+    bundle above.
+    """
+    from . import kerberos as krb
+
+    for service, candidates in _KDC_SERVICE_KEYTABS.items():
+        principal = next(
+            (p for p in candidates
+             if (principals_tmp / f"{p.replace('/', '_')}@{realm_name}.key").exists()),
+            None,
+        )
+        if principal is None:
+            if service == "hprop":
+                continue
+            typer.secho(
+                f"  Warning: no {'/'.join(candidates)}@{realm_name} principal "
+                f"found -- {service} keytab not built. kadmind/kpasswdd will "
+                f"not be able to start from this bundle.",
+                fg=typer.colors.YELLOW,
+            )
+            continue
+
+        keytab_tmp = tmpdir / f"{realm_name}-{service}.keytab"
+        try:
+            krb.extract_keytab(
+                [f"{principal}@{realm_name}"], kdc_conf, keytab_tmp,
+            )
+        except Exception as e:
+            typer.echo(f"  Error extracting {service} keytab: {e}", err=True)
+            continue
+
+        keytab_out = repo.kdc_deploy_path() / f"{realm_name}-{service}.keytab.age"
+        keytab_out.parent.mkdir(parents=True, exist_ok=True)
+        crypto.encrypt_age(
+            keytab_tmp.read_bytes(), [kdc_role_pubkey, *admin_keys], keytab_out)
+        typer.echo(f"  Wrote KDC {service} keytab: {keytab_out}")
 
 
 def _append_retained_keys(
