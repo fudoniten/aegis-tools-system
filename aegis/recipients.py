@@ -288,10 +288,15 @@ def _kdc_files(repo: config.SecretsRepo, resolver: Resolver) -> list[FilePolicy]
 
     policies = []
     for path in sorted(kdc_dir.glob("*.age")):
-        # <REALM>-principals.age / <REALM>-realm-key.age
+        # <REALM>-principals.age / <REALM>-realm-key.age, plus the KDC's own
+        # service keytabs from `aegis build keytabs`: <REALM>-kadmind.keytab.age,
+        # <REALM>-kpasswdd.keytab.age, <REALM>-hprop.keytab.age.
         stem = path.stem
         realm_name = None
-        for suffix in ("-principals", "-realm-key"):
+        for suffix in (
+            "-principals", "-realm-key",
+            "-kadmind.keytab", "-kpasswdd.keytab", "-hprop.keytab",
+        ):
             if stem.endswith(suffix):
                 realm_name = stem[: -len(suffix)]
                 break

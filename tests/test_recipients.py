@@ -173,6 +173,38 @@ def test_kdc_bundle_targets_the_realm_role(repo: config.SecretsRepo, admin_key):
         assert "age1kdcrole" in policy.recipients
 
 
+def test_kdc_service_keytabs_target_the_realm_role(
+    repo: config.SecretsRepo, admin_key
+):
+    """kadmind/kpasswdd/hprop keytabs from 'aegis build keytabs' must resolve
+    to the same realm as the principal bundle, or reencrypt can't tell who
+    should hold them and leaves their current recipients untouched."""
+    realm_mod.save(repo, realm_mod.RealmConfig(
+        name="A.ORG", domains=["a.org"], kdc_role="kdc"))
+    repo.role_pubkey_path("kdc").parent.mkdir(parents=True, exist_ok=True)
+    repo.role_pubkey_path("kdc").write_text("age1kdcrole")
+
+    for name in (
+        "A.ORG-kadmind.keytab.age",
+        "A.ORG-kpasswdd.keytab.age",
+        "A.ORG-hprop.keytab.age",
+    ):
+        _write_encrypted(
+            repo.kdc_deploy_path() / name, b"keytab", [admin_key.public_key])
+
+    plan = _plan(repo)
+
+    for name in (
+        "A.ORG-kadmind.keytab.age",
+        "A.ORG-kpasswdd.keytab.age",
+        "A.ORG-hprop.keytab.age",
+    ):
+        policy = plan[f"deploy/kdc/{name}"]
+        assert policy.category == recipients.CAT_KDC
+        assert policy.problem is None
+        assert "age1kdcrole" in policy.recipients
+
+
 def test_unknown_deploy_files_are_flagged_not_guessed(
     repo: config.SecretsRepo, admin_key
 ):
