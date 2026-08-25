@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import config, host_secrets
+from . import config, host_secrets, realm as realm_mod
 
 
 @dataclass
@@ -158,6 +158,14 @@ def plan_host_removal(repo: config.SecretsRepo, hostname: str) -> Removal:
         if repo.nebula_host_config_path(network, hostname).exists():
             removal.blockers.append(f"Nebula network '{network}' has a config for it")
 
+    # The declaration outlives the deploy directory: deleting the host without
+    # it leaves a keytab that names a host which no longer exists, and every
+    # subsequent build fails to resolve a recipient.
+    for ref in realm_mod.keytabs_for_host(repo, hostname):
+        removal.blockers.append(
+            f"keytab '{ref.name}' still delivers to it "
+            f"(aegis keytab remove-host {ref.name} {hostname})")
+
     if deployed:
         removal.warnings.append(
             f"{deployed} encrypted file(s) go with it. Whoever holds this "
@@ -213,6 +221,22 @@ def plan_role_removal(repo: config.SecretsRepo, role: str) -> Removal:
             f"{len(pointing_hosts)} host manifest(s) still declare "
             f"{', '.join(sorted(pointing_names))} as role secrets of '{role}': "
             f"{', '.join(pointing_hosts)}"
+        )
+
+    for ref in realm_mod.keytabs_for_role(repo, role):
+        removal.blockers.append(
+            f"keytab '{ref.name}' is still delivered through it "
+            f"(aegis keytab remove-role {ref.name} {role})")
+
+    keytab_hosts = [
+        host for host in repo.list_hosts()
+        if any(entry.role == role for entry in host_secrets.load_host_manifest(
+            repo.deploy_path, host).keytabs.values())
+    ]
+    if keytab_hosts:
+        removal.blockers.append(
+            f"{len(keytab_hosts)} host manifest(s) still declare keytabs of "
+            f"'{role}': {', '.join(keytab_hosts)}"
         )
 
     shared = repo.list_role_secrets(role)
@@ -453,6 +477,13 @@ def plan_realm_removal(repo: config.SecretsRepo, realm: str) -> Removal:
     if principals:
         removal.blockers.append(
             f"{principals} principal(s) are still declared in it"
+        )
+
+    declared = realm_mod.load(repo, realm).keytabs
+    if declared:
+        removal.blockers.append(
+            f"{len(declared)} named keytab(s) are declared in it: "
+            f"{', '.join(sorted(declared))}"
         )
 
     removal.warnings.append(

@@ -182,7 +182,15 @@ def _host_files(repo: config.SecretsRepo, resolver: Resolver) -> list[FilePolicy
                     policies.append(
                         _with_host(path, resolver, hostname, CAT_USER))
 
-            elif path.name == "keytab.age":
+            elif head == "keytabs":
+                # A named keytab delivered to this host: an explicit principal
+                # list, encrypted to the host and the admin set.  No KDC role
+                # key -- unlike the host keytab below, the KDC has no reason
+                # to read one, and its principals may not be this host's.
+                policies.append(
+                    _with_host(path, resolver, hostname, CAT_HOST))
+
+            elif relative == Path("keytab.age"):
                 kdc_key = resolver.kdc_for_host(hostname)
                 if kdc_key is None:
                     policies.append(FilePolicy(
@@ -279,6 +287,59 @@ def _role_secret_files(
                 ))
 
     return policies
+
+
+def _role_keytab_files(
+    repo: config.SecretsRepo, resolver: Resolver
+) -> list[FilePolicy]:
+    """Named keytabs delivered through a role.
+
+    Identical policy to a role secret, and for the same reason: one ciphertext
+    read by whoever holds the role key, so moving the service between hosts
+    re-encrypts nothing.
+    """
+    policies: list[FilePolicy] = []
+
+    for role_name in repo.list_roles():
+        keytabs_dir = repo.role_keytabs_path(role_name)
+        if not keytabs_dir.is_dir():
+            continue
+
+        role_key = resolver.role(role_name)
+        for path in sorted(keytabs_dir.glob("*.age")):
+            if role_key is None:
+                policies.append(FilePolicy(
+                    path=path, category=CAT_ROLE,
+                    problem=f"role {role_name} has no public key"))
+            else:
+                policies.append(FilePolicy(
+                    path=path,
+                    category=CAT_ROLE,
+                    recipients=[role_key, *resolver.admin_keys],
+                    label=f"role({role_name}) keytab + "
+                          f"{_admin_label(len(resolver.admin_keys))}",
+                ))
+
+    return policies
+
+
+def _export_keytab_files(
+    repo: config.SecretsRepo, resolver: Resolver
+) -> list[FilePolicy]:
+    """Named keytabs Aegis builds but does not deploy.
+
+    Admin-only by definition: the consumer is outside Aegis -- a Kubernetes
+    secret, an appliance -- so there is no host or role key to encrypt to.
+    The admin set is what lets `aegis keytab export` produce it again.
+    """
+    keytabs_dir = repo.export_keytabs_path()
+    if not keytabs_dir.is_dir():
+        return []
+
+    return [
+        _admin_only(path, resolver, f"exportable keytab '{path.stem}'")
+        for path in sorted(keytabs_dir.glob("*.age"))
+    ]
 
 
 def _kdc_files(repo: config.SecretsRepo, resolver: Resolver) -> list[FilePolicy]:
@@ -384,6 +445,8 @@ def plan(repo: config.SecretsRepo, admin_keys: list[str]) -> list[FilePolicy]:
         _admin_only_files(repo, resolver)
         + _host_files(repo, resolver)
         + _role_secret_files(repo, resolver)
+        + _role_keytab_files(repo, resolver)
+        + _export_keytab_files(repo, resolver)
         + _kdc_files(repo, resolver)
         + _dnssec_files(repo, resolver)
     )

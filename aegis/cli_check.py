@@ -286,6 +286,31 @@ def _check_placement_drift(
             f"aegis reencrypt --host {hostname}",
         )
 
+    for name, entry in sorted(manifest.keytabs.items()):
+        # A role-delivered keytab takes its placement from the role, not from
+        # the host; comparing it against the host's would report drift on
+        # every member of every role.
+        if entry.role:
+            role_config = repo.get_role_config(entry.role)
+            placement = (
+                role_config.placement_for(f"keytab:{name}")
+                if role_config else None)
+            expected = host_secrets.make_role_keytab_entry(
+                entry.role, name, placement)
+            remedy = f"aegis role set-placement {entry.role} keytab:{name} ..."
+        else:
+            expected = host_secrets.make_named_keytab_entry(
+                name, host_config.placement_for(f"keytab:{name}"))
+            remedy = f"aegis reencrypt --host {hostname}"
+
+        if entry.target != expected.target:
+            report.warn(
+                scope,
+                f"keytab '{name}' target in manifest ({entry.target}) differs "
+                f"from src/ placement ({expected.target})",
+                remedy,
+            )
+
     declared_dir = host_config.placement_for("ssh-host-keys").target_dir
     if declared_dir:
         for entry in manifest.ssh_host_keys:
@@ -557,6 +582,117 @@ def _check_realms(repo: config.SecretsRepo, report: Report) -> None:
                 )
 
 
+def _check_keytabs(repo: config.SecretsRepo, report: Report) -> None:
+    """Validate named keytabs: their principals, recipients, and built copies.
+
+    Separate from :func:`_check_realms` because a keytab need not belong to a
+    realm that has any member hosts -- an export-only keytab for something
+    outside Aegis is exactly that case, and the realm checks stop early there.
+    """
+    for name, realms in realm_mod.duplicate_keytab_names(repo).items():
+        report.error(
+            f"keytab/{name}",
+            f"declared by more than one realm ({', '.join(realms)}); delivery "
+            f"is by name, so the manifest cannot say which one a host means",
+            "rename one: aegis keytab delete <name> && aegis keytab new ...",
+        )
+
+    known_hosts = set(repo.list_hosts())
+    known_roles = set(repo.list_roles())
+
+    for ref in realm_mod.all_keytabs(repo):
+        scope = f"keytab/{ref.name}"
+        spec = ref.spec
+
+        if not spec.principals:
+            report.warn(
+                scope,
+                "declares no principals, so nothing is built for it",
+                f"aegis keytab add-principal {ref.name} <principal>",
+            )
+            continue
+
+        stored = set(realm_mod.stored_principals(repo, ref.realm))
+        missing = sorted(set(spec.principals) - stored)
+        if missing:
+            report.error(
+                scope,
+                f"names principal(s) not stored in {ref.realm}: "
+                f"{', '.join(missing)}",
+                f"aegis realm add-principal {ref.realm} {missing[0]}",
+            )
+
+        unknown_hosts = sorted(set(spec.hosts) - known_hosts)
+        if unknown_hosts:
+            report.error(
+                scope,
+                f"delivered to unknown host(s): {', '.join(unknown_hosts)}",
+                f"aegis keytab remove-host {ref.name} {unknown_hosts[0]}",
+            )
+
+        unknown_roles = sorted(set(spec.roles) - known_roles)
+        if unknown_roles:
+            report.error(
+                scope,
+                f"delivered to unknown role(s): {', '.join(unknown_roles)}",
+                f"aegis keytab remove-role {ref.name} {unknown_roles[0]}",
+            )
+
+        for role_name in sorted(set(spec.roles) & known_roles):
+            if not repo.role_pubkey_path(role_name).exists():
+                report.error(
+                    scope,
+                    f"role '{role_name}' has no public key, so its copy cannot "
+                    f"be encrypted",
+                    f"aegis role init {role_name}",
+                )
+
+        _check_keytab_copies(repo, ref, report, scope)
+
+        # A rotation in progress reaches a deployed keytab on the next build.
+        # An exported one it cannot reach at all: the copy in the Kubernetes
+        # secret, or on the appliance, is whatever was last carried out by
+        # hand, and pruning the old key is what breaks it.
+        rotating = sorted(
+            set(spec.principals) & set(realm_mod.previous_principals(repo, ref.realm)))
+        if rotating and spec.export_only:
+            report.warn(
+                scope,
+                f"export-only, and mid-rotation for {', '.join(rotating)}; "
+                f"whatever holds this keytab has the old key until it is "
+                f"re-exported by hand",
+                f"aegis build keytabs --force --realm {ref.realm} && "
+                f"aegis keytab export {ref.name}",
+            )
+
+
+def _check_keytab_copies(
+    repo: config.SecretsRepo,
+    ref: "realm_mod.KeytabRef",
+    report: Report,
+    scope: str,
+) -> None:
+    """Flag declared recipients whose ciphertext has not been built."""
+    expected = [
+        (repo.host_keytab_path(host, ref.name), f"host {host}")
+        for host in sorted(ref.spec.hosts)
+    ]
+    expected += [
+        (repo.role_keytab_path(role, ref.name), f"role {role}")
+        for role in sorted(ref.spec.roles)
+    ]
+    if ref.spec.export_only:
+        expected.append((repo.export_keytab_path(ref.name), "export"))
+
+    unbuilt = [label for path, label in expected if not path.exists()]
+    if unbuilt:
+        report.warn(
+            scope,
+            f"not built for: {', '.join(unbuilt)}",
+            f"aegis build keytabs --realm {ref.realm}",
+        )
+
+
 def _check_users(repo: config.SecretsRepo, report: Report) -> None:
     for username in repo.list_users():
         user_config = repo.get_user_config(username)
@@ -684,6 +820,7 @@ def run_check(repo: config.SecretsRepo) -> Report:
     _check_hosts(repo, report, admin_keys)
     _check_roles(repo, report)
     _check_realms(repo, report)
+    _check_keytabs(repo, report)
     _check_users(repo, report)
     _check_recipients(repo, report, admin_keys)
     return report
@@ -991,6 +1128,13 @@ def _refresh_manifest(repo: config.SecretsRepo, hostname: str) -> None:
     # Role membership drives both the roles list and an entry per role secret,
     # so a target changed in src/roles/<role>.toml reaches every member here.
     for conflict in host_secrets.reconcile_roles(repo, hostname, manifest):
+        typer.secho(f"  Warning: {hostname}: {conflict}",
+                    fg=typer.colors.YELLOW, err=True)
+
+    # Named keytabs likewise follow from realm declarations plus role
+    # membership, so a placement changed in src/ reaches every recipient here
+    # rather than waiting for the next keytab build.
+    for conflict in host_secrets.reconcile_keytabs(repo, hostname, manifest):
         typer.secho(f"  Warning: {hostname}: {conflict}",
                     fg=typer.colors.YELLOW, err=True)
 

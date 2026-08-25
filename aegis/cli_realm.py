@@ -385,12 +385,23 @@ def realm_add_principal(
     principal: str = typer.Argument(..., help="Principal, e.g. 'postgres/rama.sea.fudo.org'"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     password: Optional[str] = typer.Option(None, "--password", help="Set this password instead of a random key"),
-    host: Optional[str] = typer.Option(None, "--host", help="Host whose keytab should include this principal"),
+    host: Optional[str] = typer.Option(None, "--host", help="Host this principal belongs to, for rekey impact reporting"),
 ):
     """Add a principal to a realm.
 
-    Use --host to record which host's keytab it belongs in; 'aegis build
-    keytabs' includes it when extracting that host's keytab.
+    This creates the principal.  It does not put it in any keytab: --host
+    records which host the principal belongs to, so that 'aegis realm
+    rekey-principal' can name the hosts a rotation affects.
+
+    Two things do put a principal in a keytab:
+
+      * listing its service in the 'services' list of src/hosts/<host>.toml,
+        for a principal of the form <service>/<that host's fqdn> -- this is
+        the host keytab, and it is why 'host' and 'ssh' land there by default;
+
+      * naming it in a keytab of its own, for anything else:
+        aegis keytab new <name> --realm <REALM> --principal <principal>
+
     \b
     Examples:
         aegis realm add-principal SEA.FUDO.ORG postgres/rama.sea.fudo.org --host rama
@@ -427,8 +438,26 @@ def realm_add_principal(
     typer.secho(f"Added principal: {principal}", fg=typer.colors.GREEN)
     typer.echo(f"  Stored: {out}")
     if host:
-        typer.echo(f"  Will be included in {host}'s keytab")
-        typer.echo(f"  Run: aegis build keytabs --force --realm {realm}")
+        typer.echo(f"  Recorded as belonging to {host}")
+
+    # Creating a principal nothing carries is the easy mistake to make here,
+    # and it is silent: the principal exists, the KDC knows it, and no service
+    # can ever authenticate as it.
+    service = principal.split("/", 1)[0]
+    host_config = repo.get_host_config(host) if host else None
+    in_host_keytab = host_config is not None and service in host_config.services
+    if not in_host_keytab:
+        typer.echo("")
+        typer.echo("  Nothing carries this principal yet. To put it in a keytab:")
+        if host:
+            typer.echo(
+                f"    add '{service}' to services in "
+                f"{repo.src_path / 'hosts' / f'{host}.toml'}"
+                f"   # into {host}'s own keytab")
+        typer.echo(
+            f"    aegis keytab new <name> --realm {realm} "
+            f"--principal {principal}   # into a keytab of its own")
+    typer.echo(f"  Then: aegis build keytabs --force --realm {realm}")
 
 
 @realm_app.command("rekey-principal")
