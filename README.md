@@ -289,7 +289,7 @@ files are still out of its reach.
 | `aegis realm list` | Realms with their domains, trusts and member hosts |
 | `aegis realm show <REALM>` | Principals grouped by kind |
 | `aegis realm set <REALM>` | Update domains, KDC role, etypes, lifetimes |
-| `aegis realm add-principal` | Add a principal (random key or password) |
+| `aegis realm add-principal` | Add a principal (random key or password); does not put it in a keytab |
 | `aegis realm remove-principal` | Remove a principal |
 | `aegis realm rekey-principal` | Rotate a key, retaining the old one for a grace period |
 | `aegis realm trust <A> <B>` | Establish cross-realm trust (bidirectional by default) |
@@ -323,6 +323,100 @@ host --(domain-<domain> role)--> domain --(realm.toml domains)--> realm
 
 so a host gets a keytab once its `domain-*` role lists it *and* some realm
 declares that domain. `aegis check` reports either half being missing.
+
+### Keytab Commands
+
+The keytab above is the host's own: it holds `<service>/<fqdn>` for the
+services listed in `src/hosts/<host>.toml`, and it is how a machine proves it
+is itself. A **named keytab** is the explicit form — an arbitrary principal
+list, delivered wherever it is declared to go.
+
+| Command | Description |
+|---------|-------------|
+| `aegis keytab new <name> --realm <REALM>` | Declare a named keytab |
+| `aegis keytab list` | Named keytabs, their delivery and whether they are built |
+| `aegis keytab show <name>` | Principals, recipients, built copies |
+| `aegis keytab add-principal <name> <principal>` | Add a principal (`--create` to mint it) |
+| `aegis keytab remove-principal <name> <principal>` | Drop a principal from the keytab |
+| `aegis keytab add-host <name> <host>` | Deliver a per-host copy |
+| `aegis keytab remove-host <name> <host>` | Stop delivering to a host |
+| `aegis keytab add-role <name> <role>` | Deliver one shared copy through a role |
+| `aegis keytab remove-role <name> <role>` | Stop delivering through a role |
+| `aegis keytab export <name>` | Decrypt to a file, for a consumer outside Aegis |
+| `aegis keytab delete <name>` | Delete the declaration and every built copy |
+
+Declarations live in the realm whose principals they hold, under `[keytabs]` in
+`src/kerberos/realms/<REALM>/realm.toml`:
+
+```toml
+[keytabs.hermes]
+principals = ["hermes/hermes.sea.fudo.org"]
+roles = ["hermes"]          # optional: one shared copy, phase 2
+hosts = ["nostromo"]        # optional: a per-host copy each, phase 1
+note = "Hermes agent"
+```
+
+Names are unique across realms, because delivery is by name and a host
+manifest has one flat `[keytabs]` table.
+
+#### Three delivery modes
+
+**To a host** (`--host`) — `deploy/hosts/<host>/keytabs/<name>.age`, encrypted
+to that host's master key, decrypted in phase 1. Use it when the keytab
+belongs to one machine.
+
+**Through a role** (`--role`) — `deploy/roles/<role>/keytabs/<name>.age`, one
+ciphertext encrypted to the role key, decrypted in phase 2 by every member.
+Use it when the keytab belongs to a *service*: moving that service to another
+machine is then `aegis role add-host`, with nothing re-extracted and no
+principal rekeyed.
+
+**Export only** (neither) — `deploy/keytabs/<name>.age`, encrypted to the admin
+set. Aegis builds and rebuilds it but does not deliver it; `aegis keytab
+export` hands it over. This is the mode for a consumer Aegis has no way to
+reach — a workload scheduled by Kubernetes, an appliance, a machine someone
+else runs:
+
+```bash
+aegis keytab new hermes --realm SEA.FUDO.ORG \
+    --principal hermes/hermes.sea.fudo.org --create-missing \
+    --note "Hermes agent, deployed to k8s as a secret"
+aegis build keytabs --realm SEA.FUDO.ORG
+aegis keytab export hermes --output /tmp/hermes.keytab
+kubectl create secret generic hermes-keytab \
+    --from-file=krb5.keytab=/tmp/hermes.keytab
+shred -u /tmp/hermes.keytab
+```
+
+The export is plaintext key material at mode 0600 — move it and delete it.
+Nothing outside Aegis is updated for you, so re-export after a rekey;
+`aegis check` warns when an export-only keytab's principals are mid-rotation,
+since pruning the old key is what breaks the copy you carried out by hand.
+
+#### A client identity is not a host key
+
+"Give X access to hosts and services" usually means X needs a principal of its
+own (`hermes/hermes.sea.fudo.org`) to `kinit -kt` with, plus authorization on
+each target — `.k5login`, a service ACL, a GSSAPI name mapping. Putting
+`host/rama.sea.fudo.org` in X's keytab instead hands it rama's *server* key,
+letting it impersonate rama and decrypt tickets issued to it. Both are
+expressible here; they are not the same grant.
+
+#### Placement
+
+Where a named keytab lands follows the same rule as any other secret: on the
+recipient, in `src/`.
+
+```bash
+aegis host set-placement nostromo keytab:hermes \
+    --target /run/hermes/krb5.keytab --user hermes --mode 0400
+
+aegis role set-placement hermes keytab:hermes \
+    --target /run/hermes/krb5.keytab --user hermes --mode 0400
+```
+
+Role-delivered keytabs take placement from the role, so a host joining later
+lands it in the same place without being told.
 
 ### Import Commands
 
@@ -478,6 +572,8 @@ aegis-secrets/
     ├── hosts/<host>/       # Per-host secrets + derived secrets.toml
     ├── roles/<role>.pub    # Role public keys
     ├── roles/<role>/secrets/  # Secrets encrypted to the role, one copy each
+    ├── roles/<role>/keytabs/  # Named keytabs encrypted to the role
+    ├── keytabs/            # Named keytabs aegis builds but does not deploy
     └── kdc/                # Per-realm KDC principal bundles
 ```
 

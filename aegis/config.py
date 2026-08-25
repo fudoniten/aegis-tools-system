@@ -27,8 +27,21 @@ from .errors import ConfigError
 
 
 #: Manifest sections that a host may set placement for.  ``secret:<name>``
-#: keys are also accepted, for entries under ``[secrets]``.
+#: and ``keytab:<name>`` keys are also accepted, for entries under
+#: ``[secrets]`` and ``[keytabs]`` respectively.  Note that bare ``keytab``
+#: is the host's own implicit keytab, which is a different thing from
+#: ``keytab:<name>``: one is the ``[keytab]`` section, the other an entry in
+#: the ``[keytabs]`` table.
 PLACEMENT_KINDS = ("ssh-host-keys", "keytab", "nexus-key")
+
+#: Prefixes a placement key may carry, each naming an entry in a manifest
+#: table rather than a section of its own.
+PLACEMENT_PREFIXES = ("secret:", "keytab:")
+
+
+def is_placement_kind(kind: str) -> bool:
+    """Whether a string names something placement can be set for."""
+    return kind in PLACEMENT_KINDS or kind.startswith(PLACEMENT_PREFIXES)
 
 
 @dataclass
@@ -585,6 +598,47 @@ class SecretsRepo:
         if not secrets_dir.is_dir():
             return []
         return sorted(p.stem for p in secrets_dir.glob("*.age"))
+
+    # Named keytabs
+    #
+    # Three homes, one per delivery mode, each mirroring where the equivalent
+    # secret would live: beside the host's other secrets, beside the role's
+    # other secrets, or -- for a keytab with no in-band recipient -- in a
+    # top-level directory of its own, encrypted to the admin set and read back
+    # out with `aegis keytab export`.
+
+    def host_keytabs_path(self, hostname: str) -> Path:
+        """Directory holding a host's named keytabs."""
+        return self.host_deploy_path(hostname) / "keytabs"
+
+    def host_keytab_path(self, hostname: str, name: str) -> Path:
+        return self.host_keytabs_path(hostname) / f"{name}.age"
+
+    def role_keytabs_path(self, role_name: str) -> Path:
+        """Directory holding a role's named keytabs.
+
+        One file per keytab whatever the membership, exactly as with role
+        secrets: the role key is what decrypts it, so a host joining the role
+        gains the keytab without anything being re-extracted.
+        """
+        return self.role_deploy_path(role_name) / "keytabs"
+
+    def role_keytab_path(self, role_name: str, name: str) -> Path:
+        return self.role_keytabs_path(role_name) / f"{name}.age"
+
+    def export_keytabs_path(self) -> Path:
+        """Directory holding keytabs Aegis builds but does not deploy."""
+        return self.deploy_path / "keytabs"
+
+    def export_keytab_path(self, name: str) -> Path:
+        return self.export_keytabs_path() / f"{name}.age"
+
+    def list_export_keytabs(self) -> list[str]:
+        """Names of the built keytabs awaiting export."""
+        keytabs_dir = self.export_keytabs_path()
+        if not keytabs_dir.is_dir():
+            return []
+        return sorted(p.stem for p in keytabs_dir.glob("*.age"))
 
     def kdc_deploy_path(self) -> Path:
         """Directory holding per-realm KDC principal bundles."""

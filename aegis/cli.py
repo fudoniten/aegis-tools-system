@@ -179,6 +179,7 @@ def _register_subcommands() -> None:
     """
     from .cli_admin import admin_app
     from .cli_realm import realm_app
+    from .cli_keytab import keytab_app
     from .cli_nebula import nebula_app
     from . import cli_check
 
@@ -192,6 +193,7 @@ def _register_subcommands() -> None:
     app.add_typer(dnssec_app, name="dnssec", rich_help_panel=PANEL_MATERIAL)
     app.add_typer(admin_app, name="admin", rich_help_panel=PANEL_MATERIAL)
     app.add_typer(realm_app, name="realm", rich_help_panel=PANEL_MATERIAL)
+    app.add_typer(keytab_app, name="keytab", rich_help_panel=PANEL_MATERIAL)
     app.add_typer(nebula_app, name="nebula", rich_help_panel=PANEL_MATERIAL)
     cli_check.register(app)
 
@@ -948,11 +950,18 @@ def build_keytabs(
         return
 
     grouped = realm_mod.hosts_by_realm(repo)
-    if realm_filter:
-        grouped = {k: v for k, v in grouped.items() if k == realm_filter}
 
-    if not grouped:
-        typer.echo("No hosts resolved to a Kerberos realm.")
+    # A realm with no member hosts still has work to do if it declares named
+    # keytabs: an export-only keytab (one Aegis builds but does not deploy)
+    # need not correspond to any host in the realm at all.
+    realms = set(grouped) | {
+        name for name in repo.list_realms() if realm_mod.load(repo, name).keytabs
+    }
+    if realm_filter:
+        realms = {name for name in realms if name == realm_filter}
+
+    if not realms:
+        typer.echo("No hosts resolved to a Kerberos realm, and no named keytabs.")
         typer.echo("")
         typer.echo("A host reaches a realm via its domain-<domain> role and the")
         typer.echo("realm's declared domains. Check both with:")
@@ -960,8 +969,8 @@ def build_keytabs(
         typer.echo("  aegis check")
         return
 
-    for realm_name in sorted(grouped):
-        members = sorted(grouped[realm_name], key=lambda m: m.hostname)
+    for realm_name in sorted(realms):
+        members = sorted(grouped.get(realm_name, []), key=lambda m: m.hostname)
         typer.echo(f"\nProcessing realm: {realm_name}")
 
         realm_config = realm_mod.load(repo, realm_name)
@@ -997,6 +1006,15 @@ def build_keytabs(
             typer.echo(f"  [dry-run] Would process {len(members)} hosts")
             for member in members:
                 typer.echo(f"    - {member.hostname} ({member.fqdn})")
+            for name, spec in sorted(realm_config.keytabs.items()):
+                where = (
+                    ", ".join(
+                        [f"host {h}" for h in sorted(spec.hosts)]
+                        + [f"role {r}" for r in sorted(spec.roles)])
+                    or "export only")
+                typer.echo(
+                    f"    [keytab] {name}: {len(spec.principals)} principal(s)"
+                    f" -> {where}")
             continue
 
         with tempfile.TemporaryDirectory(prefix="aegis-krb-") as tmp:
@@ -1130,6 +1148,11 @@ def build_keytabs(
                         realm_config.principals[principal] = entry
                 realm_mod.save(repo, realm_config)
 
+            _build_named_keytabs(
+                repo, realm_name, realm_config, kdc_conf, principals_tmp,
+                realm_key_plain, admin_keys, tmpdir,
+            )
+
             typer.echo(f"\n  Generating KDC principals file...")
             all_principals = b"".join(
                 f.read_bytes() for f in sorted(principals_tmp.glob("*.key"))
@@ -1159,6 +1182,9 @@ def build_keytabs(
                 )
             elif not kdc_role_pubkey:
                 typer.echo(f"  Skipped KDC principals file (no KDC role public key)")
+
+    if not dry_run:
+        _sync_named_keytab_manifests(repo)
 
     typer.secho("\nKeytab build complete!", fg=typer.colors.GREEN)
 
@@ -1240,12 +1266,34 @@ def _append_retained_keys(
     keytab_path: Path,
     tmpdir: Path,
 ) -> list[str]:
-    """Append any retained pre-rekey keys for this host to its keytab.
+    """Append any retained pre-rekey keys for this host to its keytab."""
+    return _append_retained_principal_keys(
+        repo, realm_name, realm_config, realm_key_plain,
+        [f"{service}/{member.fqdn}" for service in services],
+        keytab_path, tmpdir, tag=member.hostname,
+    )
+
+
+def _append_retained_principal_keys(
+    repo: config.SecretsRepo,
+    realm_name: str,
+    realm_config,
+    realm_key_plain: Path,
+    principals: list[str],
+    keytab_path: Path,
+    tmpdir: Path,
+    tag: str,
+) -> list[str]:
+    """Append any retained pre-rekey keys for these principals to a keytab.
 
     `kadmin ext_keytab` appends rather than truncating, so extracting the old
     principals from a second throwaway database into the same file leaves the
     keytab holding both kvnos. That is what makes `realm rekey-principal` a
     graceful rotation instead of a hard cutover.
+
+    Applies to every keytab a principal appears in, named or implicit: a
+    rotation that left the named keytabs holding only the new key would break
+    exactly the services that a grace period exists to protect.
 
     Returns the principals whose old key was carried.
     """
@@ -1255,38 +1303,35 @@ def _append_retained_keys(
     if not previous_dir.is_dir():
         return []
 
-    # Only the services this host actually has: ext_keytab fails on a
-    # principal the database does not contain.
-    wanted = {}
-    for service in services:
-        principal = f"{service}/{member.fqdn}"
-        stem = realm_mod.principal_filename(principal)
-        source = previous_dir / f"{stem}.age"
+    # Only principals the previous-key store actually holds: ext_keytab fails
+    # on a principal the database does not contain.
+    wanted: dict[str, Path] = {}
+    for principal in principals:
+        source = previous_dir / f"{realm_mod.principal_filename(principal)}.age"
         if source.exists():
-            wanted[service] = (stem, source)
+            wanted[principal] = source
 
     if not wanted:
         return []
 
-    prev_root = tmpdir / f"previous-{member.hostname}"
+    prev_root = tmpdir / f"previous-{tag}"
     prev_realm = prev_root / realm_name
     prev_principals = prev_realm / "principals"
     prev_principals.mkdir(parents=True, exist_ok=True)
 
     # The old database needs the realm key too, or it cannot be built.
     (prev_realm / "realm.key").write_bytes(realm_key_plain.read_bytes())
-    for stem, source in wanted.values():
+    for principal, source in wanted.items():
+        stem = realm_mod.principal_filename(principal)
         (prev_principals / f"{stem}.key").write_bytes(
             crypto.decrypt_age_bytes(source))
 
     prev_conf = krb.instantiate_realm(
         realm_name, prev_realm, etypes=realm_config.etypes)
 
-    krb.extract_host_keytab(
-        member.fqdn, prev_conf, keytab_path, services=sorted(wanted),
-    )
+    krb.extract_keytab(sorted(wanted), prev_conf, keytab_path)
 
-    return [f"{service}/{member.fqdn}" for service in sorted(wanted)]
+    return sorted(wanted)
 
 
 def _sync_keytab_manifest(repo: config.SecretsRepo, hostname: str) -> None:
@@ -1298,6 +1343,173 @@ def _sync_keytab_manifest(repo: config.SecretsRepo, hostname: str) -> None:
         host_placement(repo, hostname, "keytab")
     )
     host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+
+def _sync_named_keytab_manifests(repo: config.SecretsRepo) -> None:
+    """Point every host's manifest at the named keytabs it now receives.
+
+    Run over all deploying hosts rather than only those touched by this build:
+    a keytab that gained or lost a host or a role changes what some *other*
+    host declares, and that host may have nothing else to rebuild.
+    """
+    from . import host_secrets
+
+    for hostname in repo.list_deploying_hosts():
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+        before = {name: entry.to_dict() for name, entry in manifest.keytabs.items()}
+        conflicts = host_secrets.reconcile_keytabs(repo, hostname, manifest)
+        after = {name: entry.to_dict() for name, entry in manifest.keytabs.items()}
+
+        for conflict in conflicts:
+            typer.secho(f"  Warning: {hostname}: {conflict}",
+                        fg=typer.colors.YELLOW, err=True)
+
+        if before == after:
+            continue
+
+        host_secrets.save_host_manifest(repo.deploy_path, manifest)
+        detail = ", ".join(
+            [f"+{name}" for name in sorted(set(after) - set(before))]
+            + [f"-{name}" for name in sorted(set(before) - set(after))]
+            + [f"~{name}" for name in sorted(
+                n for n in set(after) & set(before) if after[n] != before[n])]
+        )
+        typer.echo(f"  {hostname}: keytabs {detail}")
+
+
+def _build_named_keytabs(
+    repo: config.SecretsRepo,
+    realm_name: str,
+    realm_config,
+    kdc_conf: Path,
+    principals_tmp: Path,
+    realm_key_plain: Path,
+    admin_keys: list[str],
+    tmpdir: Path,
+) -> None:
+    """Build the realm's named keytabs and encrypt them to their recipients.
+
+    A named keytab is an explicit principal list rather than the implicit
+    "this host's own services" of the host keytab, so it is the shape that can
+    express a client identity, a principal borrowed from another host, or a
+    keytab for something Aegis does not deploy to at all.
+
+    Unlike the host keytab there is no "already exists, skip" shortcut per
+    recipient: the cheap thing to get wrong is a keytab that is stale for one
+    recipient and current for another, so a rebuild rewrites every copy.
+    """
+    from . import host_secrets, kerberos as krb, realm as realm_mod
+
+    if not realm_config.keytabs:
+        return
+
+    typer.echo(f"\n  Building {len(realm_config.keytabs)} named keytab(s)...")
+
+    for name, spec in sorted(realm_config.keytabs.items()):
+        if not spec.principals:
+            typer.secho(
+                f"    {name}: no principals declared, skipping. "
+                f"Add one with: aegis keytab add-principal {name} <principal>",
+                fg=typer.colors.YELLOW)
+            continue
+
+        missing = [
+            principal for principal in spec.principals
+            if not (principals_tmp
+                    / f"{realm_mod.principal_filename(principal)}.key").exists()
+        ]
+        if missing:
+            typer.secho(
+                f"    {name}: principals not in realm {realm_name}: "
+                f"{', '.join(missing)}. Keytab not built -- create them with "
+                f"'aegis realm add-principal', or 'aegis keytab new "
+                f"--create-missing'.",
+                fg=typer.colors.RED, err=True)
+            continue
+
+        recipients = _named_keytab_recipients(repo, name, spec, admin_keys)
+        if recipients is None:
+            continue
+
+        keytab_tmp = tmpdir / f"named-{name}.keytab"
+        keytab_tmp.unlink(missing_ok=True)
+        try:
+            krb.extract_keytab(sorted(spec.principals), kdc_conf, keytab_tmp)
+        except Exception as e:
+            typer.echo(f"    Error extracting keytab {name}: {e}", err=True)
+            continue
+
+        try:
+            carried = _append_retained_principal_keys(
+                repo, realm_name, realm_config, realm_key_plain,
+                sorted(spec.principals), keytab_tmp, tmpdir, tag=f"keytab-{name}",
+            )
+        except Exception as e:
+            typer.echo(f"    Error adding retained keys to {name}: {e}", err=True)
+            continue
+        if carried:
+            typer.echo(f"    {name}: carrying pre-rekey keys for "
+                       f"{', '.join(carried)}")
+
+        content = keytab_tmp.read_bytes()
+        for path, keys, label in recipients:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            crypto.encrypt_age(content, keys, path)
+            typer.echo(f"    {name} -> {label}: {path}")
+
+        if spec.export_only:
+            typer.echo(f"    {name}: export with 'aegis keytab export {name}'")
+
+
+def _named_keytab_recipients(
+    repo: config.SecretsRepo,
+    name: str,
+    spec,
+    admin_keys: list[str],
+) -> Optional[list[tuple[Path, list[str], str]]]:
+    """Where each copy of a named keytab goes, and who can read it.
+
+    Returns None when a declared recipient cannot be resolved at all.  That is
+    a hard stop rather than a partial build: writing the copies that *do*
+    resolve leaves the operator with a keytab that looks built and is missing
+    for exactly the host that could not be resolved.
+    """
+    copies: list[tuple[Path, list[str], str]] = []
+
+    for hostname in sorted(spec.hosts):
+        try:
+            host_key = get_host_age_pubkey(hostname, repo)
+        except AegisError as e:
+            typer.secho(f"    {name}: {e}", fg=typer.colors.RED, err=True)
+            return None
+        copies.append((
+            repo.host_keytab_path(hostname, name),
+            [host_key, *admin_keys],
+            f"host({hostname})",
+        ))
+
+    for role_name in sorted(spec.roles):
+        pubkey_path = repo.role_pubkey_path(role_name)
+        if not pubkey_path.exists():
+            typer.secho(
+                f"    {name}: role '{role_name}' has no public key at "
+                f"{pubkey_path}. Create it with: aegis role init {role_name}",
+                fg=typer.colors.RED, err=True)
+            return None
+        copies.append((
+            repo.role_keytab_path(role_name, name),
+            [pubkey_path.read_text().strip(), *admin_keys],
+            f"role({role_name})",
+        ))
+
+    if spec.export_only:
+        copies.append((
+            repo.export_keytab_path(name),
+            list(admin_keys),
+            "export",
+        ))
+
+    return copies
 
 
 @build_app.command("user-secrets")
@@ -3102,7 +3314,7 @@ def remove_host_from_role(
 @role_app.command("set-placement")
 def set_role_placement(
     role: str = typer.Argument(..., help="Role name"),
-    kind: str = typer.Argument(..., help="'secret:<name>', naming one of the role's secrets"),
+    kind: str = typer.Argument(..., help="'secret:<name>' or 'keytab:<name>', naming one of the role's secrets or keytabs"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     target: Optional[str] = typer.Option(None, "--target", help="Destination path on every member host"),
     user: Optional[str] = typer.Option(None, "--user", help="Owner user"),
@@ -3121,9 +3333,10 @@ def set_role_placement(
         aegis role set-placement authentik secret:ldap-bind-password \\
             --target /run/authentik/ldap-password --user authentik
     """
-    if not kind.startswith("secret:"):
+    if not kind.startswith(("secret:", "keytab:")):
         typer.echo(
-            f"Error: unknown placement kind {kind!r}. Expected 'secret:<name>'.",
+            f"Error: unknown placement kind {kind!r}. "
+            f"Expected 'secret:<name>' or 'keytab:<name>'.",
             err=True,
         )
         raise typer.Exit(1)
@@ -3398,7 +3611,7 @@ def verify(
 @host_app.command("set-placement")
 def set_placement(
     hostname: str = typer.Argument(..., help="Hostname"),
-    kind: str = typer.Argument(..., help="'ssh-host-keys', 'keytab', 'nexus-key', or 'secret:<name>'"),
+    kind: str = typer.Argument(..., help="'ssh-host-keys', 'keytab', 'nexus-key', 'secret:<name>', or 'keytab:<name>'"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     target: Optional[str] = typer.Option(None, "--target", help="Destination path on the host"),
     target_dir: Optional[str] = typer.Option(None, "--target-dir", help="Destination directory (SSH keys)"),
@@ -3423,11 +3636,11 @@ def set_placement(
     """
     repo = get_secrets_repo(secrets_path)
 
-    known = set(config.PLACEMENT_KINDS)
-    if kind not in known and not kind.startswith("secret:"):
+    if not config.is_placement_kind(kind):
         typer.echo(
             f"Error: unknown placement kind {kind!r}.\n"
-            f"Expected one of {', '.join(sorted(known))}, or 'secret:<name>'.",
+            f"Expected one of {', '.join(sorted(config.PLACEMENT_KINDS))}, "
+            f"'secret:<name>', or 'keytab:<name>'.",
             err=True,
         )
         raise typer.Exit(1)

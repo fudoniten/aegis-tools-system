@@ -32,6 +32,18 @@ Example manifest:
     user = "root"
     group = "root"
     mode = "0600"
+
+    # A named keytab: an arbitrary principal list, as opposed to [keytab]
+    # above, which holds this host's own service principals.  Delivered to
+    # the host directly, or -- with a role field, as here -- shared by every
+    # member of a role and decrypted in phase 2.
+    [keytabs.hermes]
+    source = "../../roles/hermes/keytabs/hermes.age"
+    target = "/run/aegis/keytabs/hermes"
+    user = "hermes"
+    group = "hermes"
+    mode = "0400"
+    role = "hermes"
     
     [nexus-key]
     source = "nexus-key.age"
@@ -93,6 +105,15 @@ DEFAULTS = {
         "user": "root",
         "group": "root",
         "mode": "0400",
+    },
+    # A named keytab, as opposed to the host's own implicit one above.  Its
+    # target is per-name, so only the owner and mode can have defaults; 0600
+    # matches the host keytab, since a keytab is key material whatever else
+    # it is.
+    "named-keytab": {
+        "user": "root",
+        "group": "root",
+        "mode": "0600",
     },
     "secret": {
         "user": "root",
@@ -162,6 +183,9 @@ class HostSecretsManifest:
     keytab: SecretEntry | None = None
     nexus_key: SecretEntry | None = None
     secrets: dict[str, SecretEntry] = field(default_factory=dict)
+    #: Named keytabs, keyed by keytab name.  Distinct from :attr:`keytab`,
+    #: which is the host's own principals and has a section of its own.
+    keytabs: dict[str, SecretEntry] = field(default_factory=dict)
     roles: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -176,6 +200,11 @@ class HostSecretsManifest:
         if self.secrets:
             d["secrets"] = {
                 name: entry.to_dict() for name, entry in self.secrets.items()
+            }
+        if self.keytabs:
+            d["keytabs"] = {
+                name: entry.to_dict()
+                for name, entry in sorted(self.keytabs.items())
             }
         if self.roles:
             d["roles"] = self.roles
@@ -198,6 +227,11 @@ class HostSecretsManifest:
             manifest.secrets = {
                 name: SecretEntry.from_dict(entry_data)
                 for name, entry_data in data["secrets"].items()
+            }
+        if "keytabs" in data:
+            manifest.keytabs = {
+                name: SecretEntry.from_dict(entry_data)
+                for name, entry_data in data["keytabs"].items()
             }
         if "roles" in data:
             manifest.roles = data["roles"]
@@ -581,6 +615,52 @@ def make_keytab_entry(placement: Placement | None = None) -> SecretEntry:
     )
 
 
+def make_named_keytab_entry(
+    name: str,
+    placement: Placement | None = None,
+) -> SecretEntry:
+    """Create an entry for a named keytab delivered to this host directly.
+
+    The source mirrors the host's other secrets -- ``keytabs/<name>.age``
+    inside the host's own deploy directory -- because a host-delivered keytab
+    is encrypted to that host's master key and nobody else's.
+    """
+    placement = placement or Placement()
+    defaults = DEFAULTS["named-keytab"]
+    return SecretEntry(
+        source=f"keytabs/{name}.age",
+        target=placement.target or f"/run/aegis/keytabs/{name}",
+        user=placement.user or defaults["user"],
+        group=placement.group or defaults["group"],
+        mode=placement.mode or defaults["mode"],
+    )
+
+
+def make_role_keytab_entry(
+    role: str,
+    name: str,
+    placement: Placement | None = None,
+) -> SecretEntry:
+    """Create an entry for a named keytab delivered through a role.
+
+    Shaped exactly like :func:`make_role_secret_entry`, and for the same
+    reason: one ciphertext at ``deploy/roles/<role>/keytabs/<name>.age``, named
+    by every member's manifest, decrypted in phase 2 with the role key.  A
+    service that moves between hosts keeps its Kerberos identity by moving its
+    role membership -- no principal is rekeyed and no keytab is re-extracted.
+    """
+    placement = placement or Placement()
+    defaults = DEFAULTS["named-keytab"]
+    return SecretEntry(
+        source=f"../../roles/{role}/keytabs/{name}.age",
+        target=placement.target or f"/run/aegis/keytabs/{name}",
+        user=placement.user or defaults["user"],
+        group=placement.group or defaults["group"],
+        mode=placement.mode or defaults["mode"],
+        role=role,
+    )
+
+
 def make_nexus_key_entry(placement: Placement | None = None) -> SecretEntry:
     """Create a Nexus key manifest entry with defaults."""
     placement = placement or Placement()
@@ -798,6 +878,81 @@ def reconcile_roles(
             continue
         manifest.secrets[name] = entry
 
+    return conflicts
+
+
+def keytab_entries(
+    repo: SecretsRepo,
+    hostname: str,
+) -> tuple[dict[str, SecretEntry], list[str]]:
+    """The named keytabs a host should carry, and any name collisions found.
+
+    A host receives a named keytab two ways: because the keytab names it in
+    ``hosts``, or because it belongs to a role the keytab names in ``roles``.
+    The first wins if both apply -- a per-host copy is the more specific
+    declaration -- and the overlap is reported, since it means the same keytab
+    was granted twice by two different routes and one of them is redundant.
+    """
+    from . import realm as realm_mod
+
+    entries: dict[str, SecretEntry] = {}
+    conflicts: list[str] = []
+
+    host_config = repo.get_host_config(hostname)
+
+    for ref in realm_mod.keytabs_for_host(repo, hostname):
+        placement = (
+            host_config.placement_for(f"keytab:{ref.name}")
+            if host_config else None
+        )
+        entries[ref.name] = make_named_keytab_entry(ref.name, placement)
+
+    for role_name in repo.list_roles():
+        role_config = repo.get_role_config(role_name)
+        if role_config is None or hostname not in role_config.hosts:
+            continue
+        for ref in realm_mod.keytabs_for_role(repo, role_name):
+            if ref.name in entries:
+                conflicts.append(
+                    f"keytab '{ref.name}' reaches {hostname} both directly and "
+                    f"through role '{role_name}'; the host's own copy is kept")
+                continue
+            entries[ref.name] = make_role_keytab_entry(
+                role=role_name,
+                name=ref.name,
+                placement=role_config.placement_for(f"keytab:{ref.name}"),
+            )
+
+    return entries, conflicts
+
+
+def reconcile_keytabs(
+    repo: SecretsRepo,
+    hostname: str,
+    manifest: "HostSecretsManifest",
+) -> list[str]:
+    """Bring a manifest's [keytabs] table in line with realm declarations.
+
+    Recomputed wholesale rather than merged: nothing but a realm declaration
+    ever puts an entry here, so an entry with no declaration behind it is a
+    keytab the host has stopped receiving.  Leaving it would point the host at
+    a file that is no longer built -- or, worse, one it can no longer decrypt
+    after leaving the role.
+
+    Only entries whose ciphertext exists are declared.  A keytab can be
+    declared before ``aegis build keytabs`` has run, and a manifest naming a
+    file that is not there yet fails the host's next boot rather than its next
+    build, which is much too late to find out.
+    """
+    wanted, conflicts = keytab_entries(repo, hostname)
+
+    built = {}
+    for name, entry in wanted.items():
+        source = (repo.host_deploy_path(hostname) / entry.source).resolve()
+        if source.exists():
+            built[name] = entry
+
+    manifest.keytabs = dict(sorted(built.items()))
     return conflicts
 
 
