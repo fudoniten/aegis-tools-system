@@ -162,6 +162,37 @@ def test_missing_manifest_entry_for_existing_secret(repo: config.SecretsRepo):
     assert "no nexus-key entry" in _errors(report)
 
 
+def test_ed25519_nexus_key_missing_pub_sidecar_detected(repo: config.SecretsRepo):
+    add_host(repo, "rama")
+    deploy = repo.host_deploy_path("rama")
+    deploy.mkdir(parents=True)
+    (deploy / "nexus-key.age").write_text("x")
+
+    manifest = host_secrets.HostSecretsManifest(hostname="rama")
+    manifest.nexus_key = host_secrets.make_nexus_key_entry(key_format="ed25519")
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    report = cli_check.run_check(repo)
+
+    assert "nexus-key.pub is" in _errors(report)
+
+
+def test_stale_nexus_pub_without_ed25519_manifest_detected(repo: config.SecretsRepo):
+    add_host(repo, "rama")
+    deploy = repo.host_deploy_path("rama")
+    deploy.mkdir(parents=True)
+    (deploy / "nexus-key.age").write_text("x")
+    (deploy / "nexus-key.pub").write_text("Ed25519:stale")
+
+    manifest = host_secrets.HostSecretsManifest(hostname="rama")
+    manifest.nexus_key = host_secrets.make_nexus_key_entry()
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    report = cli_check.run_check(repo)
+
+    assert "nexus-key.pub exists but" in _errors(report)
+
+
 def test_recipient_shortfall_detected(repo: config.SecretsRepo, admin_key):
     """A file encrypted before an admin key was added is spotted by count."""
     keypair = add_host(repo, "rama")

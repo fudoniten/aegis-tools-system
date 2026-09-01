@@ -814,19 +814,34 @@ def build_ssh_host_keys(
 @build_app.command("nexus-keys")
 def build_nexus_keys(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+    host: Annotated[Optional[str], typer.Option("--host", help="Only build for this host, rather than every configured host")] = None,
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
     rotate: Annotated[bool, typer.Option("--rotate", "--force", "-f", help="DESTRUCTIVE: generate a NEW key, invalidating the host's DDNS registration")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt for --rotate")] = False,
-    algorithm: Annotated[str, typer.Option("--algorithm", "-a", help="HMAC algorithm")] = "HmacSHA512",
+    key_format: Annotated[str, typer.Option("--format", "-t", help="'hmac' (legacy shared-secret, /api/v2) or 'ed25519' (public-key, /api/v3)")] = "hmac",
+    algorithm: Annotated[str, typer.Option("--algorithm", "-a", help="HMAC algorithm (--format hmac only)")] = "HmacSHA512",
 ):
     """Generate Nexus DDNS authentication keys for hosts.
 
-    Creates HMAC keys for each host to authenticate with Nexus DDNS servers.
-    Keys are encrypted for the host and the admin recipient set.
+    In --format hmac (the default), creates a shared-secret HMAC key per
+    host to authenticate against the legacy /api/v2 API. In --format
+    ed25519, creates an Ed25519 keypair per host instead: the private key
+    authenticates against the public-key-authenticated /api/v3 API, the
+    same way the HMAC key does for /api/v2.
 
-    Each host gets a unique key stored in deploy/hosts/<hostname>/nexus-key.age.
+    In both cases the private key is encrypted for the host and the admin
+    recipient set, and stored at deploy/hosts/<hostname>/nexus-key.age. In
+    --format ed25519, the public key is additionally written in cleartext
+    to deploy/hosts/<hostname>/nexus-key.pub -- it is not a secret, so it is
+    committed unencrypted, the same way SSH host keys ship a plaintext
+    .pub sidecar next to the encrypted private key.
+
     Deployment metadata comes from src/hosts/<hostname>.toml (see
     'aegis host set-placement') and is written to secrets.toml for NixOS to import.
+
+    Migrating a host from hmac to ed25519 does not require a bulk rollout:
+    the Nexus server accepts both APIs side by side, so hosts can be moved
+    one at a time with '--host <hostname> --format ed25519 --rotate --yes'.
 
     To re-encrypt an existing key for a changed recipient set, use
     'aegis reencrypt' -- NOT --rotate, which mints a new key.
@@ -834,12 +849,20 @@ def build_nexus_keys(
     Examples:
         aegis build nexus-keys
         aegis build nexus-keys --rotate --yes   NEW key; breaks DDNS until deploy
+        aegis build nexus-keys --host lambda --format ed25519 --rotate --yes
     """
     from . import nexus
 
+    if key_format not in ("hmac", "ed25519"):
+        typer.echo(f"Error: --format must be 'hmac' or 'ed25519', got {key_format!r}", err=True)
+        raise typer.Exit(1)
+
     repo = get_secrets_repo(secrets_path)
 
-    hosts = repo.list_deploying_hosts()
+    if host is not None:
+        hosts = [host]
+    else:
+        hosts = repo.list_deploying_hosts()
     if not hosts:
         typer.echo("No hosts configured. Use 'aegis host add' first.")
         return
@@ -858,16 +881,17 @@ def build_nexus_keys(
 
     for hostname in hosts:
         output_path = repo.host_deploy_path(hostname) / "nexus-key.age"
+        pub_path = repo.host_deploy_path(hostname) / "nexus-key.pub"
 
         if output_path.exists() and not rotate:
             typer.echo(f"  {hostname}: Nexus key exists (use --rotate to replace it)")
             continue
 
         if dry_run:
-            typer.echo(f"  [dry-run] Would generate Nexus key for {hostname}")
+            typer.echo(f"  [dry-run] Would generate {key_format} Nexus key for {hostname}")
             continue
 
-        typer.echo(f"  Generating Nexus key for {hostname}...")
+        typer.echo(f"  Generating {key_format} Nexus key for {hostname}...")
 
         # Get age public key from host config
         try:
@@ -879,37 +903,55 @@ def build_nexus_keys(
         # Generate key in a temp file
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_key_path = Path(tmpdir) / "nexus.key"
-            nexus.generate_key(
-                output_path=tmp_key_path,
-                algorithm=algorithm,
-                verbose=False,
-            )
-
-            # Read the generated key
-            key_content = tmp_key_path.read_text()
+            if key_format == "ed25519":
+                tmp_key_path, tmp_pub_path = nexus.generate_keypair(
+                    output_path=Path(tmpdir) / "nexus.key",
+                    verbose=False,
+                )
+                key_content = tmp_key_path.read_text()
+                pub_content = tmp_pub_path.read_text()
+            else:
+                tmp_key_path = Path(tmpdir) / "nexus.key"
+                nexus.generate_key(
+                    output_path=tmp_key_path,
+                    algorithm=algorithm,
+                    verbose=False,
+                )
+                key_content = tmp_key_path.read_text()
+                pub_content = None
 
         # Get recipients
         recipients = [host_age_key, *admin_keys]
-        
-        # Encrypt and write
+
+        # Encrypt and write the private key
         output_path.parent.mkdir(parents=True, exist_ok=True)
         crypto.encrypt_age(key_content, recipients, output_path)
-        
         typer.echo(f"    Wrote {output_path}")
-        
+
+        # The public key is not a secret -- write it in cleartext, and drop
+        # any stale sidecar left over from a previous hmac-format key.
+        if pub_content is not None:
+            pub_path.write_text(pub_content)
+            typer.echo(f"    Wrote {pub_path} (cleartext)")
+        elif pub_path.exists():
+            pub_path.unlink()
+
         # Update manifest with deployment metadata
         from . import host_secrets
         manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
         manifest.nexus_key = host_secrets.make_nexus_key_entry(
-            host_placement(repo, hostname, "nexus-key")
+            host_placement(repo, hostname, "nexus-key"),
+            key_format=key_format,
         )
         host_secrets.save_host_manifest(repo.deploy_path, manifest)
         typer.echo(f"    Updated manifest")
-        
-        # Show the algorithm
-        algo, _ = key_content.strip().split(":", 1)
-        typer.echo(f"    Algorithm: {algo}")
+
+        if key_format == "ed25519":
+            typer.echo(f"    Format: ed25519 (/api/v3)")
+        else:
+            # Show the algorithm
+            algo, _ = key_content.strip().split(":", 1)
+            typer.echo(f"    Algorithm: {algo}")
 
 
 @build_app.command("keytabs")
@@ -3389,38 +3431,55 @@ def set_role_placement(
 @nexus_app.command("keygen")
 def nexus_keygen(
     output: Path = typer.Argument(..., help="Output file path for the key"),
+    keypair: Annotated[bool, typer.Option("--keypair", "-K", help="Generate an Ed25519 public/private keypair for /api/v3 instead of an HMAC key. Writes the private key to OUTPUT and the public key to OUTPUT.pub. Ignores --algorithm and --seed.")] = False,
     algorithm: str = typer.Option("HmacSHA512", "--algorithm", "-a", help="HMAC algorithm (e.g., HmacSHA256, HmacSHA512)"),
     seed: Optional[str] = typer.Option(None, "--seed", "-s", help="Seed for key generation (for reproducibility)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Print verbose output"),
 ):
-    """Generate a Nexus DDNS authentication key.
-    
-    Creates an HMAC key for authenticating Nexus DDNS clients to servers.
-    The key is written in the format: ALGORITHM:BASE64_ENCODED_KEY
+    """Generate a standalone Nexus DDNS authentication key.
+
+    By default, creates an HMAC key authenticating against the legacy
+    /api/v2 API, written in the format ALGORITHM:BASE64_ENCODED_KEY. With
+    --keypair, creates an Ed25519 keypair authenticating against /api/v3
+    instead; the public half is not secret.
+
+    Most of the time you want 'aegis build nexus-keys', which also encrypts
+    the key for a host and updates its manifest -- this command is for
+    generating a key file directly, e.g. to hand-carry it somewhere.
     \b
     Example:
         aegis nexus keygen server.key
         aegis nexus keygen client.key --algorithm HmacSHA256
+        aegis nexus keygen client.key --keypair
     """
     from . import nexus
-    
-    typer.echo(f"Generating Nexus key with algorithm: {algorithm}")
-    
+
     try:
-        key_path = nexus.generate_key(
-            output_path=output,
-            algorithm=algorithm,
-            seed=seed,
-            verbose=verbose,
-        )
-        
-        typer.secho(f"\nKey generated successfully!", fg=typer.colors.GREEN)
-        typer.echo(f"  Location: {key_path}")
-        
-        # Show the algorithm
-        algo, _ = nexus.read_key(key_path)
-        typer.echo(f"  Algorithm: {algo}")
-        
+        if keypair:
+            typer.echo("Generating Nexus Ed25519 keypair")
+            key_path, pub_path = nexus.generate_keypair(
+                output_path=output,
+                verbose=verbose,
+            )
+            typer.secho(f"\nKeypair generated successfully!", fg=typer.colors.GREEN)
+            typer.echo(f"  Private key: {key_path}")
+            typer.echo(f"  Public key:  {pub_path} (not secret)")
+        else:
+            typer.echo(f"Generating Nexus key with algorithm: {algorithm}")
+            key_path = nexus.generate_key(
+                output_path=output,
+                algorithm=algorithm,
+                seed=seed,
+                verbose=verbose,
+            )
+
+            typer.secho(f"\nKey generated successfully!", fg=typer.colors.GREEN)
+            typer.echo(f"  Location: {key_path}")
+
+            # Show the algorithm
+            algo, _ = nexus.read_key(key_path)
+            typer.echo(f"  Algorithm: {algo}")
+
     except Exception as e:
         typer.echo(f"Error generating key: {e}", err=True)
         raise typer.Exit(1)
@@ -3464,6 +3523,11 @@ def status(
         has_ssh = ssh_dir.is_dir() and any(ssh_dir.glob("*.age"))
 
         has_nexus = (build_path / "nexus-key.age").exists()
+        nexus_format = None
+        if has_nexus:
+            nexus_manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+            if nexus_manifest.nexus_key is not None:
+                nexus_format = nexus_manifest.nexus_key.type or "hmac"
         has_keytab = (build_path / "keytab.age").exists()
 
         roles_dir = build_path / "roles"
@@ -3472,7 +3536,7 @@ def status(
         parts = [
             f"master-key={yn(has_master_key)}",
             f"ssh={yn(has_ssh)}",
-            f"nexus={yn(has_nexus)}",
+            f"nexus={nexus_format if nexus_format else yn(has_nexus)}",
             f"keytab={yn(has_keytab)}",
         ]
         if host_roles:
@@ -3945,7 +4009,7 @@ def delete_ssh_cmd(
 def list_nexus_cmd(
     secrets_path: Optional[Path] = SecretsPathOpt,
 ):
-    """List hosts holding a Nexus HMAC key.
+    """List hosts holding a Nexus key, and which API each authenticates against.
     \b
     Example:
         aegis nexus list
@@ -3959,14 +4023,21 @@ def list_nexus_cmd(
         if manifest.nexus_key is None:
             continue
         found = True
+        key_format = manifest.nexus_key.type or "hmac"
         present = (repo.host_deploy_path(host) / "nexus-key.age").exists()
+        pub_present = (repo.host_deploy_path(host) / "nexus-key.pub").exists()
+        notes = []
+        if not present:
+            notes.append("declared, no key file")
+        if key_format == "ed25519" and not pub_present:
+            notes.append("no public key file")
+        note = f"   ({'; '.join(notes)})" if notes else ""
         typer.echo(
-            f"{host:24} {manifest.nexus_key.target}"
-            f"{'' if present else '   (declared, no key file)'}"
+            f"{host:24} {key_format:8} {manifest.nexus_key.target}{note}"
         )
 
     if not found:
-        typer.echo("No host declares a nexus key. Add one with: aegis nexus keygen")
+        typer.echo("No host declares a nexus key. Add one with: aegis build nexus-keys")
 
 
 @nexus_app.command("delete")

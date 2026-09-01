@@ -661,8 +661,23 @@ def make_role_keytab_entry(
     )
 
 
-def make_nexus_key_entry(placement: Placement | None = None) -> SecretEntry:
-    """Create a Nexus key manifest entry with defaults."""
+def make_nexus_key_entry(
+    placement: Placement | None = None,
+    key_format: str = "hmac",
+) -> SecretEntry:
+    """Create a Nexus key manifest entry with defaults.
+
+    key_format is "hmac" (legacy shared-secret, authenticates against
+    /api/v2) or "ed25519" (private half of a keypair, authenticates against
+    /api/v3). Recorded in the entry's `type` field -- reusing the same field
+    SSH host keys use for their key type -- and left unset for "hmac" so
+    existing manifests and callers are unaffected.
+
+    Only the private key is ever represented here. Its Ed25519 public
+    counterpart is not a secret: aegis writes it in cleartext to
+    nexus-key.pub alongside nexus-key.age, outside the manifest entirely, so
+    it needs no age recipients and no NixOS decrypt unit.
+    """
     placement = placement or Placement()
     defaults = DEFAULTS["nexus-key"]
     return SecretEntry(
@@ -671,6 +686,7 @@ def make_nexus_key_entry(placement: Placement | None = None) -> SecretEntry:
         user=placement.user or defaults["user"],
         group=placement.group or defaults["group"],
         mode=placement.mode or defaults["mode"],
+        type=key_format if key_format != "hmac" else None,
     )
 
 
