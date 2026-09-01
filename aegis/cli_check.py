@@ -184,6 +184,28 @@ def _check_hosts(
                 "aegis reencrypt --host " + hostname,
             )
 
+        nexus_pub = deploy / "nexus-key.pub"
+        nexus_format = manifest.nexus_key.type if manifest.nexus_key else None
+        if nexus_format == "ed25519" and not nexus_pub.exists():
+            report.error(
+                scope,
+                "manifest declares an ed25519 nexus-key but nexus-key.pub is "
+                "missing, so the Nexus server has no public key to verify "
+                "this host's requests against",
+                "aegis build nexus-keys --host " + hostname
+                + " --format ed25519 --rotate --yes",
+            )
+        if nexus_pub.exists() and nexus_format != "ed25519":
+            report.error(
+                scope,
+                "nexus-key.pub exists but the manifest's nexus-key is not "
+                "ed25519 -- either a stale sidecar from a previous keypair, "
+                "or the manifest fell out of sync with the key on disk",
+                "delete " + str(nexus_pub)
+                + " if stale, or aegis build nexus-keys --host " + hostname
+                + " --format ed25519 --rotate --yes to bring both in sync",
+            )
+
         # Manifest must agree with declared placement, or a change to src/
         # silently never reaches the host.
         _check_placement_drift(repo, hostname, host_config, manifest, report, scope)

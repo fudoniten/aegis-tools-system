@@ -233,6 +233,34 @@ def test_default_values():
     assert nexus_entry.target == "/run/aegis/nexus-key"
 
 
+def test_make_nexus_key_entry_hmac_leaves_type_unset():
+    """The default (hmac) format is left unstamped, matching every manifest
+    written before the ed25519 format existed."""
+    entry = host_secrets.make_nexus_key_entry()
+    assert entry.type is None
+
+
+def test_make_nexus_key_entry_ed25519_records_format():
+    """--format ed25519 stamps the entry's type, so consumers (aegis.secrets.
+    manifest.nexusKeyFormat in the NixOS module) can tell it apart from an
+    HMAC key sharing the same [nexus-key] manifest section."""
+    entry = host_secrets.make_nexus_key_entry(key_format="ed25519")
+    assert entry.type == "ed25519"
+    assert entry.source == "nexus-key.age"
+
+
+def test_nexus_key_entry_format_roundtrips_through_manifest(tmp_path: Path):
+    """The format survives a save/load cycle, since it travels through the
+    same generic `type` field as SSH key types."""
+    manifest = host_secrets.HostSecretsManifest(hostname="testhost")
+    manifest.nexus_key = host_secrets.make_nexus_key_entry(key_format="ed25519")
+    host_secrets.save_host_manifest(tmp_path, manifest)
+
+    loaded = host_secrets.load_host_manifest(tmp_path, "testhost")
+    assert loaded.nexus_key is not None
+    assert loaded.nexus_key.type == "ed25519"
+
+
 def test_load_nonexistent_manifest(tmp_path: Path):
     """Loading a nonexistent manifest returns empty manifest."""
     manifest = host_secrets.load_host_manifest(tmp_path, "nonexistent")

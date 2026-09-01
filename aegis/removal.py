@@ -350,10 +350,14 @@ def plan_ssh_removal(repo: config.SecretsRepo, hostname: str) -> Removal:
 
 
 def plan_nexus_removal(repo: config.SecretsRepo, hostname: str) -> Removal:
-    """Delete a host's Nexus HMAC key."""
+    """Delete a host's Nexus key (HMAC or Ed25519 keypair)."""
     removal = Removal("nexus key", hostname)
 
-    removal.paths = _existing(repo.host_deploy_path(hostname) / "nexus-key.age")
+    removal.paths = _existing(
+        repo.host_deploy_path(hostname) / "nexus-key.age",
+        # Only present for an ed25519-format key; harmless no-op otherwise.
+        repo.host_deploy_path(hostname) / "nexus-key.pub",
+    )
 
     manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
 

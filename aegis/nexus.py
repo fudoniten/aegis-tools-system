@@ -51,24 +51,55 @@ def generate_key(
 
 def read_key(key_path: Path) -> tuple[str, str]:
     """Read and parse a Nexus key file.
-    
+
     Args:
         key_path: Path to the key file
-        
+
     Returns:
         Tuple of (algorithm, encoded_key)
-        
+
     Raises:
         FileNotFoundError: If key file doesn't exist
         ValueError: If key file format is invalid
     """
     if not key_path.exists():
         raise FileNotFoundError(f"Key file not found: {key_path}")
-    
+
     content = key_path.read_text().strip()
-    
+
     try:
         algorithm, encoded_key = content.split(":", 1)
         return algorithm, encoded_key
     except ValueError:
         raise ValueError(f"Invalid key file format: {key_path}")
+
+
+def generate_keypair(output_path: Path, verbose: bool = False) -> tuple[Path, Path]:
+    """Generate a Nexus DDNS Ed25519 keypair for the public-key-authenticated
+    /api/v3 API.
+
+    Shells out to `nexus-keygen --keypair`, which writes the private key to
+    output_path (owner-only permissions) and the public key to
+    output_path + ".pub". Unlike generate_key's HMAC key, only the private
+    key is sensitive -- the public key is not secret and needs no encryption
+    at rest.
+
+    Args:
+        output_path: Path where the private key file should be written
+        verbose: Print verbose output
+
+    Returns:
+        Tuple of (private_key_path, public_key_path)
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["nexus-keygen", "--keypair"]
+
+    if verbose:
+        cmd.append("--verbose")
+
+    cmd.append(str(output_path))
+
+    subprocess.run(cmd, check=True)
+
+    return output_path, output_path.with_name(output_path.name + ".pub")

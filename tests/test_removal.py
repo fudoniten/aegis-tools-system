@@ -308,6 +308,21 @@ def test_nexus_delete_clears_the_manifest_entry(repo: config.SecretsRepo):
     assert host_secrets.load_host_manifest(repo.deploy_path, "rama").nexus_key is None
 
 
+def test_nexus_delete_also_removes_the_ed25519_pub_sidecar(repo: config.SecretsRepo):
+    add_host(repo, "rama")
+    deploy = repo.host_deploy_path("rama")
+    deploy.mkdir(parents=True, exist_ok=True)
+    (deploy / "nexus-key.age").write_text("x")
+    (deploy / "nexus-key.pub").write_text("Ed25519:pub")
+    _manifest(repo, "rama", nexus_key=host_secrets.make_nexus_key_entry(key_format="ed25519"))
+
+    result = _invoke(repo, "nexus", "delete", "rama", "--yes")
+
+    assert result.exit_code == 0
+    assert not (deploy / "nexus-key.age").exists()
+    assert not (deploy / "nexus-key.pub").exists()
+
+
 def test_dnssec_delete_refuses_while_the_role_has_signers(repo: config.SecretsRepo):
     add_host(repo, "aedile")
     repo.dnssec_src_path("fudo.org").mkdir(parents=True)
