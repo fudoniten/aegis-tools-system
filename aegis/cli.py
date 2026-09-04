@@ -958,7 +958,7 @@ def build_nexus_keys(
 def build_keytabs(
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n"),
-    force: Annotated[bool, typer.Option("--force", "-f", help="Re-extract keytabs that already exist (does not change principal keys)")] = False,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Deprecated, no effect: every run now re-extracts and compares. Kept so existing callers don't break.")] = False,
     realm_filter: Annotated[Optional[str], typer.Option("--realm", help="Only process this realm")] = None,
 ):
     """Generate Kerberos keytabs for hosts, and the KDC principal bundle.
@@ -971,13 +971,18 @@ def build_keytabs(
     claims that domain.  Use 'aegis realm set <REALM> --add-domain <domain>'
     to declare the latter.
 
-    Unlike --rotate on the SSH and Nexus builders, --force here is safe: it
-    re-extracts a keytab from the principals already stored in the repo,
-    leaving key material untouched.
+    A keytab is a build artifact, not secret material of its own -- the
+    principal keys inside it are what's immutable. So every run always
+    re-extracts each host's keytab from the principals already stored in
+    the repo (leaving key material untouched) and compares the result
+    against what's on disk, rewriting keytab.age only when the plaintext
+    actually changed. That's what makes adding a service (nfs, say) to an
+    already-built host's 'services' take effect on the next plain build,
+    and what makes a rekey's second kvno reach an existing keytab.
     \b
     Examples:
         aegis build keytabs
-        aegis build keytabs --force --realm SEA.FUDO.ORG    after a rekey
+        aegis build keytabs --realm SEA.FUDO.ORG    after a rekey
     """
     from . import host_secrets, realm as realm_mod
     from . import kerberos as krb
@@ -1125,12 +1130,6 @@ def build_keytabs(
                         continue
 
                 keytab_output = repo.host_deploy_path(hostname) / "keytab.age"
-                if keytab_output.exists() and not force:
-                    typer.echo(f"    Keytab exists (use --force to re-extract)")
-                    # Still reconcile the manifest: skipping it here is how a
-                    # host ends up with a keytab and no manifest entry.
-                    _sync_keytab_manifest(repo, hostname)
-                    continue
 
                 typer.echo(f"    Extracting keytab...")
                 keytab_tmp = tmpdir / f"{hostname}.keytab"
@@ -1158,13 +1157,46 @@ def build_keytabs(
                     typer.echo(
                         f"    Carrying pre-rekey keys for: {', '.join(carried)}")
 
-                recipients = [host_age_key, *admin_keys]
-                if kdc_role_pubkey:
-                    recipients.append(kdc_role_pubkey)
+                # Keytabs are a build artifact, not secret material in their
+                # own right -- the principal keys inside are what's actually
+                # immutable; extracting them into a keytab is just
+                # packaging. So this always re-extracts and only rewrites
+                # keytab_output when the plaintext actually changed, rather
+                # than the old "skip if the file exists" rule. That rule
+                # meant a host's keytab silently stopped tracking its realm
+                # principals the moment it was first built -- adding a
+                # service to services (nfs, say) had no effect on an
+                # already-built host without a manual --force -- and, per
+                # kerberos-realm-management.md §4.3, meant a rekey's second
+                # kvno never reached a keytab that already existed either.
+                #
+                # Comparing plaintext (not ciphertext) is load-bearing: age
+                # encryption is randomized, so two encryptions of identical
+                # bytes never match, and rewriting on every build would
+                # dirty every host's keytab.age on every build for no
+                # content reason. `force` is kept, accepted but unused, so
+                # existing callers/docs passing it don't break.
+                new_keytab_bytes = keytab_tmp.read_bytes()
+                unchanged = False
+                if keytab_output.exists():
+                    try:
+                        unchanged = (crypto.decrypt_age_bytes(keytab_output)
+                                     == new_keytab_bytes)
+                    except Exception as e:
+                        typer.echo(
+                            f"    Warning: couldn't decrypt existing keytab "
+                            f"to compare ({e}); re-extracting", err=True)
 
-                keytab_output.parent.mkdir(parents=True, exist_ok=True)
-                crypto.encrypt_age(keytab_tmp.read_bytes(), recipients, keytab_output)
-                typer.echo(f"    Wrote: {keytab_output}")
+                if unchanged:
+                    typer.echo(f"    Keytab unchanged")
+                else:
+                    recipients = [host_age_key, *admin_keys]
+                    if kdc_role_pubkey:
+                        recipients.append(kdc_role_pubkey)
+
+                    keytab_output.parent.mkdir(parents=True, exist_ok=True)
+                    crypto.encrypt_age(new_keytab_bytes, recipients, keytab_output)
+                    typer.echo(f"    Wrote: {keytab_output}")
 
                 _sync_keytab_manifest(repo, hostname)
                 typer.echo(f"    Updated manifest")
