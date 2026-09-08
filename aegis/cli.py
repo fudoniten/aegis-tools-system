@@ -2064,7 +2064,19 @@ def import_nexus_key(
     output_path = repo.host_deploy_path(hostname) / "nexus-key.age"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     crypto.encrypt_age(key_content, recipients, output_path)
-    
+
+    # This command imports an HMAC key -- `nexus.read_key` above accepts
+    # nothing else -- so any nexus-key.pub here belonged to an Ed25519 keypair
+    # this import has just replaced. Drop it, the same way `build nexus-keys`
+    # does when it writes an hmac key over an ed25519 one. Leaving it would
+    # contradict the manifest entry written below, which run_check reports as
+    # an error, and would make `_refresh_manifest` read the host back as
+    # ed25519 on the next `aegis reencrypt`.
+    stale_pub = repo.host_deploy_path(hostname) / "nexus-key.pub"
+    if stale_pub.exists():
+        stale_pub.unlink()
+        typer.echo(f"  Removed stale {stale_pub} (was an ed25519 sidecar)")
+
     # Update manifest with deployment metadata
     from . import host_secrets
     record_placement(repo, hostname, "nexus-key", config.Placement(
