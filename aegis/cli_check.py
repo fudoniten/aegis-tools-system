@@ -1135,8 +1135,29 @@ def _refresh_manifest(repo: config.SecretsRepo, hostname: str) -> None:
             host_placement(repo, hostname, "keytab"))
 
     if (deploy / "nexus-key.age").exists():
+        # The key format has to be recovered, never defaulted.
+        # `make_nexus_key_entry` defaults to hmac, and this function runs over
+        # every host on every `aegis reencrypt` -- so calling it bare rewrote
+        # each ed25519 entry as hmac, dropping `type` from the manifest while
+        # leaving the keypair and its .pub sidecar untouched on disk. The NixOS
+        # module reads `type or "hmac"`, so every affected host went on signing
+        # against /api/v2 with an Ed25519 private key, and nothing failed at
+        # build time to say so.
+        #
+        # The sidecar is the ground truth here rather than the recorded type:
+        # `aegis build nexus-keys` writes nexus-key.pub for ed25519 and unlinks
+        # it for hmac, and run_check already treats a sidecar without an
+        # ed25519 manifest entry as an error. Reading the format off it
+        # therefore matches the invariant the checker enforces, and repairs a
+        # manifest that an earlier reencrypt clobbered -- where merely
+        # preserving `manifest.nexus_key.type` would leave it wrong forever.
+        # The recorded type remains the fallback, for the hmac case where there
+        # is no sidecar to read.
+        nexus_format = "ed25519" if (deploy / "nexus-key.pub").exists() else (
+            (manifest.nexus_key.type if manifest.nexus_key else None) or "hmac")
         manifest.nexus_key = host_secrets.make_nexus_key_entry(
-            host_placement(repo, hostname, "nexus-key"))
+            host_placement(repo, hostname, "nexus-key"),
+            key_format=nexus_format)
 
     secrets_dir = deploy / "secrets"
     if secrets_dir.is_dir():

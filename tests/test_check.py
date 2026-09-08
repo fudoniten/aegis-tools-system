@@ -433,3 +433,67 @@ def test_refresh_manifest_repairs_a_misfiled_host(repo: config.SecretsRepo):
     assert manifest.secrets["initrd-ed25519-key"].type is None
 
     assert cli_check.run_check(repo).errors == []
+
+
+def _nexus_host(repo: config.SecretsRepo, hostname: str, *, ed25519: bool):
+    """A host with a Nexus key on disk, in one format or the other."""
+    add_host(repo, hostname)
+    deploy = repo.host_deploy_path(hostname)
+    deploy.mkdir(parents=True, exist_ok=True)
+    (deploy / "nexus-key.age").write_text("x")
+    if ed25519:
+        (deploy / "nexus-key.pub").write_text("Ed25519:AAAA")
+    return deploy
+
+
+def test_refresh_manifest_keeps_the_ed25519_nexus_format(repo: config.SecretsRepo):
+    """`aegis reencrypt` must not silently demote an ed25519 key to hmac.
+
+    Regression: _refresh_manifest called make_nexus_key_entry with no
+    key_format, so every reencrypt rewrote `type = "ed25519"` out of every
+    manifest while leaving the keypair and its .pub sidecar in place. The
+    NixOS module then read `type or "hmac"` and kept the host on /api/v2.
+    """
+    _nexus_host(repo, "rama", ed25519=True)
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, "rama")
+    manifest.nexus_key = host_secrets.make_nexus_key_entry(key_format="ed25519")
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    cli_check._refresh_manifest(repo, "rama")
+
+    assert host_secrets.load_host_manifest(
+        repo.deploy_path, "rama").nexus_key.type == "ed25519"
+
+
+def test_refresh_manifest_repairs_a_clobbered_nexus_format(repo: config.SecretsRepo):
+    """The sidecar is ground truth, so a manifest already demoted is repaired.
+
+    Preserving only the recorded type would leave the fleet wrong forever;
+    every host clobbered by an earlier reencrypt still has its .pub.
+    """
+    _nexus_host(repo, "rama", ed25519=True)
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, "rama")
+    manifest.nexus_key = host_secrets.make_nexus_key_entry()  # demoted to hmac
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    cli_check._refresh_manifest(repo, "rama")
+
+    assert host_secrets.load_host_manifest(
+        repo.deploy_path, "rama").nexus_key.type == "ed25519"
+    assert cli_check.run_check(repo).errors == []
+
+
+def test_refresh_manifest_leaves_an_hmac_key_as_hmac(repo: config.SecretsRepo):
+    """No sidecar means hmac, and hmac records no `type` at all."""
+    _nexus_host(repo, "rama", ed25519=False)
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, "rama")
+    manifest.nexus_key = host_secrets.make_nexus_key_entry()
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    cli_check._refresh_manifest(repo, "rama")
+
+    assert host_secrets.load_host_manifest(
+        repo.deploy_path, "rama").nexus_key.type is None
