@@ -94,6 +94,14 @@ aegis secret import grafana-token --role grafana \
     --file /secure/grafana.token \
     --target /run/grafana/token --user grafana --mode 0400
 
+# No file to hand? --stdin prompts without echo (or reads a pipe), and
+# --literal takes the value inline like kubectl's --from-literal -- at the
+# cost of leaving it in your shell history.
+aegis secret import grafana-admin-password --role grafana \
+    --stdin --target /run/grafana/admin-password --user grafana
+aegis secret import smtp-user --host rama \
+    --literal mailer@example.com --target /run/mailer/user
+
 # One you want invented rather than handed over.
 aegis secret new ingest-token --host rama --host lambda \
     --target /run/aurelius/token --user aurelius

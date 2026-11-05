@@ -2134,11 +2134,34 @@ def print_secret_reference(
         )
 
 
+def _read_secret_from_stdin(name: str) -> bytes:
+    """The secret for --stdin: piped bytes as-is, or a hidden prompt on a tty.
+
+    Piped input is taken byte-for-byte, the same contract as --file, so
+    'cat x | aegis secret import ... --stdin' and '--file x' agree.  A prompt
+    is the one place a trailing newline is plainly not part of the value, so
+    none is added there.
+    """
+    if not sys.stdin.isatty():
+        return sys.stdin.buffer.read()
+
+    import getpass
+
+    first = getpass.getpass(f"Value for secret '{name}': ")
+    second = getpass.getpass("Repeat to confirm: ")
+    if first != second:
+        typer.echo("Error: the two entries did not match.", err=True)
+        raise typer.Exit(1)
+    return first.encode()
+
+
 @secret_app.command("import")
 def import_secret(
     name: str = typer.Argument(..., help="Name of the secret; or, in the older two-argument form, the hostname"),
     legacy_name: Optional[str] = typer.Argument(None, help="Deprecated: 'aegis secret import HOST NAME' still works and means '--host HOST'", metavar="[NAME]"),
-    file: Path = typer.Option(..., "--file", help="Path to secret file"),
+    file: Optional[Path] = typer.Option(None, "--file", help="Path to secret file (contents are used byte-for-byte)"),
+    literal: Optional[str] = typer.Option(None, "--literal", help="Secret value given on the command line, used exactly as typed with no trailing newline. Visible in shell history and ps; prefer --stdin for real credentials."),
+    stdin: bool = typer.Option(False, "--stdin", help="Read the secret from standard input. Piped input is used byte-for-byte; on a terminal you are prompted without echo."),
     target: Optional[str] = typer.Option(None, "--target", help="Target path on each recipient host (e.g., /run/service/config)"),
     host: List[str] = typer.Option([], "--host", "-H", help="Recipient host (repeatable). Encrypted to that host's master key; a copy per host."),
     role: List[str] = typer.Option([], "--role", "-R", help="Recipient role (repeatable). Encrypted once to the role; every member host deploys it."),
@@ -2170,11 +2193,26 @@ def import_secret(
     --target is required the first time; rotating with --force reuses the
     placement already recorded for the name unless you override it.
     \b
+    Secret source (exactly one is required):
+      --file <path>    the file's contents, byte-for-byte.
+      --literal <val>  the value itself, with no trailing newline (like
+                       kubectl's --from-literal).  Handy, but the value lands
+                       in shell history and is visible in ps while it runs.
+      --stdin          read the value from standard input.  Piped input is
+                       used byte-for-byte; on a terminal you are prompted
+                       twice without echo, and no newline is added.
+    \b
     Examples:
         aegis secret import my-service-token --host lambda \\
             --file /secure/lambda-service.token \\
             --target /run/myservice/token \\
             --user myservice --group myservice --mode 0600
+
+        aegis secret import grafana-admin-password --host lambda \\
+            --stdin --target /run/grafana/admin-password
+
+        aegis secret import smtp-user --host lambda \\
+            --literal mailer@example.com --target /run/mailer/user
 
         aegis secret import ldap-bind-password --role authentik \\
             --file /secure/authentik-ldap.password \\
@@ -2198,6 +2236,19 @@ def import_secret(
 
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
+
+    sources = [s for s, given in (
+        ("--file", file is not None),
+        ("--literal", literal is not None),
+        ("--stdin", stdin),
+    ) if given]
+    if len(sources) != 1:
+        typer.echo(
+            "Error: give exactly one of --file, --literal or --stdin"
+            + (f" (got {', '.join(sources)})." if sources else "."),
+            err=True,
+        )
+        raise typer.Exit(1)
 
     if not host and not role:
         typer.echo(
@@ -2232,7 +2283,7 @@ def import_secret(
             )
             raise typer.Exit(1)
 
-    if not file.exists():
+    if file is not None and not file.exists():
         typer.echo(f"Error: Secret file not found: {file}", err=True)
         raise typer.Exit(1)
 
@@ -2273,7 +2324,17 @@ def import_secret(
         raise typer.Exit(1)
 
     # Read secret content as bytes: a p12, DER cert or keytab is not text.
-    secret_content = file.read_bytes()
+    # Done after every check above so a terminal prompt is never wasted on a
+    # run that was going to fail anyway.
+    if file is not None:
+        secret_content = file.read_bytes()
+    elif literal is not None:
+        secret_content = literal.encode()
+    else:
+        secret_content = _read_secret_from_stdin(name)
+    if not secret_content:
+        typer.echo("Error: the secret is empty; refusing to import it.", err=True)
+        raise typer.Exit(1)
     admin_keys = admin_recipients(repo)
     placement = config.Placement(target=target, user=user, group=group, mode=mode)
 
