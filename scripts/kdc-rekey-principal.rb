@@ -84,6 +84,17 @@ def exec!(verbose, msg, cmd)
   status.success?
 end
 
+# The dump names every principal fully qualified ("nfs/host@REALM"), but the
+# principal given on the command line usually is not ("nfs/host"), in which
+# case it means the realm's own default realm -- match on the name before '@'.
+def dump_line_for?(line, principal)
+  princ = line.split(" ")[0]
+  return false if princ.nil?
+  return princ == principal if principal.include?("@")
+
+  princ.sub(/@[^@]*\z/, "") == principal
+end
+
 principal_keys = Dir::mktmpdir("rekey_principal") do |tmpdir|
   pw_clause = if options[:password]
                 "--password=\"#{options[:password]}\""
@@ -102,10 +113,7 @@ principal_keys = Dir::mktmpdir("rekey_principal") do |tmpdir|
   exec!(verbose, "Extracting keys ...",
         "kadmin --local --config-file=#{config} -- dump --decrypt #{dump_file}")
   File::open(dump_file, "r") do |file|
-    file.readlines.filter { |line|
-      princ = line.split(" ")[0]
-      princ == principal
-    }
+    file.readlines.filter { |line| dump_line_for?(line, principal) }
   end
 end
 

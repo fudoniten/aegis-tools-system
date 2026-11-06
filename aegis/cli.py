@@ -1081,6 +1081,12 @@ def build_keytabs(
                 typer.echo(f"  Decrypting {len(principal_files)} principals...")
                 for princ_file in principal_files:
                     princ_content = crypto.decrypt_age_bytes(princ_file)
+                    if not princ_content.strip():
+                        typer.echo(
+                            f"    Warning: {princ_file.name} holds no key; it "
+                            f"will not reach the KDC or any keytab. Recreate "
+                            f"it with 'aegis realm remove-principal' then "
+                            f"'aegis realm add-principal'.", err=True)
                     (principals_tmp / f"{princ_file.stem}.key").write_bytes(princ_content)
 
             typer.echo(f"  Instantiating realm database...")

@@ -545,6 +545,25 @@ def _check_realms(repo: config.SecretsRepo, report: Report) -> None:
                 f"rekey-principal {realm_name} <principal> --prune",
             )
 
+        # realm.toml records a principal the moment add-principal succeeds;
+        # the key itself is a separate file. Without it the principal is in
+        # neither the KDC bundle nor any keytab, though everything else about
+        # the realm looks right.
+        stored = set(realm_mod.stored_principals(repo, realm_name))
+        unstored = sorted(p for p in realm_config.principals if p not in stored)
+        if unstored:
+            shown = ", ".join(unstored[:4]) + (
+                f" (+{len(unstored) - 4} more)" if len(unstored) > 4 else "")
+            # A warning, not an error: a stale index entry for a principal
+            # that was deliberately dropped is just as keyless, and harmless.
+            report.warn(
+                scope,
+                f"{len(unstored)} principal(s) recorded in realm.toml with no "
+                f"stored key, so the KDC will never see them: {shown}",
+                f"aegis realm remove-principal {realm_name} <principal>, then "
+                f"aegis realm add-principal {realm_name} <principal>",
+            )
+
         if not realm_config.domains:
             report.error(
                 scope,
