@@ -77,6 +77,10 @@ class _InstantiatedRealm:
         src = self.principals_dir / f"{stem}.key"
         if not src.exists():
             raise RealmError(f"Principal file not produced: {src}")
+        if not src.read_bytes().strip():
+            # Stored anyway, this looks exactly like a real key in the repo,
+            # and the principal silently never reaches the KDC or a keytab.
+            raise RealmError(f"Principal file is empty: {src}")
 
         out = self.repo.realm_principals_path(self.realm) / f"{stem}.age"
         out.parent.mkdir(parents=True, exist_ok=True)

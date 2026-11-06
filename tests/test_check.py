@@ -96,6 +96,28 @@ def test_realm_missing_kdc_role(repo: config.SecretsRepo):
     assert "not be readable by the KDC" in _errors(report)
 
 
+def test_principal_recorded_without_stored_key(repo: config.SecretsRepo):
+    """realm.toml lists it, but no key file: the KDC never gets it."""
+    principals = repo.realm_principals_path("SEA.FUDO.ORG")
+    principals.mkdir(parents=True)
+    (principals / "nfs_kept.sea.fudo.org.age").write_text("x")
+    realm_mod.save(repo, realm_mod.RealmConfig(
+        name="SEA.FUDO.ORG",
+        principals={
+            "nfs/kept.sea.fudo.org": realm_mod.classify(
+                "nfs/kept.sea.fudo.org", "SEA.FUDO.ORG"),
+            "nfs/lost.sea.fudo.org": realm_mod.classify(
+                "nfs/lost.sea.fudo.org", "SEA.FUDO.ORG"),
+        }))
+
+    report = cli_check.run_check(repo)
+
+    messages = _messages(report)
+    assert "no stored key" in messages
+    assert "nfs/lost.sea.fudo.org" in messages
+    assert "nfs/kept.sea.fudo.org" not in messages
+
+
 def test_declared_trust_without_stored_principal(repo: config.SecretsRepo):
     repo.realm_principals_path("A.ORG").mkdir(parents=True)
     realm_mod.save(repo, realm_mod.RealmConfig(
