@@ -116,8 +116,10 @@ class Manifest:
                 entry.mode = mode
             return existing_hash
         
-        # Create new entry with random hash
-        hashed_name = generate_hash()
+        # Create new entry with random hash.  The key is the ciphertext's
+        # file name, suffix included: the host looks the file up by exactly
+        # this string, so a bare hash names a file that does not exist.
+        hashed_name = f"{generate_hash()}.age"
         entry = SecretEntry(
             name=name,
             secret_type=secret_type,
@@ -169,6 +171,11 @@ class Manifest:
         
         secrets = {}
         for hashed_name, entry_data in secrets_data.items():
+            # Manifests built before the key carried its ".age" suffix named
+            # files that were in fact written as "<hash>.age".  Normalising on
+            # load keeps the existing ciphertext and its name stable.
+            if not hashed_name.endswith(".age"):
+                hashed_name = f"{hashed_name}.age"
             secrets[hashed_name] = SecretEntry.from_dict(entry_data)
         
         manifest = cls(secrets=secrets)

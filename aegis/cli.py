@@ -1599,18 +1599,24 @@ def build_user_secrets(
     user: Optional[str] = typer.Option(None, "--user", "-u", help="Process only this user"),
 ):
     """Collect and re-encrypt user secrets from user repos.
-    
+
     User secrets are stored with privacy-preserving hashed filenames.
     A manifest file (manifest.age) is created for each user on each host,
     encrypted for both the host and the user, mapping hashed names to
-    actual secret names and metadata.
+    actual secret names and metadata.  Each secret is encrypted to the
+    host's master key, which is what the host decrypts it with.
+
+    The user repo is the source of truth: a secret removed there is removed
+    from every host's manifest and its ciphertext deleted.
+
+    Exits non-zero if any user or secret could not be built, so a partial
+    build is never mistaken for a complete one.
     \b
     Example:
         aegis build user-secrets --user alice
     """
-    import tempfile
     from . import manifest as mf
-    
+
     repo = get_secrets_repo(secrets_path)
 
     admin_keys = admin_recipients(repo)
@@ -1620,19 +1626,25 @@ def build_user_secrets(
         users = [user]
     else:
         users = repo.list_users()
-    
+
     if not users:
         typer.echo("No users configured. Use 'aegis user add' first.")
         return
-    
+
+    failures: list[str] = []
+
+    def fail(message: str) -> None:
+        typer.secho(f"  Error: {message}", fg=typer.colors.RED, err=True)
+        failures.append(message)
+
     for username in users:
         typer.echo(f"\nProcessing user: {username}")
-        
+
         user_config = repo.get_user_config(username)
         if not user_config:
-            typer.echo(f"  Warning: No config found for {username}", err=True)
+            fail(f"{username}: no config at src/users/{username}.toml")
             continue
-        
+
         if not user_config.hosts:
             typer.echo(f"  No hosts configured for {username}, skipping")
             continue
@@ -1641,7 +1653,7 @@ def build_user_secrets(
         # against the current active hosts. Building per-host manifests
         # stops the moment a wildcard user reads on this set.
         allowed = repo.resolve_user_allowed_hosts(user_config)
-        
+
         # Get user's public key for manifest encryption
         user_pubkey = user_config.public_key
         if not user_pubkey:
@@ -1649,43 +1661,47 @@ def build_user_secrets(
             user_pubkey_path = repo.user_pubkey_path(username)
             if user_pubkey_path.exists():
                 user_pubkey = user_pubkey_path.read_text().strip()
-        
+
         if not user_pubkey:
             typer.echo(f"  Warning: No public key found for {username}", err=True)
             typer.echo(f"  Manifest will only be encrypted for hosts (not user)", err=True)
-        
+
         # Find the user's private key (for decrypting their repo)
         user_key_path = repo.user_key_path(username)
         if not user_key_path.exists():
-            typer.echo(f"  Warning: No private key found at {user_key_path}", err=True)
+            fail(f"{username}: no private key at {user_key_path}")
             continue
-        
+
         # Find the user's repo
-        # First check flake inputs, then fall back to repo_url
         user_repo_path = _find_user_repo(repo, username, user_config)
         if not user_repo_path:
-            typer.echo(f"  Warning: Could not find repo for {username}", err=True)
-            typer.echo(f"  Set repo_url in user config or add as flake input")
+            fail(
+                f"{username}: could not find their secrets repo -- put it next "
+                f"to aegis-secrets as aegis-secrets-{username}, or set "
+                f"AEGIS_USER_REPO_{username.upper()}"
+            )
             continue
-        
+
         typer.echo(f"  Repo: {user_repo_path}")
-        
+
         if dry_run:
             typer.echo(
                 f"  [dry-run] Would process secrets for hosts: "
                 f"{', '.join(sorted(allowed))}"
             )
             continue
-        
+
         # Decrypt user's private key
         typer.echo(f"  Decrypting user key...")
         try:
             user_private_key = crypto.decrypt_age(user_key_path)
         except Exception as e:
-            typer.echo(f"  Error decrypting user key: {e}", err=True)
+            fail(f"{username}: could not decrypt user key: {e}")
             continue
-        
-        # Get host public keys for re-encryption
+
+        # Get host public keys for re-encryption.  A host without a usable
+        # key is skipped with a warning rather than failing the build: with
+        # a "*" user that is any host not yet given a master key.
         host_keys: dict[str, str] = {}
         for hostname in sorted(allowed):
             try:
@@ -1694,60 +1710,102 @@ def build_user_secrets(
                 typer.echo(f"  Warning: skipping {hostname}: {e}", err=True)
             except Exception as e:
                 typer.echo(f"  Warning: Could not get host {hostname}: {e}", err=True)
-        
+
         if not host_keys:
             typer.echo(f"  No valid hosts found, skipping")
             continue
-        
-        # Create a manifest for each host (or load existing)
+
+        # Load each host's existing manifest, so a secret keeps its hashed
+        # name across builds.  One that exists but cannot be read is not
+        # replaced: starting over would orphan every file it names.
         host_manifests: dict[str, mf.Manifest] = {}
+        unreadable = []
         for hostname in host_keys:
-            manifest_path = repo.host_deploy_path(hostname) / "users" / username / "manifest.age"
-            if manifest_path.exists():
-                try:
-                    host_manifests[hostname] = mf.load_manifest(
-                        manifest_path,
-                        lambda p: crypto.decrypt_age(p),
-                    )
-                except Exception:
-                    # Can't decrypt existing manifest, start fresh
-                    host_manifests[hostname] = mf.Manifest.empty()
-            else:
-                host_manifests[hostname] = mf.Manifest.empty()
-        
-        # Process environment variables
-        env_dir = user_repo_path / "env"
-        if env_dir.exists():
-            env_secrets = _process_user_secrets_dir_with_manifest(
-                env_dir, username, user_private_key, host_keys, 
-                admin_keys, repo, "env", host_manifests,
+            manifest_path = _user_deploy_dir(repo, hostname, username) / "manifest.age"
+            try:
+                host_manifests[hostname] = mf.load_manifest(
+                    manifest_path,
+                    lambda p: crypto.decrypt_age(p),
+                )
+            except Exception as e:
+                unreadable.append(hostname)
+                fail(
+                    f"{username}: cannot read existing manifest on {hostname} "
+                    f"({e}); not rebuilding it -- fix the admin key or remove "
+                    f"{manifest_path.parent} to start that host over"
+                )
+        for hostname in unreadable:
+            del host_keys[hostname]
+        if not host_keys:
+            continue
+
+        present: set[tuple[str, str]] = set()
+        for subdir, secret_type in (("env", "env"), ("files", "file")):
+            source_dir = user_repo_path / subdir
+            if not source_dir.exists():
+                continue
+            built, errors = _process_user_secrets_dir_with_manifest(
+                source_dir, username, user_private_key, host_keys,
+                admin_keys, repo, secret_type, host_manifests,
             )
-            typer.echo(f"  Processed {env_secrets} env vars")
-        
-        # Process files
-        files_dir = user_repo_path / "files"
-        if files_dir.exists():
-            file_secrets = _process_user_secrets_dir_with_manifest(
-                files_dir, username, user_private_key, host_keys,
-                admin_keys, repo, "file", host_manifests,
-            )
-            typer.echo(f"  Processed {file_secrets} files")
-        
-        # Save manifests for each host (encrypted for host + user + admin)
+            present.update((name, secret_type) for name in built)
+            for error in errors:
+                fail(f"{username}: {error}")
+            label = "env vars" if secret_type == "env" else "files"
+            typer.echo(f"  Processed {len(built)} {label}")
+
+        # Save manifests for each host (encrypted for host + user + admin),
+        # dropping whatever the user repo no longer has.
         typer.echo(f"  Saving manifests...")
         for hostname, manifest in host_manifests.items():
-            manifest_path = repo.host_deploy_path(hostname) / "users" / username / "manifest.age"
+            user_dir = _user_deploy_dir(repo, hostname, username)
+            removed = _prune_user_manifest(manifest, present, user_dir / "secrets")
+            manifest_path = user_dir / "manifest.age"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             # Recipients: host, user (if available), admin
             recipients = [host_keys[hostname], *admin_keys]
             if user_pubkey:
                 recipients.append(user_pubkey)
-            
+
             mf.save_manifest(manifest, manifest_path, crypto.encrypt_age, recipients)
-            typer.echo(f"    {hostname}: {len(manifest.secrets)} secrets")
-    
+            note = f", removed {', '.join(removed)}" if removed else ""
+            typer.echo(f"    {hostname}: {len(manifest.secrets)} secrets{note}")
+
+    if failures:
+        typer.secho(
+            f"\nUser secrets build incomplete: {len(failures)} problem(s) above.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+
     typer.secho("\nUser secrets build complete!", fg=typer.colors.GREEN)
+
+
+def _user_deploy_dir(repo: config.SecretsRepo, hostname: str, username: str) -> Path:
+    return repo.host_deploy_path(hostname) / "users" / username
+
+
+def _prune_user_manifest(manifest, present: set[tuple[str, str]], secrets_dir: Path) -> list[str]:
+    """Drop manifest entries the user repo no longer has, and their files.
+
+    Also deletes ciphertext in ``secrets_dir`` that no entry names, which is
+    what earlier builds left behind when a secret was removed.  Returns the
+    names of the removed secrets.
+    """
+    removed = []
+    for hashed_name, entry in list(manifest.secrets.items()):
+        if (entry.name, entry.secret_type) not in present:
+            manifest.remove(entry.name, entry.secret_type)
+            removed.append(entry.name)
+
+    if secrets_dir.is_dir():
+        for path in secrets_dir.glob("*.age"):
+            if path.name not in manifest.secrets:
+                path.unlink()
+
+    return sorted(removed)
 
 
 def _find_user_repo(repo: config.SecretsRepo, username: str, user_config: config.UserConfig) -> Optional[Path]:
@@ -1788,56 +1846,61 @@ def _process_user_secrets_dir_with_manifest(
     repo: config.SecretsRepo,
     secret_type: str,  # "env" or "file"
     host_manifests: dict,  # hostname -> Manifest
-) -> int:
+) -> tuple[list[str], list[str]]:
     """Process a directory of user secrets with privacy-preserving hashed filenames.
-    
+
     Decrypts each .age file, updates the manifest with a hashed filename,
     and re-encrypts for each host using that hashed name.
-    
-    Returns number of secrets processed.
+
+    Returns ``(built, errors)``: the names of the secrets processed, and a
+    message for each one that could not be.
     """
     import tempfile
-    from . import manifest as mf
-    
-    count = 0
-    
-    for secret_file in source_dir.glob("*.age"):
+
+    built: list[str] = []
+    errors: list[str] = []
+
+    for secret_file in sorted(source_dir.glob("*.age")):
         secret_name = secret_file.stem  # Remove .age extension
-        
-        # Decrypt with user's key
+
+        # Decrypt with user's key.  Bytes, exactly as stored: add-file carries
+        # arbitrary content, so neither a UTF-8 decode (which drops every
+        # binary file) nor the legacy base64 unwrap (aegis-user never wrote
+        # that wrapper) may touch it.
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".key", delete=False) as f:
                 f.write(user_private_key)
                 temp_key = Path(f.name)
-            
+
             try:
-                secret_content = crypto.decrypt_age(secret_file, identity_path=temp_key)
+                secret_content = crypto._decrypt_with_identity(secret_file, temp_key)
             finally:
                 temp_key.unlink()
-                
+
         except Exception as e:
-            typer.echo(f"    Warning: Could not decrypt {secret_name}: {e}", err=True)
+            errors.append(f"could not decrypt {secret_type} {secret_name}: {e}")
             continue
-        
+
         # Re-encrypt for each host using hashed filename
         for hostname, host_key in host_keys.items():
             manifest = host_manifests[hostname]
-            
-            # Get or create hashed filename for this secret
+
+            # Get or create hashed filename for this secret.  The manifest
+            # key is the ciphertext's file name, ".age" included.
             hashed_name = manifest.add_or_update(
                 name=secret_name,
                 secret_type=secret_type,
             )
-            
-            output_dir = repo.host_deploy_path(hostname) / "users" / username / "secrets"
-            output_file = output_dir / f"{hashed_name}.age"
-            
+
+            output_dir = _user_deploy_dir(repo, hostname, username) / "secrets"
+            output_file = output_dir / hashed_name
+
             output_dir.mkdir(parents=True, exist_ok=True)
             crypto.encrypt_age(secret_content, [host_key, *admin_keys], output_file)
-        
-        count += 1
-    
-    return count
+
+        built.append(secret_name)
+
+    return built, errors
 
 
 @build_app.command("bundles")
