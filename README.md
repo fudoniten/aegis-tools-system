@@ -145,8 +145,11 @@ aegis ssh import lambda --key /secure/lambda.ed25519.key --key /secure/lambda.ec
 aegis nexus import lambda --file /secure/lambda.nexus.hmac
 aegis realm import SEA.FUDO.ORG --realm-key /secure/realm.key --principals-dir /secure/principals/ --domain sea.fudo.org
 
-# Add a user with access to specific hosts
-aegis user add alice --hosts=host1,host2
+# Add a user with access to specific hosts, and their own secrets repo
+aegis user add alice --hosts=host1,host2 --repo-url git@github.com:alice/aegis-secrets-alice.git
+
+# Copy users' encrypted secrets from their repos into src/users/<user>/
+aegis user pull
 
 # Build all secrets (SSH keys, Nexus keys, keytabs, user secrets)
 aegis build
@@ -213,7 +216,7 @@ aegis verify myhost
 | `aegis build ssh-keys` | Generate SSH host keys |
 | `aegis build nexus-keys` | Generate Nexus DDNS authentication keys |
 | `aegis build keytabs` | Generate Kerberos keytabs and the KDC principal bundle |
-| `aegis build user-secrets` | Process user secrets from user repos |
+| `aegis build user-secrets` | Re-encrypt pulled user secrets for each host |
 | `aegis build bundles` | Package secrets into host bundles |
 
 Generators create only what is missing. `--rotate` (formerly `--force`) on the
@@ -439,6 +442,34 @@ generating it is the `aegis build` family above.
 | `aegis realm import <REALM>` | Import Kerberos realm with principals |
 | `aegis secret import <name>` | Import a generic secret for hosts and/or roles |
 
+### User secrets
+
+Each user keeps their secrets in a repo of their own, which can live anywhere
+git can clone from:
+
+1. `aegis user add alice --hosts host1,host2 --repo-url <git url>` generates
+   alice's keypair (the private key stays in `keys/users/`, encrypted to the
+   admins) and prints her public key.
+2. Alice runs `aegis-user init --key=<public key>` in her repo, adds secrets
+   with `aegis-user add-env` / `add-file`, and pushes.  From any machine.
+3. `aegis user pull alice` clones the repo, checks every file and copies the
+   ciphertext into `src/users/alice/`, recording the commit.  It prints what
+   was added, changed and removed.  Nothing is copied if any file fails:
+   names must be safe (env names must be variable names), no symlinks, under
+   `--max-bytes` (1 MiB), and every file must decrypt with alice's key.
+4. `aegis build user-secrets` re-encrypts what was pulled to each host's
+   master key, under `deploy/hosts/<host>/users/alice/`.
+5. In nixos-config, `aegis.secrets.users = [ "alice" ];` on those hosts.
+
+Pulling is separate from building on purpose: a push to a user's repo reaches
+hosts only when an admin pulls it.  Anyone who can push to that repo can set
+that user's secrets on every host they reach.  Secret *names* are visible in
+the user repo even though values are encrypted.
+
+To try a local checkout before it is pushed:
+`aegis user pull alice --source ~/src/aegis-secrets-alice`, or set
+`AEGIS_USER_REPO_ALICE` (dashes in a username become underscores).
+
 ### Host, User and Secret Commands
 
 | Command | Description |
@@ -450,6 +481,8 @@ generating it is the `aegis build` family above.
 | `aegis host list` | Declared hosts, their status, key and deployed file count |
 | `aegis host delete <host>` | Delete a host and everything deployed to it |
 | `aegis user add <username>` | Add a user and generate their keypair |
+| `aegis user set-repo <username> <url>` | Set the repo a user's secrets are pulled from |
+| `aegis user pull [<username>...]` | Fetch, check and copy users' secrets into `src/users/` |
 | `aegis user list` | Users and the hosts they reach |
 | `aegis user delete <username>` | Delete a user and every host's copy of their key |
 | `aegis secret new <name>` | Generate a random secret for hosts and/or roles |
@@ -569,7 +602,8 @@ This tool manages the `aegis-secrets` repository:
 aegis-secrets/
 ├── src/                    # Source of truth: what exists, and where it lands
 │   ├── hosts/*.toml        # Host configs, including [placement] metadata
-│   ├── users/*.toml        # User configs
+│   ├── users/*.toml        # User configs, incl. repo URL and last pulled commit
+│   ├── users/<user>/       # Pulled user ciphertext: env/*.age, files/*.age
 │   ├── roles/*.toml        # Role configs
 │   └── kerberos/realms/    # Realm data: realm.toml, realm key, principals
 ├── keys/                   # Encrypted keys

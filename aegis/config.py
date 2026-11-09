@@ -206,6 +206,11 @@ class UserConfig:
     hosts: list[str]
     repo_url: str | None = None
     public_key: str | None = None  # User's age public key for manifest encryption
+    # Branch or tag of repo_url to pull; the repo's default branch if unset.
+    repo_ref: str | None = None
+    # Commit 'aegis user pull' last copied into src/users/<user>/.  None for
+    # a pull from a local directory that is not a git checkout.
+    pulled_commit: str | None = None
 
     @classmethod
     def from_dict(cls, username: str, data: dict) -> "UserConfig":
@@ -214,6 +219,8 @@ class UserConfig:
             hosts=data.get("hosts", []),
             repo_url=data.get("repo_url"),
             public_key=data.get("public_key"),
+            repo_ref=data.get("repo_ref"),
+            pulled_commit=data.get("pulled_commit"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -224,6 +231,10 @@ class UserConfig:
             d["repo_url"] = self.repo_url
         if self.public_key:
             d["public_key"] = self.public_key
+        if self.repo_ref:
+            d["repo_ref"] = self.repo_ref
+        if self.pulled_commit:
+            d["pulled_commit"] = self.pulled_commit
         return d
 
 
@@ -649,6 +660,10 @@ class SecretsRepo:
     def user_key_path(self, username: str) -> Path:
         """Get the path to a user's private key (encrypted)."""
         return self.keys_path / "users" / f"{username}.age"
+
+    def user_src_path(self, username: str) -> Path:
+        """Where 'aegis user pull' puts a user's ciphertext: env/ and files/."""
+        return self.src_path / "users" / username
 
     def user_pubkey_path(self, username: str) -> Path:
         """Get the path to a user's public key."""
