@@ -257,6 +257,7 @@ def plan_user_removal(repo: config.SecretsRepo, username: str) -> Removal:
 
     removal.paths = _existing(
         repo.src_path / "users" / f"{username}.toml",
+        repo.user_src_path(username),
         repo.user_key_path(username),
         repo.user_pubkey_path(username),
         *[

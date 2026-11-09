@@ -126,7 +126,7 @@ Environment. Each names a path; the command-line option wins where there is one:
 
   AEGIS_SCRIPTS            the bundled Kerberos scripts; set by the Nix wrapper
 
-  AEGIS_USER_REPO_<USER>   one user's secrets repo, for build user-secrets
+  AEGIS_USER_REPO_<USER>   a local checkout of one user's repo, for user pull
 
 Run 'aegis COMMAND --help' to see what a group can do, e.g. 'aegis host --help'.""",
     no_args_is_help=True,
@@ -1672,17 +1672,17 @@ def build_user_secrets(
             fail(f"{username}: no private key at {user_key_path}")
             continue
 
-        # Find the user's repo
-        user_repo_path = _find_user_repo(repo, username, user_config)
-        if not user_repo_path:
+        # The copy 'aegis user pull' made.  Nothing else is read: the build
+        # does not depend on where the user's own repo is checked out.
+        user_repo_path = repo.user_src_path(username)
+        if not user_repo_path.is_dir():
             fail(
-                f"{username}: could not find their secrets repo -- put it next "
-                f"to aegis-secrets as aegis-secrets-{username}, or set "
-                f"AEGIS_USER_REPO_{username.upper()}"
+                f"{username}: nothing pulled yet -- run 'aegis user pull {username}'"
             )
             continue
 
-        typer.echo(f"  Repo: {user_repo_path}")
+        pulled = user_config.pulled_commit
+        typer.echo(f"  Source: {user_repo_path}" + (f" (commit {pulled[:12]})" if pulled else ""))
 
         if dry_run:
             typer.echo(
@@ -1806,35 +1806,6 @@ def _prune_user_manifest(manifest, present: set[tuple[str, str]], secrets_dir: P
                 path.unlink()
 
     return sorted(removed)
-
-
-def _find_user_repo(repo: config.SecretsRepo, username: str, user_config: config.UserConfig) -> Optional[Path]:
-    """Find the path to a user's secrets repo.
-    
-    Checks:
-    1. Flake input path (if running from flake context)
-    2. Sibling directory (aegis-secrets-<username>)
-    3. repo_url in config (would need to clone)
-    """
-    # Check for sibling directory
-    sibling = repo.path.parent / f"aegis-secrets-{username}"
-    if sibling.exists():
-        return sibling
-    
-    # Check for flake input (set via environment)
-    import os
-    flake_input = os.environ.get(f"AEGIS_USER_REPO_{username.upper()}")
-    if flake_input:
-        flake_path = Path(flake_input)
-        if flake_path.exists():
-            return flake_path
-    
-    # Check inputs directory (common flake structure)
-    inputs_dir = repo.path / "inputs" / f"aegis-secrets-{username}"
-    if inputs_dir.exists():
-        return inputs_dir
-    
-    return None
 
 
 def _process_user_secrets_dir_with_manifest(
@@ -3234,20 +3205,29 @@ def add_user(
             "An explicit host alongside '*' is redundant but harmless."
         ),
     ),
-    repo_url: Optional[str] = typer.Option(None, "--repo-url", help="URL of user's secrets repo"),
+    repo_url: Optional[str] = typer.Option(None, "--repo-url", "-r", help="Git URL of the user's own secrets repo, for 'aegis user pull'"),
+    repo_ref: Optional[str] = typer.Option(None, "--repo-ref", help="Branch or tag to pull (default: the repo's default branch)"),
     secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
 ):
     """Add a user and generate their keypair.
 
-    The public key is printed for the user to put in their own secrets repo;
-    'aegis build user-secrets' then collects what they encrypt with it.
+    The public key is printed for the user: they run 'aegis-user init
+    --key=<it>' in a repo of their own, add secrets and push.  'aegis user
+    pull' then copies that repo's ciphertext in here, and 'aegis build
+    user-secrets' re-encrypts it for each host.
     \b
     Example:
-        aegis user add alice --hosts rama,lambda
+        aegis user add alice --hosts rama,lambda \\
+            --repo-url git@github.com:alice/aegis-secrets-alice.git
     """
     repo = get_secrets_repo(secrets_path)
     repo.ensure_structure()
     
+    from .user_repo import FILE_NAME_RE
+    if not FILE_NAME_RE.match(username):
+        typer.echo(f"Error: '{username}' is not a valid username", err=True)
+        raise typer.Exit(1)
+
     existing = repo.get_user_config(username)
     if existing:
         typer.echo(f"User {username} already configured")
@@ -3274,6 +3254,7 @@ def add_user(
         username=username,
         hosts=host_list,
         repo_url=repo_url,
+        repo_ref=repo_ref,
         public_key=keypair.public_key,
     )
     repo.set_user_config(user_config)
@@ -3282,9 +3263,143 @@ def add_user(
     typer.echo(f"  Hosts: {', '.join(host_list)}")
     typer.echo(f"  Private key: {user_key_path}")
     typer.echo(f"  Public key: {user_pubkey_path}")
+    if repo_url:
+        typer.echo(f"  Repo: {repo_url}")
+    else:
+        typer.echo(f"  Repo: none yet -- set one with 'aegis user set-repo {username} <url>'")
+    typer.echo("")
+    typer.echo("Next: the user runs 'aegis-user init --key=<public key>' in their repo,")
+    typer.echo(f"adds secrets and pushes; then 'aegis user pull {username}' and")
+    typer.echo(f"'aegis build user-secrets --user {username}'.")
     typer.echo("")
     typer.secho("Give this public key to the user:", fg=typer.colors.YELLOW)
     typer.echo(keypair.public_key)
+
+
+@user_app.command("set-repo")
+def set_user_repo(
+    username: str = typer.Argument(..., help="Username"),
+    repo_url: str = typer.Argument(..., help="Git URL of the user's own secrets repo"),
+    repo_ref: Optional[str] = typer.Option(None, "--ref", help="Branch or tag to pull (default: the repo's default branch)"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+):
+    """Set (or change) the repo 'aegis user pull' fetches a user's secrets from.
+    \b
+    Example:
+        aegis user set-repo alice https://github.com/alice/aegis-secrets-alice
+    """
+    repo = get_secrets_repo(secrets_path)
+    user_config = repo.get_user_config(username)
+    if user_config is None:
+        typer.echo(f"Error: no such user: {username}", err=True)
+        raise typer.Exit(1)
+    user_config.repo_url = repo_url
+    user_config.repo_ref = repo_ref
+    repo.set_user_config(user_config)
+    typer.echo(f"{username}: pulls from {repo_url}" + (f" ({repo_ref})" if repo_ref else ""))
+
+
+@user_app.command("pull")
+def pull_user_secrets(
+    usernames: List[str] = typer.Argument(None, help="Users to pull (default: every user with a repo)"),
+    source: Optional[Path] = typer.Option(None, "--source", help="Pull from this local checkout instead of the user's repo URL (one user only)"),
+    max_bytes: int = typer.Option(1024 * 1024, "--max-bytes", help="Reject any secret file larger than this"),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+):
+    """Copy users' encrypted secrets from their own repos into this one.
+
+    Fetches each user's repo, checks every file (safe names, no symlinks,
+    under the size limit, decrypts with that user's key) and replaces
+    src/users/<user>/ with exactly what is there, recording the commit.
+    Nothing is copied for a user whose repo fails a check.  Prints what was
+    added, changed and removed, for review before 'aegis build user-secrets'
+    sends it to hosts.
+
+    Pulling is deliberately separate from building, so a push to a user's
+    repo reaches hosts only when an admin pulls it.
+    \b
+    Examples:
+        aegis user pull                 every user with a repo
+        aegis user pull alice
+        aegis user pull alice --source ~/src/aegis-secrets-alice
+    """
+    from . import user_repo as ur
+
+    repo = get_secrets_repo(secrets_path)
+
+    if usernames:
+        users = list(usernames)
+    else:
+        users = [u for u in repo.list_users()
+                 if (c := repo.get_user_config(u)) and (c.repo_url or ur.env_override(u))]
+        if not users:
+            typer.echo("No users have a repo set. Use 'aegis user set-repo <user> <url>'.")
+            return
+
+    if source is not None and len(users) != 1:
+        typer.echo("Error: --source needs exactly one user", err=True)
+        raise typer.Exit(1)
+
+    failed = []
+    for username in users:
+        typer.echo(f"\n{username}:")
+        user_config = repo.get_user_config(username)
+        if user_config is None:
+            typer.secho(f"  Error: no such user", fg=typer.colors.RED, err=True)
+            failed.append(username)
+            continue
+
+        key_path = repo.user_key_path(username)
+        if not key_path.exists():
+            typer.secho(f"  Error: no private key at {key_path}", fg=typer.colors.RED, err=True)
+            failed.append(username)
+            continue
+
+        try:
+            identity = crypto.decrypt_age(key_path)
+            local = source or ur.env_override(username)
+            if local is not None:
+                if not local.is_dir():
+                    raise ur.UserRepoError(f"{local} is not a directory")
+                typer.echo(f"  From {local} (local)")
+                secrets = ur.validate(local, username, identity, max_bytes)
+                commit = ur._local_commit(local)
+            elif user_config.repo_url:
+                ref = f" ({user_config.repo_ref})" if user_config.repo_ref else ""
+                typer.echo(f"  From {user_config.repo_url}{ref}")
+                with ur.checkout(user_config.repo_url, user_config.repo_ref) as (path, commit):
+                    secrets = ur.validate(path, username, identity, max_bytes)
+            else:
+                raise ur.UserRepoError(
+                    f"no repo set; use 'aegis user set-repo {username} <url>'"
+                )
+        except AegisError as e:
+            typer.secho(f"  Error: {e}", fg=typer.colors.RED, err=True)
+            failed.append(username)
+            continue
+
+        changes = ur.diff(ur.read_pulled(repo, username), secrets)
+        ur.write_pulled(repo, username, secrets)
+
+        previous = user_config.pulled_commit
+        user_config.pulled_commit = commit
+        repo.set_user_config(user_config)
+
+        if commit and previous and commit != previous:
+            typer.echo(f"  Commit {previous[:12]} -> {commit[:12]}")
+        elif commit:
+            typer.echo(f"  Commit {commit[:12]}")
+        if changes.is_empty():
+            typer.echo(f"  No changes ({len(secrets)} secrets)")
+        for label, items in (("+", changes.added), ("~", changes.changed), ("-", changes.removed)):
+            for item in items:
+                typer.echo(f"  {label} {item}")
+
+    if failed:
+        typer.secho(f"\nNot pulled: {', '.join(failed)}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+
+    typer.echo("\nReview the changes, then: aegis build user-secrets")
 
 
 @secret_app.command("add")
