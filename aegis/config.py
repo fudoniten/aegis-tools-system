@@ -109,6 +109,10 @@ HOST_STATUSES = (STATUS_ACTIVE, STATUS_PENDING, STATUS_RETIRED, STATUS_EXTERNAL)
 #: Statuses for which Aegis builds and deploys host secrets.
 DEPLOYING_STATUSES = (STATUS_ACTIVE,)
 
+#: Prefix of an entry in a user's host list that names a role rather than a
+#: host: ``role:site-seattle`` is every active member of ``site-seattle``.
+USER_HOSTS_ROLE_PREFIX = "role:"
+
 
 @dataclass
 class HostConfig:
@@ -491,25 +495,63 @@ class SecretsRepo:
     def resolve_user_allowed_hosts(self, user_config: "UserConfig") -> set[str]:
         """Compute the set of hosts a user is allowed to read secrets on.
 
-        Supports the ``"*"`` sentinel in :attr:`UserConfig.hosts` as
-        "every active host aegis manages", re-evaluated on each call.
-        New hosts added after the user was configured are reachable on
-        the next :func:`build_user_secrets` run.
+        Each entry in :attr:`UserConfig.hosts` is one of:
 
-        An explicit host alongside ``*`` is redundant (the wildcard
-        supersedes it) but harmless — explicit entries are kept so the
-        config remains self-documenting about who is supposed to read.
+        ``"*"``
+            every active host aegis manages.
+        ``"role:<role>"``
+            every active member of that role -- in practice a host group,
+            since every host already belongs to its ``site-<site>`` and
+            ``domain-<domain>`` roles.  ``role:site-seattle`` is every host at
+            that site, and ``role:domain-fudo.org`` every host in the domain.
+        anything else
+            a hostname, taken as written.
 
-        Retired or externally-managed hosts are not in this set: a user
-        with ``*`` should not gain access to hosts Aegis has stopped
-        managing (``list_deploying_hosts`` filters those out). Aegis's
-        ``check`` command still flags obsolete on-disk artefacts so an
-        explicit cleanup is possible.
+        Wildcards and roles are re-evaluated on each call, so a host that is
+        added (or joins the role) after the user was configured is reachable
+        on the next :func:`build_user_secrets` run, with no edit to the user.
+
+        An explicit host alongside a wildcard is redundant but harmless --
+        explicit entries are kept so the config remains self-documenting
+        about who is supposed to read.
+
+        Retired or externally-managed hosts are never reached through a
+        wildcard or a role: a user with ``*`` should not gain access to hosts
+        Aegis has stopped managing (``list_deploying_hosts`` filters those
+        out).  A role that does not exist contributes nothing; ``aegis check``
+        reports it.
         """
-        explicit = {h for h in user_config.hosts if h != "*"}
-        if "*" not in user_config.hosts:
-            return explicit
-        return explicit | set(self.list_deploying_hosts())
+        deploying = set(self.list_deploying_hosts())
+        allowed: set[str] = set()
+        for entry in user_config.hosts:
+            if entry == "*":
+                allowed |= deploying
+            elif entry.startswith(USER_HOSTS_ROLE_PREFIX):
+                role = self.get_role_config(entry[len(USER_HOSTS_ROLE_PREFIX):])
+                if role is not None:
+                    allowed |= set(role.hosts) & deploying
+            else:
+                allowed.add(entry)
+        return allowed
+
+    def unknown_user_host_entries(self, hosts: list[str]) -> list[str]:
+        """Entries of a user's host list that name no host or role.
+
+        A typo in a host list fails silently otherwise: the user is simply
+        never built for the host they were meant to reach.
+        """
+        known_hosts = set(self.list_hosts())
+        known_roles = set(self.list_roles())
+        unknown = []
+        for entry in hosts:
+            if entry == "*":
+                continue
+            if entry.startswith(USER_HOSTS_ROLE_PREFIX):
+                if entry[len(USER_HOSTS_ROLE_PREFIX):] not in known_roles:
+                    unknown.append(entry)
+            elif entry not in known_hosts:
+                unknown.append(entry)
+        return unknown
 
     def roles_deploy_path(self) -> Path:
         """Directory holding role public keys."""

@@ -148,6 +148,10 @@ aegis realm import SEA.FUDO.ORG --realm-key /secure/realm.key --principals-dir /
 # Add a user with access to specific hosts, and their own secrets repo
 aegis user add alice --hosts=host1,host2 --repo-url git@github.com:alice/aegis-secrets-alice.git
 
+# ...or to every host, or to whole sites and domains (see "Choosing hosts")
+aegis user add bob --hosts='*'
+aegis user add carol --hosts=role:site-seattle,role:domain-fudo.org
+
 # Copy users' encrypted secrets from their repos into src/users/<user>/
 aegis user pull
 
@@ -459,7 +463,34 @@ git can clone from:
    `--max-bytes` (1 MiB), and every file must decrypt with alice's key.
 4. `aegis build user-secrets` re-encrypts what was pulled to each host's
    master key, under `deploy/hosts/<host>/users/alice/`.
-5. In nixos-config, `aegis.secrets.users = [ "alice" ];` on those hosts.
+5. Nothing to do in nixos-config: a host decrypts the user secrets that were
+   built for it, for every user it has an account for (the default of
+   `aegis.secrets.users`).
+
+#### Choosing hosts
+
+`--hosts` (and `aegis user set-hosts <user> <hosts>`, which replaces the list
+later) takes a comma-separated mix of:
+
+| Entry | Means |
+|-------|-------|
+| `lambda` | that host |
+| `*` | every active host |
+| `role:<role>` | every active member of the role |
+
+Every host is already a member of its `site-<site>` and `domain-<domain>`
+role, so those are the host groups: `role:site-seattle` is every host at the
+site, `role:domain-fudo.org` every host in the domain.  `*` and roles are
+resolved on each `aegis build user-secrets`, so a new host -- or one that
+joins the role -- gets the user's secrets on the next build without touching
+the user.  Retired and external hosts are never included.  An unknown role is
+refused; an unknown hostname is a warning (it may be added later), and
+`aegis check` reports both.
+
+Every host a user reaches can decrypt that user's secrets with its master
+key, whether or not the user has an account there, so `*` makes the user's
+secrets readable to root on every host.  Prefer a site or domain when that
+is what is meant.
 
 Pulling is separate from building on purpose: a push to a user's repo reaches
 hosts only when an admin pulls it.  Anyone who can push to that repo can set
@@ -481,6 +512,7 @@ To try a local checkout before it is pushed:
 | `aegis host list` | Declared hosts, their status, key and deployed file count |
 | `aegis host delete <host>` | Delete a host and everything deployed to it |
 | `aegis user add <username>` | Add a user and generate their keypair |
+| `aegis user set-hosts <username> <hosts>` | Replace the hosts (or `*`, or `role:<role>`) a user reaches |
 | `aegis user set-repo <username> <url>` | Set the repo a user's secrets are pulled from |
 | `aegis user pull [<username>...]` | Fetch, check and copy users' secrets into `src/users/` |
 | `aegis user list` | Users and the hosts they reach |
