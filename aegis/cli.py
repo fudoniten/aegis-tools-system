@@ -3193,17 +3193,54 @@ def set_host_status(
             )
 
 
+USER_HOSTS_HELP = (
+    "Comma-separated hosts the user can access.  Each entry is a hostname, "
+    "'*' for every active host aegis manages, or 'role:<role>' for every "
+    "active member of a role -- e.g. 'role:site-seattle' or "
+    "'role:domain-fudo.org'.  '*' and roles are resolved at build time, so "
+    "hosts added later are picked up without editing the user."
+)
+
+
+def _parse_user_hosts(repo: config.SecretsRepo, hosts: str) -> list[str]:
+    """Split a --hosts value, refusing entries that name no host or role."""
+    host_list = [h.strip() for h in hosts.split(",") if h.strip()]
+    if not host_list:
+        typer.echo("Error: --hosts is empty", err=True)
+        raise typer.Exit(1)
+    unknown = repo.unknown_user_host_entries(host_list)
+    # A role is new syntax, so an unknown one is a typo and is refused.  A
+    # hostname not declared yet is allowed, as it always has been, but said
+    # out loud: the user is simply never built for it until it exists.
+    bad_roles = [e for e in unknown if e.startswith(config.USER_HOSTS_ROLE_PREFIX)]
+    if bad_roles:
+        typer.echo(
+            f"Error: no such role: {', '.join(bad_roles)} (see 'aegis role list')",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if unknown:
+        typer.secho(
+            f"Warning: no such host (yet): {', '.join(unknown)}",
+            fg=typer.colors.YELLOW, err=True,
+        )
+    return host_list
+
+
+def _describe_user_hosts(repo: config.SecretsRepo, user_config: config.UserConfig) -> str:
+    """The configured host list, and what it currently resolves to."""
+    resolved = sorted(repo.resolve_user_allowed_hosts(user_config))
+    return (f"{', '.join(user_config.hosts)} "
+            f"(currently {len(resolved)} host(s): {', '.join(resolved) or '-'})")
+
+
 @user_app.command("add")
 def add_user(
     username: str = typer.Argument(..., help="Username"),
     hosts: str = typer.Option(
         ...,
         "--hosts", "-h",
-        help=(
-            "Comma-separated list of hosts user can access. Pass '*' to grant "
-            "access to every active host aegis manages now and in the future. "
-            "An explicit host alongside '*' is redundant but harmless."
-        ),
+        help=USER_HOSTS_HELP,
     ),
     repo_url: Optional[str] = typer.Option(None, "--repo-url", "-r", help="Git URL of the user's own secrets repo, for 'aegis user pull'"),
     repo_ref: Optional[str] = typer.Option(None, "--repo-ref", help="Branch or tag to pull (default: the repo's default branch)"),
@@ -3233,8 +3270,8 @@ def add_user(
         typer.echo(f"User {username} already configured")
         raise typer.Exit(1)
     
-    host_list = [h.strip() for h in hosts.split(",")]
-    
+    host_list = _parse_user_hosts(repo, hosts)
+
     # Generate keypair for user
     typer.echo(f"Generating keypair for {username}...")
     keypair = crypto.generate_age_keypair()
@@ -3260,7 +3297,7 @@ def add_user(
     repo.set_user_config(user_config)
     
     typer.secho(f"Added user: {username}", fg=typer.colors.GREEN)
-    typer.echo(f"  Hosts: {', '.join(host_list)}")
+    typer.echo(f"  Hosts: {_describe_user_hosts(repo, user_config)}")
     typer.echo(f"  Private key: {user_key_path}")
     typer.echo(f"  Public key: {user_pubkey_path}")
     if repo_url:
@@ -3274,6 +3311,42 @@ def add_user(
     typer.echo("")
     typer.secho("Give this public key to the user:", fg=typer.colors.YELLOW)
     typer.echo(keypair.public_key)
+
+
+@user_app.command("set-hosts")
+def set_user_hosts(
+    username: str = typer.Argument(..., help="Username"),
+    hosts: str = typer.Argument(..., help=USER_HOSTS_HELP),
+    secrets_path: Optional[Path] = typer.Option(None, "--secrets-path", "-s", help="Path to the aegis-secrets repo (default: $AEGIS_SYSTEM)"),
+):
+    """Replace the hosts a user's secrets are deployed to.
+    \b
+    Examples:
+        aegis user set-hosts alice '*'
+        aegis user set-hosts alice role:site-seattle,role:domain-fudo.org
+        aegis user set-hosts alice role:site-seattle,lambda
+    """
+    repo = get_secrets_repo(secrets_path)
+    user_config = repo.get_user_config(username)
+    if user_config is None:
+        typer.echo(f"Error: no such user: {username}", err=True)
+        raise typer.Exit(1)
+    before = repo.resolve_user_allowed_hosts(user_config)
+    user_config.hosts = _parse_user_hosts(repo, hosts)
+    repo.set_user_config(user_config)
+    after = repo.resolve_user_allowed_hosts(user_config)
+
+    typer.echo(f"{username}: {_describe_user_hosts(repo, user_config)}")
+    if after - before:
+        typer.echo(f"  Gains: {', '.join(sorted(after - before))}")
+    if before - after:
+        typer.echo(f"  Loses: {', '.join(sorted(before - after))}")
+        typer.secho(
+            "  Their secrets already deployed there stay until removed; "
+            "'aegis check' lists them.",
+            fg=typer.colors.YELLOW,
+        )
+    typer.echo(f"Next: 'aegis build user-secrets --user {username}'.")
 
 
 @user_app.command("set-repo")
@@ -3837,7 +3910,7 @@ def status(
     for username in users:
         user_config = repo.get_user_config(username)
         if user_config:
-            typer.echo(f"  {username}: hosts=[{', '.join(user_config.hosts)}]")
+            typer.echo(f"  {username}: hosts={_describe_user_hosts(repo, user_config)}")
 
     typer.echo(f"\nConfigured roles: {len(roles)}")
     for role in roles:

@@ -743,6 +743,14 @@ def _check_users(repo: config.SecretsRepo, report: Report) -> None:
         scope = f"user/{username}"
         allowed = repo.resolve_user_allowed_hosts(user_config)
 
+        unknown = repo.unknown_user_host_entries(user_config.hosts)
+        if unknown:
+            report.warn(
+                scope,
+                f"host list names no such host or role: {', '.join(unknown)}",
+                f"aegis user set-hosts {username} ...",
+            )
+
         if not repo.user_key_path(username).exists():
             report.error(
                 scope,

@@ -519,3 +519,14 @@ def test_refresh_manifest_leaves_an_hmac_key_as_hmac(repo: config.SecretsRepo):
 
     assert host_secrets.load_host_manifest(
         repo.deploy_path, "rama").nexus_key.type is None
+
+
+def test_user_host_list_with_unknown_role(repo: config.SecretsRepo):
+    """A mistyped role in a host list reaches nobody; check must say so."""
+    add_host(repo, "rama")
+    repo.set_user_config(config.UserConfig(
+        username="niten", hosts=["rama", "role:site-nowhere", "*"]))
+
+    report = cli_check.run_check(repo)
+
+    assert "no such host or role: role:site-nowhere" in _messages(report)

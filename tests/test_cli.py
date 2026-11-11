@@ -503,3 +503,91 @@ def test_resolve_user_no_wildcard_is_passthrough(temp_secrets_repo: Path):
     assert allowed == {"alpha", "beta"}
 
 
+
+
+# Host groups through roles ---------------------------------------------------
+#
+# `role:<role>` in a user's host list means every active member of that role.
+# Every host is already in its site-<site> and domain-<domain> role, so these
+# are the fleet's host groups, kept current by the role commands.
+
+
+def _seattle_repo(temp_secrets_repo: Path) -> config.SecretsRepo:
+    from tests.conftest import add_host
+    repo = config.SecretsRepo(temp_secrets_repo)
+    for host in ("alpha", "beta", "gamma", "remote"):
+        add_host(repo, host)
+    repo.set_role_config(config.RoleConfig(name="site-seattle", hosts=["alpha", "beta", "gamma"]))
+    return repo
+
+
+def test_role_entry_resolves_to_role_members(temp_secrets_repo: Path):
+    repo = _seattle_repo(temp_secrets_repo)
+    result = runner.invoke(app, [
+        "user", "add", "niten", "--hosts", "role:site-seattle,remote",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    assert result.exit_code == 0, _out([result])
+    user_config = repo.get_user_config("niten")
+    assert user_config.hosts == ["role:site-seattle", "remote"]
+    assert repo.resolve_user_allowed_hosts(user_config) == {"alpha", "beta", "gamma", "remote"}
+
+
+def test_role_entry_follows_membership_changes(temp_secrets_repo: Path):
+    """A host joining the role is picked up with no edit to the user."""
+    from tests.conftest import add_host
+    repo = _seattle_repo(temp_secrets_repo)
+    runner.invoke(app, [
+        "user", "add", "niten", "--hosts", "role:site-seattle",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    add_host(repo, "delta")
+    role = repo.get_role_config("site-seattle")
+    role.hosts.append("delta")
+    repo.set_role_config(role)
+    assert "delta" in repo.resolve_user_allowed_hosts(repo.get_user_config("niten"))
+
+
+def test_role_entry_skips_retired_members(temp_secrets_repo: Path):
+    repo = _seattle_repo(temp_secrets_repo)
+    gamma = repo.get_host_config("gamma")
+    gamma.status = config.STATUS_RETIRED
+    repo.set_host_config(gamma)
+    user_config = config.UserConfig(username="niten", hosts=["role:site-seattle"])
+    assert repo.resolve_user_allowed_hosts(user_config) == {"alpha", "beta"}
+
+
+def test_unknown_role_is_refused(temp_secrets_repo: Path):
+    _seattle_repo(temp_secrets_repo)
+    result = runner.invoke(app, [
+        "user", "add", "niten", "--hosts", "role:site-seatle",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    assert result.exit_code == 1
+    assert "no such role: role:site-seatle" in _out(result)
+    assert config.SecretsRepo(temp_secrets_repo).get_user_config("niten") is None
+
+
+def test_set_hosts_replaces_host_list(temp_secrets_repo: Path):
+    repo = _seattle_repo(temp_secrets_repo)
+    runner.invoke(app, [
+        "user", "add", "niten", "--hosts", "remote",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    result = runner.invoke(app, [
+        "user", "set-hosts", "niten", "role:site-seattle",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    assert result.exit_code == 0, _out([result])
+    out = _out(result)
+    assert "Gains: alpha, beta, gamma" in out
+    assert "Loses: remote" in out
+    assert repo.get_user_config("niten").hosts == ["role:site-seattle"]
+
+
+def test_set_hosts_unknown_user(temp_secrets_repo: Path):
+    result = runner.invoke(app, [
+        "user", "set-hosts", "nobody", "*",
+        "--secrets-path", str(temp_secrets_repo),
+    ])
+    assert result.exit_code == 1
