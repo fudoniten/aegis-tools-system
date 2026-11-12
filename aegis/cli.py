@@ -975,10 +975,14 @@ def build_keytabs(
     principal keys inside it are what's immutable. So every run always
     re-extracts each host's keytab from the principals already stored in
     the repo (leaving key material untouched) and compares the result
-    against what's on disk, rewriting keytab.age only when the plaintext
-    actually changed. That's what makes adding a service (nfs, say) to an
-    already-built host's 'services' take effect on the next plain build,
-    and what makes a rekey's second kvno reach an existing keytab.
+    against what's on disk, rewriting keytab.age only when its entries
+    (principals, kvnos, keys) or its recipients actually changed; the
+    timestamps ext_keytab writes don't count. That's what makes adding a
+    service (nfs, say) to an already-built host's 'services' take effect on
+    the next plain build, what makes a rekey's second kvno reach an existing
+    keytab, and what keeps a build with nothing new from touching any file.
+    The KDC bundle, realm key and daemon keytabs, and every named keytab
+    copy, follow the same rule.
     \b
     Examples:
         aegis build keytabs
@@ -1167,7 +1171,7 @@ def build_keytabs(
                 # own right -- the principal keys inside are what's actually
                 # immutable; extracting them into a keytab is just
                 # packaging. So this always re-extracts and only rewrites
-                # keytab_output when the plaintext actually changed, rather
+                # keytab_output when the content actually changed, rather
                 # than the old "skip if the file exists" rule. That rule
                 # meant a host's keytab silently stopped tracking its realm
                 # principals the moment it was first built -- adding a
@@ -1176,33 +1180,24 @@ def build_keytabs(
                 # kerberos-realm-management.md §4.3, meant a rekey's second
                 # kvno never reached a keytab that already existed either.
                 #
-                # Comparing plaintext (not ciphertext) is load-bearing: age
-                # encryption is randomized, so two encryptions of identical
-                # bytes never match, and rewriting on every build would
-                # dirty every host's keytab.age on every build for no
-                # content reason. `force` is kept, accepted but unused, so
-                # existing callers/docs passing it don't break.
-                new_keytab_bytes = keytab_tmp.read_bytes()
-                unchanged = False
-                if keytab_output.exists():
-                    try:
-                        unchanged = (crypto.decrypt_age_bytes(keytab_output)
-                                     == new_keytab_bytes)
-                    except Exception as e:
-                        typer.echo(
-                            f"    Warning: couldn't decrypt existing keytab "
-                            f"to compare ({e}); re-extracting", err=True)
+                # The comparison is of keytab *entries*, not ciphertext or
+                # even raw plaintext: age is randomized, and ext_keytab stamps
+                # every entry with the time it was extracted, so neither the
+                # ciphertext nor the plaintext of an unchanged keytab ever
+                # matches the last build's. See _write_encrypted_if_changed.
+                # `force` is kept, accepted but unused, so existing
+                # callers/docs passing it don't break.
+                recipients = [host_age_key, *admin_keys]
+                if kdc_role_pubkey:
+                    recipients.append(kdc_role_pubkey)
 
-                if unchanged:
-                    typer.echo(f"    Keytab unchanged")
-                else:
-                    recipients = [host_age_key, *admin_keys]
-                    if kdc_role_pubkey:
-                        recipients.append(kdc_role_pubkey)
-
-                    keytab_output.parent.mkdir(parents=True, exist_ok=True)
-                    crypto.encrypt_age(new_keytab_bytes, recipients, keytab_output)
+                if _write_encrypted_if_changed(
+                    keytab_tmp.read_bytes(), recipients, keytab_output,
+                    same=krb.keytabs_equivalent, indent="    ",
+                ):
                     typer.echo(f"    Wrote: {keytab_output}")
+                else:
+                    typer.echo(f"    Keytab unchanged")
 
                 _sync_keytab_manifest(repo, hostname)
                 typer.echo(f"    Updated manifest")
@@ -1240,21 +1235,26 @@ def build_keytabs(
 
             if all_principals and kdc_role_pubkey:
                 kdc_principals_out = repo.kdc_deploy_path() / f"{realm_name}-principals.age"
-                kdc_principals_out.parent.mkdir(parents=True, exist_ok=True)
-                crypto.encrypt_age(
-                    all_principals, [kdc_role_pubkey, *admin_keys], kdc_principals_out)
-                typer.echo(f"  Wrote KDC principals: {kdc_principals_out}")
+                if _write_encrypted_if_changed(
+                    all_principals, [kdc_role_pubkey, *admin_keys],
+                    kdc_principals_out,
+                ):
+                    typer.echo(f"  Wrote KDC principals: {kdc_principals_out}")
+                else:
+                    typer.echo(f"  KDC principals unchanged")
 
                 # The KDC needs the realm master key to encrypt the database
                 # it builds; a principal bundle alone is not enough.
                 realm_key_out = (
                     repo.kdc_deploy_path() / f"{realm_name}-realm-key.age")
-                crypto.encrypt_age(
+                if _write_encrypted_if_changed(
                     realm_key_plain.read_bytes(),
                     [kdc_role_pubkey, *admin_keys],
                     realm_key_out,
-                )
-                typer.echo(f"  Wrote KDC realm key:   {realm_key_out}")
+                ):
+                    typer.echo(f"  Wrote KDC realm key:   {realm_key_out}")
+                else:
+                    typer.echo(f"  KDC realm key unchanged")
 
                 _build_kdc_service_keytabs(
                     repo, realm_name, kdc_conf, principals_tmp,
@@ -1330,10 +1330,13 @@ def _build_kdc_service_keytabs(
             continue
 
         keytab_out = repo.kdc_deploy_path() / f"{realm_name}-{service}.keytab.age"
-        keytab_out.parent.mkdir(parents=True, exist_ok=True)
-        crypto.encrypt_age(
-            keytab_tmp.read_bytes(), [kdc_role_pubkey, *admin_keys], keytab_out)
-        typer.echo(f"  Wrote KDC {service} keytab: {keytab_out}")
+        if _write_encrypted_if_changed(
+            keytab_tmp.read_bytes(), [kdc_role_pubkey, *admin_keys], keytab_out,
+            same=krb.keytabs_equivalent,
+        ):
+            typer.echo(f"  Wrote KDC {service} keytab: {keytab_out}")
+        else:
+            typer.echo(f"  KDC {service} keytab unchanged")
 
 
 def _append_retained_keys(
@@ -1412,6 +1415,45 @@ def _append_retained_principal_keys(
     krb.extract_keytab(sorted(wanted), prev_conf, keytab_path)
 
     return sorted(wanted)
+
+
+def _write_encrypted_if_changed(
+    content: bytes,
+    recipients: list[str],
+    path: Path,
+    same=bytes.__eq__,
+    indent: str = "  ",
+) -> bool:
+    """Encrypt `content` to `path` unless what is there already matches.
+
+    Keytabs and the KDC bundle are rebuilt from the stored principals on
+    every build, and re-encrypting them unconditionally dirties every one of
+    those files in git each time, because age encryption is randomized. So
+    this decrypts the existing file and leaves it alone when its plaintext is
+    `same` as the new content and it is encrypted to as many recipients as
+    it should be (the recipient-count rule `aegis check` and `aegis
+    reencrypt` already use, so a newly added recipient such as the KDC role
+    still gets the file rewritten).
+
+    For keytabs, pass `same=krb.keytabs_equivalent`: ext_keytab timestamps
+    every entry, so the plaintext of an unchanged keytab differs too.
+
+    Returns True if the file was written.
+    """
+    if path.exists():
+        expected = len({r for r in recipients if r})
+        try:
+            existing = crypto.decrypt_age_bytes(path)
+            if same(existing, content) and crypto.recipients_of(path) == expected:
+                return False
+        except Exception as e:
+            typer.echo(
+                f"{indent}Warning: couldn't decrypt existing {path.name} "
+                f"to compare ({e}); rewriting it", err=True)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    crypto.encrypt_age(content, recipients, path)
+    return True
 
 
 def _sync_keytab_manifest(repo: config.SecretsRepo, hostname: str) -> None:
@@ -1533,9 +1575,13 @@ def _build_named_keytabs(
 
         content = keytab_tmp.read_bytes()
         for path, keys, label in recipients:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            crypto.encrypt_age(content, keys, path)
-            typer.echo(f"    {name} -> {label}: {path}")
+            if _write_encrypted_if_changed(
+                content, keys, path, same=krb.keytabs_equivalent,
+                indent="    ",
+            ):
+                typer.echo(f"    {name} -> {label}: {path}")
+            else:
+                typer.echo(f"    {name} -> {label}: unchanged")
 
         if spec.export_only:
             typer.echo(f"    {name}: export with 'aegis keytab export {name}'")

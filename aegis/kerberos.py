@@ -392,3 +392,65 @@ def extract_keytab(
     subprocess.run(cmd, check=True)
     
     return output_path
+
+
+def keytab_entries(data: bytes) -> tuple[bytes, ...] | None:
+    """The entries of a v5.2 keytab with each entry's timestamp zeroed.
+
+    `kadmin ext_keytab` stamps every entry it writes with the current time,
+    so extracting the same, unchanged principals twice yields keytabs that
+    differ in those four bytes per entry and nowhere else. Comparing what this
+    returns instead of the raw bytes compares what a keytab actually carries
+    -- principals, kvnos, enctypes, keys -- and ignores when it was written.
+
+    Holes (deleted entries, negative length) are dropped. Anything after the
+    keyblock (the 32-bit kvno, Heimdal's flags) is kept as-is, so it still
+    counts. Returns None if the data is not a keytab this can parse, in which
+    case the caller should fall back to comparing raw bytes.
+    """
+    if len(data) < 2 or data[:2] != b"\x05\x02":
+        return None
+
+    def u16(buf: bytes, at: int) -> int:
+        if at + 2 > len(buf):
+            raise ValueError("truncated")
+        return int.from_bytes(buf[at:at + 2], "big")
+
+    entries: list[bytes] = []
+    pos = 2
+    try:
+        while pos < len(data):
+            if pos + 4 > len(data):
+                raise ValueError("truncated entry length")
+            size = int.from_bytes(data[pos:pos + 4], "big", signed=True)
+            pos += 4
+            if size == 0:
+                break
+            if size < 0:
+                pos += -size
+                continue
+            entry = data[pos:pos + size]
+            if len(entry) != size:
+                raise ValueError("truncated entry")
+            pos += size
+
+            # num_components, realm, then each component: all counted strings.
+            at = 2
+            for _ in range(u16(entry, 0) + 1):
+                at += 2 + u16(entry, at)
+            at += 4  # name_type; the timestamp follows
+            if at + 4 > size:
+                raise ValueError("entry too short for a timestamp")
+            entries.append(entry[:at] + b"\x00" * 4 + entry[at + 4:])
+    except ValueError:
+        return None
+
+    return tuple(entries)
+
+
+def keytabs_equivalent(a: bytes, b: bytes) -> bool:
+    """Whether two keytabs hold the same entries, ignoring write timestamps."""
+    if a == b:
+        return True
+    entries_a, entries_b = keytab_entries(a), keytab_entries(b)
+    return entries_a is not None and entries_a == entries_b
