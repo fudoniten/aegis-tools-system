@@ -1827,6 +1827,10 @@ def build_user_secrets(
         raise typer.Exit(1)
 
     typer.secho("\nUser secrets build complete!", fg=typer.colors.GREEN)
+    typer.echo(
+        "Hosts only see what is pushed: git add -A src/users deploy/hosts "
+        "&& git commit"
+    )
 
 
 def _user_deploy_dir(repo: config.SecretsRepo, hostname: str, username: str) -> Path:
@@ -3518,7 +3522,12 @@ def pull_user_secrets(
         typer.secho(f"\nNot pulled: {', '.join(failed)}", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
 
-    typer.echo("\nReview the changes, then: aegis build user-secrets")
+    typer.echo(
+        "\nReview the changes, then: aegis build user-secrets\n"
+        "Commit src/users/ and deploy/hosts/*/users/ together -- they are new\n"
+        "files, so 'git commit -a' leaves them out:\n"
+        "  git add -A src/users deploy/hosts && git commit"
+    )
 
 
 @secret_app.command("add")

@@ -530,3 +530,59 @@ def test_user_host_list_with_unknown_role(repo: config.SecretsRepo):
     report = cli_check.run_check(repo)
 
     assert "no such host or role: role:site-nowhere" in _messages(report)
+
+
+def _niten_with_key(repo: config.SecretsRepo, **kw) -> None:
+    repo.set_user_config(config.UserConfig(username="niten", **kw))
+    repo.user_key_path("niten").parent.mkdir(parents=True, exist_ok=True)
+    repo.user_key_path("niten").write_text("x")
+
+
+def test_recorded_pull_without_pulled_copy(repo: config.SecretsRepo):
+    """The toml says a pull happened but its ciphertext is not in the repo."""
+    _niten_with_key(repo, hosts=["*"], pulled_commit="c651ab94505d2002")
+
+    report = cli_check.run_check(repo)
+
+    assert "src/users/niten/ is missing" in _errors(report)
+
+
+def test_pulled_secrets_not_built_for_host(repo: config.SecretsRepo):
+    """Pulled but never built: hosts get no user units and nothing fails."""
+    add_host(repo, "system7")
+    _niten_with_key(repo, hosts=["*"], pulled_commit="abc")
+    env = repo.user_src_path("niten") / "env"
+    env.mkdir(parents=True)
+    (env / "API_KEY.age").write_text("x")
+
+    report = cli_check.run_check(repo)
+    assert "not built for 1 host(s)" in _errors(report)
+    assert "system7" in _errors(report)
+
+    built = repo.host_deploy_path("system7") / "users" / "niten"
+    built.mkdir(parents=True)
+    (built / "manifest.age").write_text("x")
+
+    assert "not built for" not in _messages(cli_check.run_check(repo))
+
+
+def test_uncommitted_output_warns(repo: config.SecretsRepo):
+    import subprocess
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo.path, check=True,
+                       capture_output=True)
+
+    git("init", "-q")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+    assert "not committed" not in _messages(cli_check.run_check(repo))
+
+    user_dir = repo.host_deploy_path("system7") / "users" / "niten"
+    user_dir.mkdir(parents=True)
+    (user_dir / "manifest.age").write_text("x")
+
+    report = cli_check.run_check(repo)
+    assert "1 file(s) not committed" in _messages(report)
+    assert "deploy/hosts/system7/users" in _messages(report)
+    assert not any("not committed" in f.message for f in report.errors)
