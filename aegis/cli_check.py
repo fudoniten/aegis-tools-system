@@ -758,6 +758,35 @@ def _check_users(repo: config.SecretsRepo, report: Report) -> None:
                 f"aegis user add {username} --hosts=...",
             )
 
+        # A pull that left nothing behind, or a pull that was never built:
+        # either way no host gets anything, and the host side cannot tell
+        # "no secrets" from "secrets never built" -- it just makes no units.
+        pulled_dir = repo.user_src_path(username)
+        if user_config.pulled_commit and not pulled_dir.is_dir():
+            report.error(
+                scope,
+                f"src/users/{username}.toml records a pull "
+                f"({user_config.pulled_commit[:12]}) but src/users/{username}/ "
+                "is missing -- was it left out of a commit?",
+                f"aegis user pull {username}, then git add src/users/{username}",
+            )
+        elif pulled_dir.is_dir() and any(pulled_dir.rglob("*.age")):
+            unbuilt = sorted(
+                h for h in allowed
+                if (c := repo.get_host_config(h)) and c.age_pubkey
+                and not (repo.host_deploy_path(h) / "users" / username
+                         / "manifest.age").exists()
+            )
+            if unbuilt:
+                shown = ", ".join(unbuilt[:8]) + (
+                    f" and {len(unbuilt) - 8} more" if len(unbuilt) > 8 else "")
+                report.error(
+                    scope,
+                    f"pulled secrets are not built for {len(unbuilt)} host(s) "
+                    f"in their host list: {shown}",
+                    f"aegis build user-secrets --user {username}",
+                )
+
         for hostname in repo.list_deployed_hosts():
             user_dir = repo.host_deploy_path(hostname) / "users" / username
             if not user_dir.is_dir():
@@ -770,6 +799,46 @@ def _check_users(repo: config.SecretsRepo, report: Report) -> None:
                     f"host list -- removing access does not delete deployed secrets",
                     f"rm -r {user_dir}",
                 )
+
+
+def _check_uncommitted(repo: config.SecretsRepo, report: Report) -> None:
+    """Warn about generated or pulled files that git does not have yet.
+
+    Hosts build from the pushed repo, not the admin's checkout, so a file
+    that exists here but was never committed reaches nobody -- and nothing
+    fails: the host simply sees no such secret.  New directories are the easy
+    ones to miss, since ``git commit -a`` only stages files git already knows.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--",
+             "src", "keys", repo.deploy_path.name],
+            cwd=repo.path, capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return
+    if result.returncode != 0:
+        return  # not a git checkout
+
+    paths = [line[3:] for line in result.stdout.splitlines() if line.strip()]
+    if not paths:
+        return
+
+    tops: dict[str, int] = {}
+    for path in paths:
+        parts = path.strip('"').split("/")
+        top = "/".join(parts[:4] if parts[0] == repo.deploy_path.name else parts[:3])
+        tops[top] = tops.get(top, 0) + 1
+    shown = ", ".join(f"{t} ({n})" for t, n in sorted(tops.items())[:8])
+    if len(tops) > 8:
+        shown += f" and {len(tops) - 8} more"
+    report.warn(
+        "repo",
+        f"{len(paths)} file(s) not committed, so no host can see them yet: {shown}",
+        "git add -A src keys deploy && git commit",
+    )
 
 
 def _check_recipients(
@@ -872,6 +941,7 @@ def run_check(repo: config.SecretsRepo) -> Report:
     _check_keytabs(repo, report)
     _check_users(repo, report)
     _check_recipients(repo, report, admin_keys)
+    _check_uncommitted(repo, report)
     return report
 
 
