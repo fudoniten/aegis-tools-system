@@ -105,6 +105,11 @@ aegis secret import smtp-user --host rama \
 # One you want invented rather than handed over.
 aegis secret new ingest-token --host rama --host lambda \
     --target /run/aurelius/token --user aurelius
+
+# Following a service to another machine: re-encrypt with the admin key,
+# placement and all, then drop the old copy. Promote host secrets into a
+# role once, and the next move is just 'aegis role add-host'.
+aegis secret move nexus-server-db-passwd --from-host legatus --to-role nexus-server
 ```
 
 Two rules worth knowing before you need them:
@@ -520,7 +525,8 @@ To try a local checkout before it is pushed:
 | `aegis secret new <name>` | Generate a random secret for hosts and/or roles |
 | `aegis secret add <host> <name> <file>` | Encrypt a file for a host (no placement) |
 | `aegis secret list [host]` | List secrets for host(s) |
-| `aegis secret delete <name>` | Delete a secret's ciphertext and manifest entries |
+| `aegis secret move <name>` | Move a secret between hosts and roles, using the admin key |
+| `aegis secret delete <name>` | Delete a secret's ciphertext, manifest entries and placement |
 | `aegis ssh list [host]` | SSH host keys declared, and which reach sshd |
 | `aegis ssh delete <host>` | Delete a host's SSH keys (its identity) |
 | `aegis nexus list` | Hosts holding a Nexus HMAC key |

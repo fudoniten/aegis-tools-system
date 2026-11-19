@@ -104,6 +104,68 @@ def _drop_manifest_secrets(
     return Edit(f"{hostname}: drop [secrets] {listed} from the manifest", do)
 
 
+def _drop_host_secret_entry(
+    repo: config.SecretsRepo, hostname: str, name: str
+) -> Edit:
+    """Drop a host's own copy of NAME, letting a role's copy take its place.
+
+    A host secret shadows a role secret of the same name, so once the host's
+    copy goes, a role the host belongs to may be what should now supply it.
+    Reconciling here means the manifest is right straight away rather than
+    after the next ``aegis build role-secrets``.
+    """
+    def do() -> None:
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+        entry = manifest.secrets.get(name)
+        if entry is not None and not entry.role:
+            del manifest.secrets[name]
+        if hostname in repo.list_deploying_hosts():
+            host_secrets.reconcile_roles(repo, hostname, manifest)
+        host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    return Edit(f"{hostname}: drop [secrets] {name} from the manifest", do)
+
+
+def _drop_role_secret_entry(
+    repo: config.SecretsRepo, hostname: str, name: str, role: str
+) -> Edit:
+    """Drop a member's entry for NAME, but only if it points at ROLE."""
+    def do() -> None:
+        manifest = host_secrets.load_host_manifest(repo.deploy_path, hostname)
+        entry = manifest.secrets.get(name)
+        if entry is not None and entry.role == role:
+            del manifest.secrets[name]
+            host_secrets.save_host_manifest(repo.deploy_path, manifest)
+
+    return Edit(
+        f"{hostname}: drop [secrets] {name} (from role '{role}') from the manifest",
+        do)
+
+
+def _drop_host_placement(repo: config.SecretsRepo, hostname: str, name: str) -> Edit:
+    def do() -> None:
+        host_config = repo.get_host_config(hostname)
+        if host_config is not None:
+            host_config.placement.pop(f"secret:{name}", None)
+            repo.set_host_config(host_config)
+
+    return Edit(
+        f"{hostname}: drop placement \"secret:{name}\" from src/hosts/{hostname}.toml",
+        do)
+
+
+def _drop_role_placement(repo: config.SecretsRepo, role: str, name: str) -> Edit:
+    def do() -> None:
+        role_config = repo.get_role_config(role)
+        if role_config is not None:
+            role_config.placement.pop(f"secret:{name}", None)
+            repo.set_role_config(role_config)
+
+    return Edit(
+        f"role {role}: drop placement \"secret:{name}\" from src/roles/{role}.toml",
+        do)
+
+
 def _drop_role_membership(repo: config.SecretsRepo, role: str, hostname: str) -> Edit:
     def do() -> None:
         role_config = repo.get_role_config(role)
@@ -297,18 +359,33 @@ def plan_secret_removal(
         *[repo.role_secret_path(r, name) for r in roles],
     )
 
+    # Manifest entries are dropped only when they are the copy being deleted.
+    # The manifest has one key per name, so a host can declare NAME as its own
+    # secret while also belonging to a role that publishes NAME; dropping by
+    # name alone would take out whichever copy happened to be there.
     for host in hosts:
         manifest = host_secrets.load_host_manifest(repo.deploy_path, host)
-        if name in manifest.secrets:
-            removal.edits.append(_drop_manifest_secrets(repo, host, [name]))
+        entry = manifest.secrets.get(name)
+        if entry is not None and not entry.role:
+            removal.edits.append(_drop_host_secret_entry(repo, host, name))
+        host_config = repo.get_host_config(host)
+        if host_config and f"secret:{name}" in host_config.placement:
+            removal.edits.append(_drop_host_placement(repo, host, name))
 
     # A role secret is declared in every member's manifest, not the role's.
     for role in roles:
         role_config = repo.get_role_config(role)
         for host in (role_config.hosts if role_config else []):
             manifest = host_secrets.load_host_manifest(repo.deploy_path, host)
-            if name in manifest.secrets:
-                removal.edits.append(_drop_manifest_secrets(repo, host, [name]))
+            # Any entry for NAME, not just a role one: a host copy that is
+            # itself being deleted above lets the role's entry back in when
+            # that edit reconciles, and this one has to take it out again.
+            entry = manifest.secrets.get(name)
+            if entry is not None and (entry.role == role or host in hosts):
+                removal.edits.append(
+                    _drop_role_secret_entry(repo, host, name, role))
+        if role_config and f"secret:{name}" in role_config.placement:
+            removal.edits.append(_drop_role_placement(repo, role, name))
 
     removal.warnings.append(
         "Any service still reading this path gets nothing at next boot. The "
