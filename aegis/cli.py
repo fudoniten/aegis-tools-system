@@ -1791,7 +1791,7 @@ def build_user_secrets(
             source_dir = user_repo_path / subdir
             if not source_dir.exists():
                 continue
-            built, errors = _process_user_secrets_dir_with_manifest(
+            built, written, errors = _process_user_secrets_dir_with_manifest(
                 source_dir, username, user_private_key, host_keys,
                 admin_keys, repo, secret_type, host_manifests,
             )
@@ -1799,7 +1799,10 @@ def build_user_secrets(
             for error in errors:
                 fail(f"{username}: {error}")
             label = "env vars" if secret_type == "env" else "files"
-            typer.echo(f"  Processed {len(built)} {label}")
+            typer.echo(
+                f"  Processed {len(built)} {label} "
+                f"({len(set(written))} changed)"
+            )
 
         # Save manifests for each host (encrypted for host + user + admin),
         # dropping whatever the user repo no longer has.
@@ -1815,9 +1818,16 @@ def build_user_secrets(
             if user_pubkey:
                 recipients.append(user_pubkey)
 
-            mf.save_manifest(manifest, manifest_path, crypto.encrypt_age, recipients)
+            # Like each secret, the manifest is only rewritten when its
+            # content or recipient count changed: age is randomized, so
+            # re-encrypting an unchanged manifest still dirties it in git.
+            wrote = _write_encrypted_if_changed(
+                manifest.to_yaml().encode("utf-8"), recipients, manifest_path,
+                indent="    ",
+            )
             note = f", removed {', '.join(removed)}" if removed else ""
-            typer.echo(f"    {hostname}: {len(manifest.secrets)} secrets{note}")
+            state = "" if wrote or removed else " (unchanged)"
+            typer.echo(f"    {hostname}: {len(manifest.secrets)} secrets{note}{state}")
 
     if failures:
         typer.secho(
@@ -1868,18 +1878,21 @@ def _process_user_secrets_dir_with_manifest(
     repo: config.SecretsRepo,
     secret_type: str,  # "env" or "file"
     host_manifests: dict,  # hostname -> Manifest
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Process a directory of user secrets with privacy-preserving hashed filenames.
 
     Decrypts each .age file, updates the manifest with a hashed filename,
-    and re-encrypts for each host using that hashed name.
+    and re-encrypts for each host using that hashed name -- but only where
+    the host's existing ciphertext does not already hold that plaintext.
 
-    Returns ``(built, errors)``: the names of the secrets processed, and a
-    message for each one that could not be.
+    Returns ``(built, written, errors)``: the names of the secrets processed,
+    the names whose ciphertext was (re)written on at least one host, and a
+    message for each one that could not be processed.
     """
     import tempfile
 
     built: list[str] = []
+    written: list[str] = []
     errors: list[str] = []
 
     for secret_file in sorted(source_dir.glob("*.age")):
@@ -1917,12 +1930,19 @@ def _process_user_secrets_dir_with_manifest(
             output_dir = _user_deploy_dir(repo, hostname, username) / "secrets"
             output_file = output_dir / hashed_name
 
-            output_dir.mkdir(parents=True, exist_ok=True)
-            crypto.encrypt_age(secret_content, [host_key, *admin_keys], output_file)
+            # Every build decrypts every user secret afresh, and age
+            # encryption is randomized, so writing unconditionally would give
+            # every secret new ciphertext on every run.  Leave the file alone
+            # when it already holds this plaintext for the right recipients.
+            if _write_encrypted_if_changed(
+                secret_content, [host_key, *admin_keys], output_file,
+                indent="    ",
+            ):
+                written.append(secret_name)
 
         built.append(secret_name)
 
-    return built, errors
+    return built, written, errors
 
 
 @build_app.command("bundles")

@@ -320,3 +320,52 @@ def test_user_delete_removes_the_pulled_copy(setup):
                                  "--secrets-path", str(repo.path)])
     assert result.exit_code == 0, _out(result)
     assert not repo.user_src_path("alice").exists()
+
+
+def _deploy_bytes(repo: config.SecretsRepo) -> dict[str, bytes]:
+    user_dir = repo.host_deploy_path("lambda") / "users" / "alice"
+    return {
+        str(p.relative_to(user_dir)): p.read_bytes()
+        for p in sorted(user_dir.rglob("*.age"))
+    }
+
+
+def test_rebuild_without_changes_rewrites_nothing(setup):
+    # age is randomized, so re-encrypting unchanged plaintext would still give
+    # every file new bytes -- and a git diff on every build.
+    repo, key_file, _, put = setup
+    put("env", "A", b"one")
+    put("files", "B", b"two")
+    assert _build(repo).exit_code == 0
+    before = _deploy_bytes(repo)
+
+    result = _build(repo)
+    assert result.exit_code == 0, _out(result)
+    assert _deploy_bytes(repo) == before
+    assert "(0 changed)" in _out(result)
+    assert "(unchanged)" in _out(result)
+
+
+def test_rebuild_rewrites_only_the_changed_secret(setup):
+    repo, key_file, _, put = setup
+    put("env", "A", b"one")
+    put("env", "B", b"two")
+    assert _build(repo).exit_code == 0
+    before = _deploy_bytes(repo)
+    names = {name: key for key, name in (
+        (k, e.name) for k, e in mf.Manifest.from_yaml(crypto.decrypt_age(
+            repo.host_deploy_path("lambda") / "users" / "alice" / "manifest.age",
+            identity_path=key_file,
+        )).secrets.items()
+    )}
+
+    put("env", "B", b"two-updated")
+    result = _build(repo)
+    assert result.exit_code == 0, _out(result)
+    after = _deploy_bytes(repo)
+
+    assert after[f"secrets/{names['A']}"] == before[f"secrets/{names['A']}"]
+    assert after[f"secrets/{names['B']}"] != before[f"secrets/{names['B']}"]
+    # The manifest's content did not change (same names, same hashed keys).
+    assert after["manifest.age"] == before["manifest.age"]
+    assert _host_view(repo, key_file)[("B", "env")] == b"two-updated"
