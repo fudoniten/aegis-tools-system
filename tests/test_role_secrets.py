@@ -291,6 +291,39 @@ def test_a_host_secret_shadowing_a_role_secret_is_reported(
     assert "shadowing" in "\n".join(f.message for f in report.findings)
 
 
+def test_a_dangling_host_entry_does_not_shadow_a_role_secret(
+    repo: config.SecretsRepo, tmp_path: Path,
+):
+    """A host entry whose ciphertext is gone must give way to the role's copy.
+
+    This is what a secret moved from a host to a role leaves behind when the
+    host's manifest still names secrets/<name>.age: the host fails to decrypt
+    it at boot, and the role's copy, which does exist, never gets declared.
+    """
+    _init_role(repo, "svc")
+    _member(repo, "svc", "one")
+
+    manifest = host_secrets.load_host_manifest(repo.deploy_path, "one")
+    manifest.secrets["tok"] = host_secrets.make_secret_entry(
+        name="tok", placement=config.Placement(target="/run/svc/tok"))
+    host_secrets.save_host_manifest(repo.deploy_path, manifest)
+    assert not (repo.host_deploy_path("one") / "secrets" / "tok.age").exists()
+
+    report = cli_check.run_check(repo)
+    assert "does not exist" in "\n".join(f.message for f in report.errors)
+
+    result = _import(repo.path, "tok", "role-value", tmp_path, "--role", "svc")
+    assert result.exit_code == 0, _out(result)
+    assert "replaced it with role 'svc'" in _out(result)
+
+    entry = host_secrets.load_host_manifest(repo.deploy_path, "one").secrets["tok"]
+    assert entry.role == "svc"
+    assert (repo.host_deploy_path("one") / entry.source).exists()
+
+    report = cli_check.run_check(repo)
+    assert report.errors == [], "\n".join(f.message for f in report.errors)
+
+
 # check ------------------------------------------------------------------
 
 

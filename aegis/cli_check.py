@@ -206,6 +206,22 @@ def _check_hosts(
                 + " --format ed25519 --rotate --yes to bring both in sync",
             )
 
+        # Every declared secret must have its ciphertext: the host's decrypt
+        # unit fails at boot on a missing file, long after the build "worked".
+        for name, entry in sorted(manifest.secrets.items()):
+            if not (deploy / entry.source).exists():
+                where = f"role '{entry.role}'" if entry.role else "this host"
+                report.error(
+                    scope,
+                    f"manifest declares secret '{name}' from {where}, but "
+                    f"{entry.source} does not exist, so it fails to decrypt "
+                    f"at boot",
+                    (f"aegis build role-secrets" if entry.role else
+                     f"re-import it (aegis secret import {name} --host "
+                     f"{hostname} ...), or drop it: aegis secret delete "
+                     f"{name} --host {hostname}"),
+                )
+
         # Manifest must agree with declared placement, or a change to src/
         # silently never reaches the host.
         _check_placement_drift(repo, hostname, host_config, manifest, report, scope)
