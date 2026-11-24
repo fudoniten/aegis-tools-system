@@ -885,9 +885,21 @@ def reconcile_roles(
         if entry.role and name not in wanted:
             del manifest.secrets[name]
 
+    deploy = repo.host_deploy_path(hostname)
     for name, entry in wanted.items():
         existing = manifest.secrets.get(name)
         if existing is not None and not existing.role:
+            if not (deploy / existing.source).exists():
+                # A host entry with no ciphertext behind it is not a more
+                # specific declaration, it is a dangling one: it fails the
+                # host's boot, and keeping it would hide the role's copy that
+                # actually exists.  Typical after moving a secret to a role.
+                conflicts.append(
+                    f"'{name}' was declared as a secret of host {hostname} but "
+                    f"{existing.source} does not exist; replaced it with role "
+                    f"'{entry.role}''s copy")
+                manifest.secrets[name] = entry
+                continue
             conflicts.append(
                 f"'{name}' is both a role secret (role '{entry.role}') and a "
                 f"secret of host {hostname}; the host's own copy is kept")
